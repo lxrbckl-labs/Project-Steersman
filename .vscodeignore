@@ -1,0 +1,19 @@
+# Files/folders excluded from the packaged .vsix. Steersman's extension host
+# has one real runtime dep (ws, used by cdp-tab.js), so node_modules/** is
+# intentionally NOT ignored here: vsce auto-includes production
+# "dependencies" (ws) and auto-prunes "devDependencies" (including
+# @modelcontextprotocol/sdk, which only mcp-server.js needs). mcp-server.js
+# itself is excluded below because it runs as a separate stdio process from
+# the repo, not inside the packaged extension host.
+mcp-server.js
+build/**
+scripts/**
+tests/**
+.vscode/**
+.github/**
+**/*.map
+.gitignore
+.vscodeignore
+PLAN.md
+CLAUDE.md
+package-lock.json

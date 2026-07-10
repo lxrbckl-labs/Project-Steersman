@@ -1,0 +1,85 @@
+{
+  "name": "project-steersman",
+  "displayName": "Project Steersman",
+  "description": "Expose VS Code's integrated browser to Claude Code via a local HTTP API and MCP server.",
+  "version": "0.0.1",
+  "publisher": "aarbuckle",
+  "engines": {
+    "vscode": "^1.112.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionDependencies": [
+    "ms-vscode.js-debug"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "projectSteersman.openPanel",
+        "title": "Open Panel",
+        "category": "Project Steersman",
+        "icon": "$(browser)"
+      },
+      {
+        "command": "projectSteersman.startServer",
+        "title": "Start HTTP Server",
+        "category": "Project Steersman"
+      },
+      {
+        "command": "projectSteersman.stopServer",
+        "title": "Stop HTTP Server",
+        "category": "Project Steersman"
+      },
+      {
+        "command": "projectSteersman.status",
+        "title": "Show Status",
+        "category": "Project Steersman"
+      }
+    ],
+    "configuration": {
+      "title": "Project Steersman",
+      "properties": {
+        "projectSteersman.httpPort": {
+          "type": "number",
+          "default": 3788,
+          "description": "Local HTTP API port (increments if taken)."
+        },
+        "projectSteersman.autoStartServer": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start the HTTP server automatically when the extension activates."
+        },
+        "projectSteersman.startUrl": {
+          "type": "string",
+          "default": "about:blank",
+          "description": "URL to open when the integrated browser is launched."
+        },
+        "projectSteersman.autoOpenPanel": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically open the Project Steersman panel when VS Code starts."
+        },
+        "projectSteersman.autoLaunchWindow": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically launch one integrated-browser window on activation."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "mcp": "node mcp-server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "@types/vscode": "^1.112.0"
+  }
+}

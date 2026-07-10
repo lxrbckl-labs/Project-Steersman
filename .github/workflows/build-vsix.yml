@@ -1,0 +1,62 @@
+# Builds Project Steersman's .vsix in CI. This is the CI counterpart to
+# build/reinstall.sh (same vsce invocation, same entry-point sanity check),
+# minus the local `code --install-extension` step.
+#
+# - Normal pushes to main/master: package the vsix and upload it as a
+#   workflow artifact (Actions tab -> this run -> Artifacts).
+# - Pushing a `v*` tag: also cuts a GitHub Release with the vsix attached.
+# - workflow_dispatch: lets you trigger a build manually from the Actions UI.
+name: Build VSIX
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # contents: write is required for the `gh release create` step on tag pushes.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # NOTE: deliberately NOT passing --no-dependencies here. Unlike bundled
+      # (esbuild) extensions, this one is unbundled plain CommonJS and relies
+      # on vsce packaging its production "dependencies" (ws) straight out of
+      # node_modules. --no-dependencies would drop ws from the vsix and break
+      # extension.js's `require('ws')` at runtime, so it must stay off.
+      - name: Package extension (.vsix)
+        run: npx --yes @vscode/vsce package --allow-missing-repository --skip-license
+
+      # package.json "main" is "./extension.js"; vsce stores repo files under
+      # an "extension/" prefix inside the vsix, so the packaged path is
+      # extension/extension.js. If that's missing, packaging is broken -
+      # never ship a vsix that can't even load its own entry point.
+      - name: Entry-point sanity check
+        run: unzip -l project-steersman-*.vsix | grep -q 'extension/extension.js'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: project-steersman-vsix
+          path: '*.vsix'
+          retention-days: 90
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" project-steersman-*.vsix \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "Project Steersman ${GITHUB_REF_NAME}. Install: code --install-extension project-steersman-<version>.vsix"
