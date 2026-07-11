@@ -159,6 +159,14 @@ button.icon-button.btn-add {
   line-height: 1;
 }
 
+/* Fleet-level copy button — the rail-scoped sibling of the per-row copy
+   button; pairs with .btn-add (box border/sizing) so it matches the ＋ New
+   Session button, and margin-left:auto pins it to the opposite (right) side
+   of the body-toolbar from that button. */
+button.icon-button.btn-fleet-copy {
+  margin-left: auto;
+}
+
 /* ─── Settings view — capability config, rendered entirely from host-pushed
    state (instruction / capabilities / composedPreview). Reachable via the
    Settings tab. ──────────────────────────────────────────────────────────── */
@@ -187,7 +195,7 @@ button.icon-button.btn-add {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--vscode-descriptionForeground);
-  margin: 14px 0 6px;
+  margin: 28px 0 6px;
 }
 
 .settings-section-title:first-child {
@@ -269,6 +277,19 @@ button.icon-button.btn-add {
   min-height: 44px;
 }
 
+/* Top-level role-debrief instruction — needs room for a multi-sentence
+   brief, unlike the terser per-capability overrides above. */
+.settings-textarea {
+  min-height: 140px;
+}
+
+/* Read-only, but text stays selectable/copyable and normally coloured —
+   just drop the resize handle and the text-edit cursor. */
+.settings-textarea[readonly] {
+  cursor: default;
+  resize: none;
+}
+
 /* Composed-preview block — read-only, visually distinct as a "generated
    output" region: monospace, slightly recessed, no resize handle. */
 .settings-preview {
@@ -341,8 +362,8 @@ button.icon-button.btn-add {
 
 .session-row {
   display: flex;
-  align-items: center;
-  gap: 10px;
+  flex-direction: column;
+  gap: 6px;
   padding: 8px 10px;
   /* Rows now share one card (the .session-table), so they read as table rows:
      a thin grid line below each, dropped on the last row (Mandrake row style). */
@@ -351,6 +372,9 @@ button.icon-button.btn-add {
 
 .session-row:last-child {
   border-bottom: none;
+  /* Bottom inset below the last row should match the rows' own left padding (10px),
+     not the 8px vertical padding shared by every row (which sets inter-row spacing). */
+  padding-bottom: 10px;
 }
 
 .session-row:hover {
@@ -391,30 +415,76 @@ button.icon-button.btn-add {
   50%      { opacity: 1; }
 }
 
-/* Middle zone — id + url/state; must be allowed to shrink for ellipsis. */
-.session-body {
-  flex: 1 1 auto;
-  min-width: 0;
+/* Agent-active — pulsing orange, overrides the state color (connected/failed/etc.) while an
+   agent is driving the tab. Placed after the state rules so equal specificity resolves in its
+   favor; source order (not just specificity) is what wins here since both are single-class
+   selectors on .dot. Each dot has its own animation instance, so multiple rows pulse independently. */
+.dot.agent-active {
+  background: #f9a825;
+  box-shadow: none;
+  animation: steersman-dot-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes steersman-dot-pulse {
+  0%, 100% { opacity: 1;    box-shadow: 0 0 0 0 rgba(249, 168, 37, 0.55); }
+  50%      { opacity: 0.35; box-shadow: 0 0 4px 3px rgba(249, 168, 37, 0.35); }
+}
+
+/* Top sub-row — identity line: dot, bold name, faint url, all on one line.
+   min-width:0 lets the faint url shrink and ellipsize instead of wrapping. */
+.session-top {
   display: flex;
-  flex-direction: column;
-  gap: 1px;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
 }
 
 .session-id {
+  flex-shrink: 0;
   font-family: var(--vscode-editor-font-family, monospace);
   font-size: 12px;
+  font-weight: 600;
   color: var(--vscode-foreground);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
+/* Faint/muted so it reads as secondary to the bold name beside it. */
 .session-url {
+  flex: 1 1 auto;
+  min-width: 0;
   font-size: 11px;
   color: var(--vscode-descriptionForeground);
+  opacity: 0.7;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* Bottom sub-row — controls line: the autopilot wheel, then the script
+   cluster, then actions pushed to the right so the clusters sit level.
+   Tight gap so the now-wide .session-scripts cluster butts up against the
+   action buttons. */
+.session-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* Autopilot toggle — leftmost in the controls row, same 26px bordered
+   footprint as the .bm-rowbtn action buttons so the row stays level. Solid
+   wheel (default) means Claude may drive, and gets a yellow tint so
+   Claude-controlled windows are easy to spot at a glance; the outline
+   (manual) state falls back to the plain neutral icon color so it clearly
+   reads as "not Claude". */
+button.icon-button.autopilot-toggle {
+  flex-shrink: 0;
+  color: var(--vscode-charts-yellow, #e5c07b);
+}
+
+button.icon-button.autopilot-toggle.autopilot-off {
+  color: var(--vscode-icon-foreground, var(--vscode-foreground));
 }
 
 /* Right-aligned action cluster — always visible and clickable at rest; row
@@ -424,6 +494,7 @@ button.icon-button.btn-add {
   display: flex;
   align-items: center;
   gap: 2px;
+  margin-left: auto;
 }
 
 /* Transient "Copied!" affordance flashed on the copy button. */
@@ -434,30 +505,50 @@ button.icon-button.btn-add {
   white-space: nowrap;
 }
 
+/* Same "Copied!" affordance, flashed next to the fleet copy button in the
+   body-toolbar instead of a session row's action cluster. */
+.body-toolbar .copied-flash {
+  font-size: 11px;
+  color: var(--vscode-charts-green, var(--vscode-testing-iconPassed, #4caf50));
+  margin-right: 4px;
+  white-space: nowrap;
+}
+
 /* ─── Per-row script cluster — status badge + run-script picker ────────────
-   Sits between the body and the action-icon cluster; shrinks to content so
-   the ellipsizing .session-body still gets first claim on row width. ────── */
+   Sits on the left of the controls sub-row and grows to fill the row so the
+   picker's right edge lands flush against the action-icon cluster (which
+   stays pinned right via .session-actions' margin-left:auto). ── */
 
 .session-scripts {
-  flex-shrink: 0;
+  flex: 1 1 auto;
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 6px;
 }
 
 /* Run-script picker — a one-shot action trigger, styled like a compact
-   VS Code dropdown; resets to the placeholder right after firing. */
+   VS Code dropdown; resets to the placeholder right after firing. Sized to
+   match the 26px .icon-button.bm-rowbtn actions so both sit level on the
+   controls row, and stretched to fill .session-scripts so it meets the
+   action buttons instead of leaving a dead gap. */
 select.script-picker {
-  height: 24px;
-  max-width: 120px;
+  flex: 1 1 auto;
+  min-width: 0;
+  width: 100%;
+  height: 26px;
+  line-height: 24px;
   background: var(--vscode-dropdown-background, var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.06)));
   color: var(--vscode-dropdown-foreground, var(--vscode-foreground));
   border: 1px solid var(--vscode-dropdown-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
   border-radius: 3px;
   font: inherit;
   font-size: 11px;
-  padding: 0 4px;
+  padding: 0 6px;
   cursor: pointer;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow: hidden;
 }
 
 select.script-picker:disabled {
@@ -492,5 +583,252 @@ select.script-picker:focus-visible {
 
 .script-status-error {
   color: var(--vscode-errorForeground, #f14c4c);
+}
+
+/* ─── Bookmarks manager (Settings view) ───────────────────────────────────
+   A Chrome-style CRUD tree rendered from host state: a bordered, scrollable
+   card of indented rows with inline add-forms, rename boxes, and drag-and-drop
+   reorder/move. Shares the settings card frame + theme tokens throughout. ── */
+
+.bm-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  /* Section wrapper itself (not the nested title) sits between Capabilities
+     and Bookmarks in .settings-body, so the inter-segment gap has to live
+     here to match the ~34px (gap 6px + title margin-top 28px) other segments get. */
+  margin-top: 28px;
+}
+
+/* Section header — reuses the .settings-section-title label, with the
+   root-level add controls pinned to the right. */
+.bm-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.bm-root-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+/* "Show bookmarks bar" row — reuses .capability-toggle/.capability-label so it
+   reads as the same toggle affordance as the Capabilities list above it. */
+.bm-bar-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.bm-bar-hint {
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  font-style: italic;
+}
+
+/* Tree card — same border/background as .session-table, bounded + scrollable. */
+.bm-tree-wrap {
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  border-radius: 4px;
+  background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.06));
+  padding: 4px;
+  min-height: 360px;
+  max-height: 640px;
+  overflow: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--vscode-scrollbarSlider-background) transparent;
+}
+
+.bm-tree,
+.bm-children,
+.bm-node {
+  display: flex;
+  flex-direction: column;
+}
+
+/* Nested folders indent their children (droplines included, so insertion
+   points line up under the folder they belong to). */
+.bm-children {
+  padding-left: 16px;
+}
+
+/* A tree row — folder or bookmark. draggable, hover-lit, grab cursor. */
+.bm-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 3px 6px;
+  border-radius: 3px;
+  cursor: grab;
+}
+
+.bm-row:hover {
+  background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.12));
+}
+
+.bm-row.bm-dragging {
+  opacity: 0.5;
+}
+
+/* Drop ONTO a folder — highlight the whole row as the into-target. */
+.bm-row.bm-drop-into {
+  outline: 1px solid var(--vscode-focusBorder, #007fd4);
+  outline-offset: -1px;
+  background: var(--vscode-list-dropBackground, rgba(0, 127, 212, 0.18));
+}
+
+/* Compact icon buttons inside rows (smaller than the 26px session buttons). */
+.bm-row .icon-button,
+.bm-actions .icon-button {
+  width: 22px;
+  height: 22px;
+}
+
+/* Expand/collapse chevron — a drawn SVG triangle (chevronIcon() in panel.js)
+   rotated to point down when open, rather than the old text '▸' glyph, so its
+   bounding box is roughly square and it turns cleanly about the button's
+   center. Given a comfortable ~24px square hit box (wider than the 22px
+   row-icon default) so the whole box, not just the small triangle, toggles
+   the folder; flex centering on .icon-button keeps the svg centered. */
+button.icon-button.bm-chevron {
+  width: 24px;
+  height: 24px;
+  transition: transform 0.1s ease;
+}
+
+button.icon-button.bm-chevron.open {
+  transform: rotate(90deg);
+}
+
+.bm-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--vscode-foreground);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Favicon slot — an <img> when present, else a faint placeholder square
+   (favicons are populated in Phase 3). */
+.bm-favicon {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  border-radius: 2px;
+}
+
+.bm-favicon-placeholder {
+  background: var(--vscode-descriptionForeground, #888);
+  opacity: 0.25;
+}
+
+.bm-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.bm-title {
+  font-size: 12px;
+  color: var(--vscode-foreground);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bm-url {
+  font-size: 10px;
+  color: var(--vscode-descriptionForeground);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bm-actions {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+}
+
+/* Compact bordered row-action buttons — the ＋bookmark/＋folder, rename and
+   delete controls on bookmark-section rows, plus the copy/focus/close actions
+   on Tabs-view session rows (shared here rather than duplicated). A subtle
+   themed border (matching .btn-add) gives each icon a clear clickable
+   boundary; hover state comes from the base .icon-button rule. Kept icon-only
+   and compact, just clearly bounded. */
+button.icon-button.bm-rowbtn {
+  border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
+}
+
+/* ＋ + glyph add buttons — auto-width (override the square icon-button) so the
+   plus and the bookmark/folder glyph sit side by side. */
+button.icon-button.bm-add {
+  width: auto;
+  padding: 0 4px;
+  gap: 2px;
+}
+
+.bm-add-plus {
+  font-size: 12px;
+  line-height: 1;
+}
+
+button.icon-button.bm-add svg {
+  width: 13px;
+  height: 13px;
+}
+
+button.icon-button.bm-confirm:hover:not(:disabled) {
+  color: var(--vscode-charts-green, var(--vscode-testing-iconPassed, #4caf50));
+}
+
+/* Insertion line between siblings — invisible at rest, a bright bar on hover
+   while dragging (the reorder drop affordance). */
+.bm-dropline {
+  height: 4px;
+  margin: 1px 0;
+  border-radius: 2px;
+}
+
+.bm-dropline.bm-drop-active {
+  background: var(--vscode-focusBorder, #007fd4);
+}
+
+/* Inline add-form + rename box — text inputs with ✓/✕ confirm/cancel. */
+.bm-addform {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 6px;
+}
+
+.bm-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 24px;
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
+  border-radius: 3px;
+  background: var(--vscode-input-background, var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.06)));
+  color: var(--vscode-input-foreground, var(--vscode-foreground));
+  font: inherit;
+  font-size: 12px;
+  padding: 0 6px;
+}
+
+.bm-input:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder, #007fd4);
+  outline-offset: -1px;
 }
 

@@ -34,17 +34,36 @@ also means the HTTP API is independently testable with `curl` before any MCP wir
    `code --enable-proposed-api=<publisher>.project-steersman`. Cleaner multiplexed
    CDP, but may require Insiders. Not the foundation.
 
-## Planned HTTP API / MCP tools (MVP)
+## HTTP API
 
-| HTTP | MCP tool | CDP under the hood |
-|------|----------|--------------------|
-| `POST /navigate {url}` | `browser_navigate` | `Page.navigate` |
-| `POST /click {selector}` | `browser_click` | `Runtime.evaluate` (querySelector().click()) |
-| `POST /type {selector,text}` | `browser_type` | `Runtime.evaluate` / `Input.*` |
-| `GET /text?selector=` | `browser_text` | `Runtime.evaluate` |
-| `POST /eval {js}` | `browser_eval` | `Runtime.evaluate` |
-| `GET /screenshot` | `browser_screenshot` | `Page.captureScreenshot` |
-| `GET /url` | `browser_url` | `Runtime.evaluate` (location.href) |
+Every request must send the header `x-steersman-token: <token>` and a loopback `Host`
+(non-loopback hosts are rejected, DNS-rebinding defense). Each session is addressed by its
+`instance` id (`win-1`, `win-2`, …) — query string for GET, JSON body for POST; POST bodies
+default to the most-recently-created connected window when `instance` is omitted.
+
+Most endpoints are **operator-gated** by a capability toggled in the panel: when a
+capability is disabled the endpoint returns **HTTP 403** (`{"error":"capability disabled"}`).
+The observation/wait endpoints (`GET /windows`, `GET /window`, `GET /url`, `POST /wait`)
+carry no gate and are always available (behind host + token). Sensitive endpoints and their
+gating capability: `POST /navigate` (`navigate`), `GET /text` (`read`), `POST /click` ·
+`/type` · `/scroll` · `/press` · `/hover` (`interact`), `GET /screenshot` (`screenshot`),
+`POST /eval` (`eval`), `POST /windows` (`create_window`), `POST /window/close`
+(`close_window`), `GET /scripts` · `POST /script/run` (`run_script`). `GET /health` and
+`GET /capabilities` are also served (host + token, no capability gate).
+
+**Live API reference** — the full, capability-filtered endpoint listing (request shapes and
+examples, reflecting exactly the currently-enabled capabilities) is served as markdown at:
+
+- `GET /docs/tab` — reference for driving a single window.
+- `GET /docs/fleet` — reference for managing all windows (enumerate, create, drive any).
+
+The `/docs/*` routes stay behind the loopback `Host` check but are **exempt from the token +
+capability gates** (they are how an agent discovers the API, so requiring the token would be a
+chicken-and-egg). Every *other* request needs the `x-steersman-token` header.
+
+The panel's **Copy prompt** button produces a short natural-language driving guide (role +
+bootstrap) that points the agent at `/docs/tab` (or `/docs/fleet`) for the full endpoint
+reference, with the token header pre-filled.
 
 ## Status
 

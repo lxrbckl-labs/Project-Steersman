@@ -15,6 +15,9 @@ const ROUTE_CAPABILITY = {
   'GET /text': 'read',
   'POST /click': 'interact',
   'POST /type': 'interact',
+  'POST /scroll': 'interact',
+  'POST /press': 'interact',
+  'POST /hover': 'interact',
   'POST /eval': 'eval',
   'GET /screenshot': 'screenshot',
   'POST /windows': 'create_window',
@@ -113,14 +116,16 @@ async function startHttpServer(preferredPort, ctx) {
       res.writeHead(code, { 'content-type': 'application/json' });
       res.end(JSON.stringify(obj));
     };
+    // Text send path (used for the /docs/* markdown reference, which isn't JSON).
+    const sendText = (code, text, contentType) => {
+      res.writeHead(code, { 'content-type': contentType || 'text/plain; charset=utf-8' });
+      res.end(text);
+    };
 
     // Pre-routing security gate (order: host -> token -> route -> capability). A failed
     // earlier check short-circuits. Neither branch ever echoes the token.
     if (!isAllowedHost(req.headers.host)) {
       return send(403, { error: 'forbidden host' });
-    }
-    if (!tokensMatch(req.headers['x-steersman-token'], token)) {
-      return send(401, { error: 'unauthorized' });
     }
 
     let u;
@@ -130,6 +135,19 @@ async function startHttpServer(preferredPort, ctx) {
       return send(400, { error: 'bad url' });
     }
     const p = u.pathname;
+
+    // Docs allowlist: the capability-filtered API reference the agent fetches to LEARN the
+    // API. Requiring the token here would be a chicken-and-egg (the doc is how it discovers
+    // the header), so /docs/* bypasses the token AND capability gates — but stays behind the
+    // Host (loopback) check above, so only local pages can read it. Non-sensitive text only.
+    if (p === '/docs/tab' || p === '/docs/fleet') {
+      const kind = p === '/docs/fleet' ? 'fleet' : 'tab';
+      return sendText(200, manager.buildApiDoc(kind, config), 'text/markdown; charset=utf-8');
+    }
+
+    if (!tokensMatch(req.headers['x-steersman-token'], token)) {
+      return send(401, { error: 'unauthorized' });
+    }
 
     // Server-side capability enforcement (defense-in-depth): a sensitive route whose
     // capability is disabled is rejected before it can touch a session. Observation routes
@@ -168,8 +186,21 @@ async function startHttpServer(preferredPort, ctx) {
           return send(200, { ok: true, id: s.id });
         }
         if (p === '/window' && req.method === 'GET') {
+          // Manual-mode guard FIRST: a window with autopilot OFF is human-only, so an agent may
+          // not even read it — 403 before manager.window() does any CDP title eval / DOM read.
+          // Guard on the raw instance id; isAutopilot fails open on an unknown id, so a truly
+          // unknown instance falls through to window() and still 404s below. GET /windows (the
+          // fleet list) stays open so the manual window still shows up there.
+          if (instance != null && instance !== '' && manager.isAutopilot(instance) === false) {
+            return send(403, { error: 'window under manual control', instance });
+          }
           const w = await manager.window(instance);
           if (!w) return send(404, { error: 'instance not found', instance });
+          // Reading one window is agent activity against that specific session — mark it
+          // (w.id is the resolved instance), but only when connected: a disconnected/connecting
+          // tab shouldn't flash its dot orange just because an agent polled it. Fleet list
+          // /windows stays unmarked.
+          if (w.id && w.state === 'connected') manager.markAgentActivity(w.id);
           // Observation is always allowed, but DOM depth respects `read` (mirror the MCP
           // dom-strip): omit the dom field entirely when read is off.
           if (!isCapEnabled(config, 'read') && w && typeof w === 'object' && 'dom' in w) {
@@ -180,6 +211,12 @@ async function startHttpServer(preferredPort, ctx) {
         }
         if (p === '/window/close' && req.method === 'POST') {
           if (!manager.get(instance)) return send(404, { error: 'instance not found', instance });
+          // Manual-mode guard: an agent may not close a human-only window (autopilot OFF) —
+          // 403 and leave it open. The operator still closes it via the panel (which drives the
+          // host directly, not this route). Fail-open on unknown id (already 404'd above).
+          if (manager.isAutopilot(instance) === false) {
+            return send(403, { error: 'window under manual control', instance });
+          }
           await manager.close(instance);
           return send(200, { ok: true, id: instance });
         }
@@ -190,8 +227,21 @@ async function startHttpServer(preferredPort, ctx) {
           if (!runner) return send(500, { error: 'no script runner' });
           const name = body.name != null ? body.name : u.searchParams.get('name');
           if (!name) return send(400, { error: 'name required' });
+          // Manual-mode guard: resolve the concrete target (explicit instance, else the
+          // latest-connected default the runner would pick) and reject if that window is
+          // human-only, so a saved script can't drive a manual window. Fail-open on unknown id.
+          const runId = instance != null && instance !== ''
+            ? instance
+            : (manager.latestConnected() && manager.latestConnected().id);
+          if (runId && manager.isAutopilot(runId) === false) {
+            return send(403, { error: 'window under manual control', instance: runId });
+          }
           try {
             const out = await runner.runScript(instance, name);
+            // A saved script ran against a concrete session — mark it agent-active (out.instance
+            // is the id the runner acted on, even when `instance` defaulted). Applies whether the
+            // script succeeded or errored, since either way it drove the tab.
+            if (out && out.instance) manager.markAgentActivity(out.instance);
             // A script that threw ran but errored: distinguish it (ok:false) from a 4xx.
             if (out.status === 'error') {
               return send(200, { ok: false, instance: out.instance, name: out.name, status: 'error', error: out.error });
@@ -235,6 +285,22 @@ async function startHttpServer(preferredPort, ctx) {
         return send(409, { error: 'session not connected', instance: session.id, state: session.state });
       }
 
+      // Shared manual-mode guard for the per-instance agent endpoints below
+      // (navigate/click/type/eval/screenshot/scroll/press/hover/text/url/wait): a window with
+      // autopilot OFF is human-only, so reject the agent action/read (403) before we mark or
+      // touch it — only the operator's panel drives that window. Fail-open on unknown id
+      // (isAutopilot defaults true), so normal windows are unaffected. Sits after host+token
+      // auth (an unauthed caller already got 401) and alongside the capability gate above.
+      if (manager.isAutopilot(session.id) === false) {
+        return send(403, { error: 'window under manual control', instance: session.id });
+      }
+
+      // Shared mark point for the per-instance agent-driving/reading endpoints below
+      // (navigate/click/type/eval/screenshot/scroll/press/hover/text/url/wait): this is
+      // where they resolve their concrete session (explicit `instance` or latest-connected),
+      // so one call keeps that session's agent-active dot lit. Guarded no-op on unknown id.
+      if (session && session.id) manager.markAgentActivity(session.id);
+
       switch (p) {
         case '/navigate': {
           const url = q('url');
@@ -246,7 +312,8 @@ async function startHttpServer(preferredPort, ctx) {
         case '/url':
           return send(200, { instance: session.id, url: await tab.currentUrl() });
         case '/text':
-          return send(200, { instance: session.id, text: await tab.getText(q('selector') || undefined) });
+          // Stripped read: a text pull never includes the injected bookmarks bar.
+          return send(200, { instance: session.id, text: await tab.getTextStripped(q('selector') || undefined) });
         case '/click': {
           const sel = q('selector');
           if (!sel) return send(400, { error: 'selector required' });
@@ -258,6 +325,34 @@ async function startHttpServer(preferredPort, ctx) {
           if (!sel) return send(400, { error: 'selector required' });
           await tab.type(sel, q('text') || '');
           return send(200, { ok: true, instance: session.id });
+        }
+        case '/scroll': {
+          const to = q('to');
+          const x = q('x'), y = q('y');
+          return send(200, { ok: true, instance: session.id, result: await tab.scroll({
+            x: x != null ? Number(x) : undefined,
+            y: y != null ? Number(y) : undefined,
+            selector: q('selector') || undefined,
+            to: to || undefined,
+          }) });
+        }
+        case '/press': {
+          const key = q('key');
+          if (!key) return send(400, { error: 'key required' });
+          return send(200, { instance: session.id, result: await tab.press({ key, selector: q('selector') || undefined }) });
+        }
+        case '/hover': {
+          const sel = q('selector');
+          if (!sel) return send(400, { error: 'selector required' });
+          return send(200, { instance: session.id, result: await tab.hover({ selector: sel }) });
+        }
+        case '/wait': {
+          const timeout = q('timeout');
+          return send(200, { instance: session.id, result: await tab.waitFor({
+            selector: q('selector') || undefined,
+            until: q('until') || undefined,
+            timeout: timeout != null ? Number(timeout) : undefined,
+          }) });
         }
         case '/eval': {
           const js = q('js') || q('expression');

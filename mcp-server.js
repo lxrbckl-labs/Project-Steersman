@@ -20,6 +20,8 @@ const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio
 const {
   ListToolsRequestSchema,
   CallToolRequestSchema,
+  ListResourcesRequestSchema,
+  ReadResourceRequestSchema,
 } = require('@modelcontextprotocol/sdk/types.js');
 
 const HOST = '127.0.0.1';
@@ -29,12 +31,35 @@ function log(msg) {
   process.stderr.write('[MCP] ' + msg + '\n');
 }
 
+// Strip a trailing path separator (but not from a bare root like "/" or "C:\") so
+// comparisons below aren't fooled by a stray trailing slash.
+function stripTrailingSep(p) {
+  if (p.length > 1 && (p.endsWith(path.sep) || p.endsWith('/'))) {
+    return p.slice(0, -1);
+  }
+  return p;
+}
+
+// Does `cwd` match `workspace` (equal, or one nested inside the other)? Both are assumed
+// already path.resolve()'d and trailing-sep-stripped.
+function workspaceMatchesCwd(workspace, cwd) {
+  if (workspace === cwd) return true;
+  if (cwd.startsWith(workspace + path.sep)) return true;
+  if (workspace.startsWith(cwd + path.sep)) return true;
+  return false;
+}
+
 // Resolve the extension's HTTP port + loopback auth token from the shared instance
 // registry that extension.js writes (~/.project-steersman/instances/<id>.json, each
-// { port, workspace, pid, token }). Resolution: if STEERSMAN_PORT is set, pick the entry
-// whose port matches; else if exactly one instance is registered, use it; else fall back
-// to the STEERSMAN_PORT/STEERSMAN_TOKEN env vars. Never throws — a missing token just
-// means calls will 401 and surface as tool errors.
+// { port, workspace, pid, token }). Resolution order:
+//   1. STEERSMAN_PORT env set -> pick the entry whose port matches (explicit override);
+//      if set but no entry matches, fall through to the env-based fallback (step 4).
+//   2. Workspace match -> among registry entries, pick the one whose `workspace` best
+//      matches this process's cwd (exact match, cwd nested in workspace, or workspace
+//      nested in cwd), preferring the longest/most-specific workspace path on ties.
+//   3. Exactly one registered instance -> use it.
+//   4. Fallback -> STEERSMAN_PORT/STEERSMAN_TOKEN env vars, else default port 3788/no token.
+// Never throws — a missing token just means calls will 401 and surface as tool errors.
 function resolveInstance() {
   const dir = path.join(os.homedir(), '.project-steersman', 'instances');
   const envPort = process.env.STEERSMAN_PORT ? Number(process.env.STEERSMAN_PORT) : null;
@@ -54,14 +79,53 @@ function resolveInstance() {
   } catch {
     entries = [];
   }
+
   let chosen = null;
+
+  // 1. Explicit STEERSMAN_PORT override.
   if (envPort != null) {
     chosen = entries.find((e) => Number(e.port) === envPort) || null;
-  } else if (entries.length === 1) {
+  }
+
+  // 2. Workspace match against this process's own cwd.
+  if (!chosen && envPort == null) {
+    let cwd = null;
+    try {
+      cwd = stripTrailingSep(path.resolve(process.cwd()));
+    } catch {
+      cwd = null;
+    }
+    if (cwd) {
+      let best = null;
+      for (const e of entries) {
+        if (!e.workspace) continue;
+        let ws;
+        try {
+          ws = stripTrailingSep(path.resolve(String(e.workspace)));
+        } catch {
+          continue;
+        }
+        if (workspaceMatchesCwd(ws, cwd)) {
+          if (!best || ws.length > best.ws.length) best = { entry: e, ws };
+        }
+      }
+      if (best) chosen = best.entry;
+    }
+  }
+
+  // 3. Exactly one registered instance.
+  if (!chosen && envPort == null && entries.length === 1) {
     chosen = entries[0];
   }
+
+  // 4. Env/default fallback.
   const port = chosen && chosen.port != null ? chosen.port : envPort != null ? envPort : 3788;
   const token = (chosen && chosen.token) || process.env.STEERSMAN_TOKEN || null;
+
+  if (chosen) {
+    log('targeting instance on port ' + port + ' (workspace ' + (chosen.workspace || '?') + ')');
+  }
+
   return { port, token };
 }
 
@@ -295,8 +359,108 @@ function makeTools(readEnabled) {
       },
       call: (a) => ({ method: 'POST', path: '/script/run', body: { instance: a.instance, name: a.name } }),
     },
+    {
+      name: 'scroll',
+      cap: 'interact',
+      description: "Scroll the page, either by a pixel offset (x/y), to a selector, or to 'top'/'bottom'.",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          ...INSTANCE_PROP,
+          x: { type: 'number', description: 'Horizontal scroll offset in pixels.' },
+          y: { type: 'number', description: 'Vertical scroll offset in pixels.' },
+          selector: { type: 'string', description: 'CSS selector to scroll into view.' },
+          to: { type: 'string', enum: ['top', 'bottom'], description: "Scroll to 'top' or 'bottom' of the page." },
+        },
+        required: ['instance'],
+        additionalProperties: false,
+      },
+      call: (a) => ({
+        method: 'POST',
+        path: '/scroll',
+        body: { instance: a.instance, x: a.x, y: a.y, selector: a.selector, to: a.to },
+      }),
+    },
+    {
+      name: 'press_key',
+      cap: 'interact',
+      description: 'Press a key (Enter, Tab, ArrowDown, etc.), optionally focusing a selector first.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          ...INSTANCE_PROP,
+          key: { type: 'string', description: "Key to press, e.g. 'Enter', 'Tab', 'ArrowDown'." },
+          selector: { type: 'string', description: 'Optional CSS selector to focus before pressing the key.' },
+        },
+        required: ['instance', 'key'],
+        additionalProperties: false,
+      },
+      call: (a) => ({
+        method: 'POST',
+        path: '/press',
+        body: { instance: a.instance, key: a.key, selector: a.selector },
+      }),
+    },
+    {
+      name: 'hover',
+      cap: 'interact',
+      description: 'Hover the first element matching a CSS selector.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          ...INSTANCE_PROP,
+          selector: { type: 'string', description: 'CSS selector of the element to hover.' },
+        },
+        required: ['instance', 'selector'],
+        additionalProperties: false,
+      },
+      call: (a) => ({ method: 'POST', path: '/hover', body: { instance: a.instance, selector: a.selector } }),
+    },
+    {
+      name: 'wait_for',
+      cap: null,
+      description:
+        "Wait for a selector to appear or the page to finish loading ('load'), bounded by an " +
+        'optional timeout in milliseconds.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          ...INSTANCE_PROP,
+          selector: { type: 'string', description: 'CSS selector to wait for.' },
+          until: { type: 'string', enum: ['load'], description: "Wait for the page 'load' event instead of a selector." },
+          timeout: { type: 'number', description: 'Maximum time to wait, in milliseconds.' },
+        },
+        required: ['instance'],
+        additionalProperties: false,
+      },
+      call: (a) => ({
+        method: 'POST',
+        path: '/wait',
+        body: { instance: a.instance, selector: a.selector, until: a.until, timeout: a.timeout },
+      }),
+    },
   ];
 }
+
+// Static resource catalogue: the two capability-filtered markdown API references the
+// extension serves token-exempt at GET /docs/fleet and GET /docs/tab.
+const RESOURCES = [
+  {
+    uri: 'steersman://docs/fleet',
+    name: 'Steersman Fleet API',
+    description: 'API reference for managing all Project Steersman browser windows',
+    mimeType: 'text/markdown',
+    path: '/docs/fleet',
+  },
+  {
+    uri: 'steersman://docs/tab',
+    name: 'Steersman Tab API',
+    description: 'API reference for driving a single browser window',
+    mimeType: 'text/markdown',
+    path: '/docs/tab',
+  },
+];
+const RESOURCES_BY_URI = new Map(RESOURCES.map((r) => [r.uri, r]));
 
 // Fetch /capabilities: returns { enabled:Set<id>, instructions:string }. On any failure
 // we degrade gracefully — no enabled caps (observation-only) and a fallback instruction.
@@ -336,7 +500,7 @@ async function main() {
   // The composed capability prompt is delivered to the client's model via `instructions`.
   const server = new Server(
     { name: 'project-steersman', version: '0.0.1' },
-    { capabilities: { tools: {} }, instructions }
+    { capabilities: { tools: {}, resources: {} }, instructions }
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -375,6 +539,44 @@ async function main() {
       return {
         isError: true,
         content: [{ type: 'text', text: tool.name + ' failed: ' + e.message }],
+      };
+    }
+  });
+
+  server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+    resources: RESOURCES.map(({ uri, name, description, mimeType }) => ({ uri, name, description, mimeType })),
+  }));
+
+  server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
+    const resource = RESOURCES_BY_URI.get(req.params.uri);
+    if (!resource) {
+      throw new Error('Unknown resource: ' + req.params.uri);
+    }
+    try {
+      const { status, json } = await apiRequest('GET', resource.path);
+      if (status < 200 || status >= 300) {
+        const detail = json && json.error ? json.error : JSON.stringify(json);
+        return {
+          contents: [
+            {
+              uri: resource.uri,
+              mimeType: 'text/plain',
+              text: 'HTTP ' + status + ' from ' + resource.path + ': ' + detail,
+            },
+          ],
+        };
+      }
+      // /docs/* responds with raw markdown, which apiRequest's JSON.parse attempt fails on
+      // and falls back to { raw: body } for — unwrap that back to the plain markdown text.
+      const text = json && typeof json === 'object' && 'raw' in json ? json.raw : JSON.stringify(json);
+      return { contents: [{ uri: resource.uri, mimeType: resource.mimeType, text }] };
+    } catch (e) {
+      // Extension unreachable — surface a readable error as the resource body rather than
+      // throwing, so a client can still see why the doc is unavailable.
+      return {
+        contents: [
+          { uri: resource.uri, mimeType: 'text/plain', text: 'Failed to fetch ' + resource.path + ': ' + e.message },
+        ],
       };
     }
   });

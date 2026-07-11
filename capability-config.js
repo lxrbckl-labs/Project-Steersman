@@ -61,13 +61,13 @@ const CAPABILITIES = [
     label: 'Interact (click/type)',
     enabled: true,
     risky: false,
-    instruction: 'You may click elements and type into fields using CSS selectors.',
+    instruction: 'You may click elements, type into fields, scroll the page, hover elements, and press keys using CSS selectors.',
     restriction: 'You MUST NOT click or type — disabled by the operator.',
   },
   {
     id: 'eval',
     label: 'Eval (arbitrary JS)',
-    enabled: false,
+    enabled: true,
     risky: true,
     instruction: 'You may execute arbitrary JavaScript in a tab\'s page context.',
     restriction: 'You MUST NOT run arbitrary JavaScript (eval) — this capability is disabled by the operator.',
@@ -148,6 +148,15 @@ class CapabilityConfig {
       for (const c of restricted) rules.push('- ' + c.restriction);
       parts.push(rules.join('\n'));
     }
+
+    // Standing note, independent of which capabilities are enabled: manual-mode windows
+    // are off-limits no matter what the operator has toggled above.
+    parts.push(
+      'MANUAL WINDOWS: Some browser windows may be under manual human control (shown as ' +
+      '`autopilot: false` in the window list). Do NOT act on, run scripts against, or close ' +
+      'a window whose autopilot is false — those calls are rejected. Check the window list ' +
+      'and leave manual windows alone.'
+    );
 
     return parts.join('\n\n');
   }

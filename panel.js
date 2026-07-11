@@ -64,6 +64,12 @@ class ProjectSteersmanPanel {
     // the extension host owns it so HTTP /capabilities reads the same instance the Settings
     // handlers below mutate. Falls back to a fresh one only if a caller omits it.
     this._config = deps.capabilityConfig || new CapabilityConfig();
+    // Bookmarks store (Phase 1) + the hook that re-injects the live in-page bars after a
+    // Settings-editor mutation; both are optional so the panel still works feature-off.
+    this._bookmarks = deps.bookmarksStore || null;
+    this._refreshBars = deps.refreshBookmarkBars || null;
+    // Best-effort favicon fetcher (Phase 3); optional so bookmarks still work without it.
+    this._favicons = deps.faviconFetcher || null;
     // Loopback auth token the HTTP API now requires; included in the copy-prompt so manual/
     // direct HTTP driving still works. Local/ephemeral only — never written to a log line.
     this._token = deps.token || null;
@@ -112,14 +118,36 @@ class ProjectSteersmanPanel {
         // the existing per-window action instructions (prepend only — nothing is removed).
         // Every request to the local HTTP API now requires the loopback auth header; note
         // it (with a curl example) so a human driving the API directly can authenticate.
+        // Point the example curl at the actually-bound port (a 2nd instance may be on 3789+),
+        // matching the port the prompt body uses; fall back to 3788 only if getPort is unset.
+        const authPort = this._getPort ? this._getPort() : 3788;
         const authNote = this._token
           ? '\n\n---\n\nAUTH: every request to the local HTTP API must send the header ' +
             '`x-steersman-token: ' + this._token + '` — e.g. ' +
-            '`curl -H "x-steersman-token: ' + this._token + '" http://localhost:3788/url`.'
+            '`curl -H "x-steersman-token: ' + this._token + '" http://localhost:' + authPort + '/url`.'
           : '';
-        const prompt = this._config.compose() + '\n\n---\n\n' + this._manager.buildPrompt(msg.id) + authNote;
+        const prompt = this._config.compose() + '\n\n---\n\n' + this._manager.buildPrompt(msg.id, this._config) + authNote;
         await vscode.env.clipboard.writeText(prompt);
         this._post({ type: 'copied', id: msg.id });
+        break;
+      }
+      case 'copyFleetPrompt': {
+        // Fleet-scoped sibling of copyPrompt: same composed role debrief + capability
+        // rules + auth note, but the action guide covers the WHOLE surface (manage/create/
+        // drive any window) instead of one baked-in window — buildFleetPrompt takes no id.
+        // Point the example curl at the actually-bound port (a 2nd instance may be on 3789+),
+        // matching the port the prompt body uses; fall back to 3788 only if getPort is unset.
+        const authPort = this._getPort ? this._getPort() : 3788;
+        const authNote = this._token
+          ? '\n\n---\n\nAUTH: every request to the local HTTP API must send the header ' +
+            '`x-steersman-token: ' + this._token + '` — e.g. ' +
+            '`curl -H "x-steersman-token: ' + this._token + '" http://localhost:' + authPort + '/url`.'
+          : '';
+        const prompt = this._config.compose() + '\n\n---\n\n' + this._manager.buildFleetPrompt(this._config) + authNote;
+        await vscode.env.clipboard.writeText(prompt);
+        // Same 'copied' postback shape the per-session copy uses; id:'fleet' sentinel tells
+        // the webview it was the fleet button that flashed (no per-window instance applies).
+        this._post({ type: 'copied', id: 'fleet' });
         break;
       }
       case 'getSettings':
@@ -143,6 +171,16 @@ class ProjectSteersmanPanel {
       case 'closeSession':
         await this._manager.close(msg.id);
         break;
+      case 'setAutopilot':
+        // Flip a window's autopilot posture (wheel toggle): true = agents may drive it,
+        // false = MANUAL/human-only (HTTP server 403s agent calls). setAutopilot fires
+        // onDidChangeSessions -> _postState re-runs -> the wheel updates. Guarded; never throws.
+        try {
+          if (this._manager) this._manager.setAutopilot(msg.id, !!msg.enabled);
+        } catch (e) {
+          this._log.appendLine('[Panel] setAutopilot ' + (msg && msg.id) + ' failed: ' + (e && e.message ? e.message : e));
+        }
+        break;
       case 'runScript':
         // Operator action (NOT gated by the run_script capability — that only gates
         // Claude's MCP tool). A script that itself throws is recorded as status:'error'
@@ -155,6 +193,58 @@ class ProjectSteersmanPanel {
         }
         this._postState();
         break;
+      case 'getBookmarks':
+        this._postBookmarks();
+        break;
+      case 'setBookmarksBarEnabled':
+        // Flip the persisted global flag, re-run injection/removal across every live tab,
+        // then repost the tree so the webview's toggle reflects the new state; guarded
+        // no-op (never a throw) when the bookmarks store is off.
+        if (this._bookmarks) {
+          try {
+            this._bookmarks.setBarEnabled(!!msg.enabled);
+            if (this._refreshBars) await this._refreshBars();
+          } catch (e) {
+            this._log.appendLine('[Panel] setBookmarksBarEnabled failed: ' + (e && e.message ? e.message : e));
+          }
+          this._postBookmarks();
+        }
+        break;
+      case 'addBookmark': {
+        let created = null;
+        await this._mutateBookmarks(() => {
+          if (this._isDangerousBookmarkUrl(msg.url)) return;
+          created = this._bookmarks.addBookmark(msg.parentId, { title: msg.title, url: msg.url });
+        });
+        // Fire-and-forget: the tree above already reposted with the new bookmark, so the
+        // favicon just fills in whenever the fetch resolves (never blocks the add).
+        if (created && created.id) this._fetchFavicon(created.id, msg.url);
+        break;
+      }
+      case 'addFolder':
+        await this._mutateBookmarks(() => this._bookmarks.addFolder(msg.parentId, msg.name));
+        break;
+      case 'removeBookmark':
+        await this._mutateBookmarks(() => this._bookmarks.remove(msg.id));
+        break;
+      case 'renameBookmark':
+        await this._mutateBookmarks(() => this._bookmarks.rename(msg.id, msg.name));
+        break;
+      case 'moveBookmark':
+        await this._mutateBookmarks(() => this._bookmarks.move(msg.id, msg.newParentId, msg.index));
+        break;
+      case 'updateBookmark': {
+        const fields = msg.fields || {};
+        await this._mutateBookmarks(() => {
+          if (fields.url !== undefined && this._isDangerousBookmarkUrl(fields.url)) return;
+          this._bookmarks.update(msg.id, fields);
+        });
+        // Same fire-and-forget favicon refresh as addBookmark, only when the url actually changed.
+        if (fields.url !== undefined && !this._isDangerousBookmarkUrl(fields.url)) {
+          this._fetchFavicon(msg.id, fields.url);
+        }
+        break;
+      }
       case 'openExternal': {
         let parsed;
         try { parsed = new URL(msg.url); }
@@ -252,21 +342,20 @@ class ProjectSteersmanPanel {
       this._log.appendLine('[Panel] focusSession ' + id + ': no stored viewColumn to focus (tab may have never opened or dropped)');
     }
 
-    // 2. Activate the specific browser tab within that group (the group's active tab
-    //    may be some other editor). openEditorAtIndex acts on the just-focused group.
+    // 2. Make the session's exact browser tab the ACTIVE editor in that group.
+    //    Focusing the group alone only lands on whichever sibling tab was already
+    //    active (with two browser tabs open, that's the OTHER one), and a bare
+    //    openEditorAtIndex can silently no-op on an editor-browser (webview) tab — which
+    //    is why "Focus" appeared to do nothing when another browser tab was in front.
+    //    _activateTabInGroup verifies the switch actually took and, if not, cycles the
+    //    group's editors until our tab wins.
     if (located && column) {
-      const idx = located.group.tabs.indexOf(located.tab);
-      const cmd = ProjectSteersmanPanel._OPEN_AT_INDEX_COMMANDS[idx];
-      if (cmd) {
-        try {
-          await vscode.commands.executeCommand(cmd);
-          revealed = true;
-          this._log.appendLine('[Panel] focusSession ' + id + ': focused group viewColumn ' + column + ', activated tab index ' + idx);
-        } catch (e) {
-          this._log.appendLine('[Panel] focusSession ' + id + ': openEditorAtIndex(' + idx + ') failed: ' + (e && e.message ? e.message : e));
-        }
+      const activated = await this._activateTabInGroup(column, located.tab);
+      if (activated) {
+        revealed = true;
+        this._log.appendLine('[Panel] focusSession ' + id + ': activated browser tab in viewColumn ' + column);
       } else {
-        this._log.appendLine('[Panel] focusSession ' + id + ': tab index ' + idx + ' out of openEditorAtIndex range; group-focus only');
+        this._log.appendLine('[Panel] focusSession ' + id + ': could not make browser tab active in viewColumn ' + column + '; group-focus only');
       }
     } else {
       this._log.appendLine('[Panel] focusSession ' + id + ': tab not found, group-focus only');
@@ -290,17 +379,90 @@ class ProjectSteersmanPanel {
     }
   }
 
+  // True when `tab` is currently the active editor of its group. Matched by object
+  // IDENTITY only, never by label: every editor-browser tab carries the same debug
+  // session label ("Project Steersman"), so a label match here would treat a sibling
+  // browser tab as "already active" and skip the switch — the very bug we're fixing.
+  // VS Code keeps a Tab's object stable for its lifetime, so identity is the reliable
+  // signal. Never throws.
+  _isTabActive(tab) {
+    if (!tab) return false;
+    try {
+      const groups = (vscode.window.tabGroups && vscode.window.tabGroups.all) || [];
+      for (const g of groups) {
+        if (g.activeTab === tab) return true;
+      }
+    } catch (e) {
+      this._log.appendLine('[Panel] isTabActive error: ' + (e && e.message ? e.message : e));
+    }
+    return false;
+  }
+
+  // Re-read the live editor group for a viewColumn (VS Code hands back fresh group
+  // snapshots, so we re-fetch after each focus/switch command). null if none matches.
+  _groupForColumn(column) {
+    const groups = (vscode.window.tabGroups && vscode.window.tabGroups.all) || [];
+    for (const g of groups) {
+      if (g.viewColumn === column) return g;
+    }
+    return null;
+  }
+
+  // Make `targetTab` the ACTIVE editor within its group. Focuses the group first (so the
+  // switch commands act on the right one), then tries the direct index command (no
+  // intermediate tabs flash) — and because openEditorAtIndex can no-op on an
+  // editor-browser webview tab, falls back to cycling nextEditorInGroup, which reliably
+  // re-activates ANY editor type, until the live group's active tab IS our target.
+  // Bounded by the group's tab count; verified via object identity; never throws.
+  async _activateTabInGroup(column, targetTab) {
+    try {
+      if (typeof this._focusEditorGroupByColumn === 'function') {
+        await this._focusEditorGroupByColumn(column);
+      }
+      if (this._isTabActive(targetTab)) return true;
+
+      // Direct jump by index when the tab sits where we located it and within range.
+      const g0 = this._groupForColumn(column);
+      if (g0) {
+        const idx = g0.tabs.indexOf(targetTab);
+        const cmd = idx >= 0 ? ProjectSteersmanPanel._OPEN_AT_INDEX_COMMANDS[idx] : null;
+        if (cmd) {
+          await vscode.commands.executeCommand(cmd);
+          if (this._isTabActive(targetTab)) return true;
+        }
+      }
+
+      // Fallback: step through the (focused) group's editors until ours is the active
+      // one. nextEditorInGroup switches the active editor for any tab type, so this lands
+      // on the browser tab even when the index command leaves it untouched.
+      const g = this._groupForColumn(column);
+      const steps = g ? g.tabs.length : 0;
+      for (let i = 0; i < steps; i++) {
+        await vscode.commands.executeCommand('workbench.action.nextEditorInGroup');
+        if (this._isTabActive(targetTab)) return true;
+      }
+    } catch (e) {
+      this._log.appendLine('[Panel] activateTabInGroup error: ' + (e && e.message ? e.message : e));
+    }
+    return this._isTabActive(targetTab);
+  }
+
   // ---- State push (host -> webview) ----
 
   // Push session roster + the saved-script list to the webview. Each session entry is
   // augmented (additively) with its activity (carrying activity.script = the last run's
-  // {name,status,...}|null) so the webview can render the per-row dropdown + status.
+  // {name,status,...}|null) and its agentActive flag (so the webview can pulse the status
+  // dot orange while an agent is actively driving that tab) so the webview can render the
+  // per-row dropdown + status.
   _postState() {
     if (!this._panel) return;
     const port = this._getPort ? this._getPort() : null;
     const sessions = this._manager.list().map((s) => {
       const full = this._manager.get(s.id);
-      return { ...s, activity: full ? this._manager.activityOf(full) : null };
+      return {
+        ...s,
+        activity: full ? this._manager.activityOf(full) : null,
+      };
     });
     const scripts = this._scriptRunner ? this._scriptRunner.listScripts() : [];
     this._post({ type: 'state', sessions, port: port == null ? null : port, scripts });
@@ -309,6 +471,55 @@ class ProjectSteersmanPanel {
   // Push the current capability settings (composedPreview recomputed fresh) to the webview.
   _postSettings() {
     this._post({ type: 'settings', settings: this._config.getState() });
+  }
+
+  // Push the current bookmark tree + the persisted bar-enabled flag to the webview; an
+  // empty tree and enabled:true when the store is off (feature-off is a no-op, never a throw).
+  _postBookmarks() {
+    this._post({
+      type: 'bookmarks',
+      tree: this._bookmarks ? this._bookmarks.getTree() : { children: [] },
+      barEnabled: this._bookmarks ? this._bookmarks.getBarEnabled() : true,
+    });
+  }
+
+  // True for a bookmark url whose scheme could run script on click (javascript:/vbscript:,
+  // checked case-insensitively after trimming) — a bookmark must never be a code-exec vector.
+  _isDangerousBookmarkUrl(url) {
+    const trimmed = typeof url === 'string' ? url.trim().toLowerCase() : '';
+    return trimmed.startsWith('javascript:') || trimmed.startsWith('vbscript:');
+  }
+
+  // Run a bookmark mutation against this._bookmarks (guarded no-op when the store is off),
+  // then refresh the live in-page bars and push the fresh tree back to the webview. Errors
+  // are logged, never thrown, so a failed edit still leaves the UI showing a consistent tree.
+  async _mutateBookmarks(fn) {
+    if (!this._bookmarks) return;
+    try {
+      fn();
+    } catch (e) {
+      this._log.appendLine('[Panel] bookmark mutation failed: ' + (e && e.message ? e.message : e));
+    }
+    try {
+      if (this._refreshBars) await this._refreshBars();
+    } catch (e) {
+      this._log.appendLine('[Panel] refreshBookmarkBars failed: ' + (e && e.message ? e.message : e));
+    }
+    this._postBookmarks();
+  }
+
+  // Fire-and-forget favicon fetch for a bookmark that was just added/re-pointed: never awaited
+  // by the caller, so a slow or failing fetch can't block the add/update response. Once (if) it
+  // resolves with a data-URI we merge it in, refresh the live bars, and repost the tree so the
+  // icon appears; a missing fetcher, dangerous url, null result, or thrown error are all no-ops.
+  _fetchFavicon(id, url) {
+    if (!this._favicons || !id || this._isDangerousBookmarkUrl(url)) return;
+    this._favicons.fetch(url).then((dataUri) => {
+      if (!dataUri) return;
+      this._bookmarks.update(id, { favicon: dataUri });
+      if (this._refreshBars) this._refreshBars();
+      this._postBookmarks();
+    }).catch(() => {});
   }
 
   _post(message) {

@@ -9,6 +9,8 @@ const { SessionManager } = require('./session-manager');
 const { ProjectSteersmanPanel } = require('./panel');
 const { CapabilityConfig } = require('./capability-config');
 const { ScriptRunner } = require('./script-runner');
+const { BookmarksStore } = require('./bookmarks-store');
+const { FaviconFetcher } = require('./favicon-fetcher');
 
 let log;
 let manager = null;
@@ -18,6 +20,13 @@ let scriptRunner = null;
 // One capability config per activation (one VS Code window). Shared, in-memory: the
 // panel's Settings handlers mutate it and the HTTP /capabilities endpoint reads it.
 let capabilityConfig = null;
+// Global bookmark tree (folders + bookmarks), persisted in globalState so it is shared
+// across all windows. The session layer injects it as an in-page bar; Phase 2's UI edits it.
+let bookmarks = null;
+// One favicon fetcher per activation: resolves a bookmark's favicon to a data: URI (Node-side,
+// so the in-page bar's img-src CSP never sees a live cross-origin request). Shared by the panel
+// (fetch-on-add) and the activation backfill below.
+let favicons = null;
 let extensionUri = null;
 let httpServer = null;
 let statusBarItem = null;
@@ -48,18 +57,51 @@ function activate(context) {
   statusBarItem.show();
 
   capabilityConfig = new CapabilityConfig();
+  bookmarks = new BookmarksStore(context.globalState);
+  favicons = new FaviconFetcher();
   apiToken = crypto.randomBytes(32).toString('hex');
+
+  // Clear registry entries left behind by extension hosts that crashed without unregistering.
+  pruneStaleInstances();
 
   manager = new SessionManager({
     log,
     createTab,
     getPort: () => actualPort,
     getStartUrl: () => vscode.workspace.getConfiguration('projectSteersman').get('startUrl', 'about:blank'),
+    bookmarksStore: bookmarks,
   });
   scriptRunner = new ScriptRunner({ manager, getScriptsDir, log });
 
   context.subscriptions.push(manager.onDidChangeSessions(updateStatus));
   updateStatus();
+
+  // Remove a session when the user closes its integrated-browser editor tab: the Tab we
+  // captured at create() (session.editorTab) reappears in onDidChangeTabs' `closed` array by
+  // the same stable reference, so we match it back to its session and call manager.close()
+  // (tears down the CDPTab and fires onDidChangeSessions so the panel drops the row). This
+  // fires only on an actual tab close — a transient CDP drop leaves the tab open and is handled
+  // separately by _handleTabDisconnect — so a dropped-but-open session is never removed here.
+  // Guarded end to end: an unavailable API, a non-match, or any error is a silent no-op.
+  const tabGroups = vscode.window.tabGroups;
+  if (tabGroups && typeof tabGroups.onDidChangeTabs === 'function') {
+    context.subscriptions.push(
+      tabGroups.onDidChangeTabs((e) => {
+        try {
+          for (const tab of (e.closed || [])) {
+            const id = manager.sessionIdForEditorTab(tab);
+            if (!id) continue;
+            log.appendLine('[Bridge] browser tab closed; removing session ' + id);
+            manager.close(id).catch((err) =>
+              log.appendLine('[Bridge] close on tab-close failed: ' + (err && err.message ? err.message : err))
+            );
+          }
+        } catch (err) {
+          log.appendLine('[Bridge] onDidChangeTabs handler error: ' + (err && err.message ? err.message : err));
+        }
+      })
+    );
+  }
 
   context.subscriptions.push(
     log,
@@ -91,6 +133,44 @@ function activate(context) {
   if (cfg.get('autoLaunchWindow', false)) {
     manager.create().catch((e) => log.appendLine('[Bridge] autoLaunchWindow failed: ' + (e && e.message ? e.message : e)));
   }
+
+  // Best-effort background backfill: fill in favicons for any bookmark that doesn't have one
+  // yet (freshly seeded, or added before this feature existed). Fire-and-forget - never
+  // awaited here - so a slow or failing favicon service can never delay or break activation.
+  backfillFavicons().catch((e) => log.appendLine('[Bridge] backfillFavicons failed: ' + (e && e.message ? e.message : e)));
+}
+
+// Walk the whole bookmark tree once and fetch a favicon for every bookmark that doesn't have
+// one yet, persisting each hit through the store and refreshing any open bookmark bars once at
+// the end. Sequential (one host at a time) so a burst of bookmarks at startup doesn't hammer
+// the favicon service; every per-bookmark failure is swallowed (favicons.fetch() itself never
+// throws) so one bad URL can never stop the rest of the walk or destabilize activation.
+async function backfillFavicons() {
+  if (!bookmarks || !favicons) return;
+  const pending = collectMissingFavicons(bookmarks.getTree());
+  if (!pending.length) return;
+  let changed = false;
+  for (const node of pending) {
+    try {
+      const dataUri = await favicons.fetch(node.url);
+      if (dataUri) {
+        bookmarks.update(node.id, { favicon: dataUri });
+        changed = true;
+      }
+    } catch (e) {
+      log.appendLine('[Bridge] favicon backfill failed for ' + node.url + ': ' + (e && e.message ? e.message : e));
+    }
+  }
+  if (changed && manager) manager.refreshBookmarkBars();
+}
+
+// Recursively collect every bookmark node (not folders) with a missing/empty favicon.
+function collectMissingFavicons(node, out = []) {
+  for (const child of (node && node.children) || []) {
+    if (child.type === 'folder') collectMissingFavicons(child, out);
+    else if (child.type === 'bookmark' && !child.favicon) out.push(child);
+  }
+  return out;
 }
 
 // Factory used by the session manager: open one integrated-browser tab, CDP-connect
@@ -385,7 +465,21 @@ function getScriptsDir() {
 
 // Shared deps handed to the webview panel (fresh-open and serializer-revive both use it).
 function panelDeps() {
-  return { manager, scriptRunner, getPort: () => actualPort, log, extensionUri, focusEditorGroupByColumn, capabilityConfig, token: apiToken };
+  return {
+    manager,
+    scriptRunner,
+    getPort: () => actualPort,
+    log,
+    extensionUri,
+    focusEditorGroupByColumn,
+    capabilityConfig,
+    bookmarksStore: bookmarks,
+    // Lets the panel fetch a data-URI favicon (Node-side) when a bookmark is added.
+    faviconFetcher: favicons,
+    // Lets the panel re-inject the live in-page bookmarks bar after a Settings-editor edit.
+    refreshBookmarkBars: () => manager.refreshBookmarkBars(),
+    token: apiToken,
+  };
 }
 
 // Open (or reveal) the webview editor tab that drives sessions. Ensure the HTTP server
@@ -455,8 +549,9 @@ async function registerInstance(port) {
   try {
     fs.mkdirSync(INSTANCES_DIR, { recursive: true });
     const workspace = (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0].uri.fsPath) || `pid-${process.pid}`;
-    const id = crypto.createHash('md5').update(workspace).digest('hex').slice(0, 12);
-    instanceFile = path.join(INSTANCES_DIR, `${id}.json`);
+    // Key the file by PID (unique per extension-host window) so two windows on the SAME
+    // workspace write DISTINCT files and never overwrite/unregister each other's entry.
+    instanceFile = path.join(INSTANCES_DIR, `${process.pid}.json`);
     fs.writeFileSync(instanceFile, JSON.stringify({ port, workspace, pid: process.pid, token: apiToken }, null, 2));
     log.appendLine('[Bridge] registered instance ' + instanceFile);
   } catch (e) {
@@ -470,6 +565,40 @@ async function unregisterInstance() {
       fs.unlinkSync(instanceFile);
     } catch {}
     instanceFile = null;
+  }
+}
+
+// Best-effort sweep of crash-leftover entries: drop any file whose owning PID is no longer
+// alive. `process.kill(pid, 0)` sends no signal — it only probes existence: ESRCH means the
+// process is gone (prune it); EPERM means it exists but isn't ours (alive — keep). Fully
+// guarded so a bad file, a race, or a permissions quirk never throws or blocks activation.
+function pruneStaleInstances() {
+  try {
+    fs.mkdirSync(INSTANCES_DIR, { recursive: true });
+    for (const name of fs.readdirSync(INSTANCES_DIR)) {
+      if (!name.endsWith('.json')) continue;
+      const p = path.join(INSTANCES_DIR, name);
+      let entry;
+      try {
+        entry = JSON.parse(fs.readFileSync(p, 'utf8'));
+      } catch {
+        continue; // unparseable — leave it alone
+      }
+      if (!entry || typeof entry.pid !== 'number') continue;
+      let dead = false;
+      try {
+        process.kill(entry.pid, 0);
+      } catch (e) {
+        if (e.code === 'ESRCH') dead = true; // gone; EPERM => alive-but-not-ours, keep
+      }
+      if (dead) {
+        try {
+          fs.unlinkSync(p);
+        } catch {}
+      }
+    }
+  } catch (e) {
+    log.appendLine('[Bridge] pruneStaleInstances failed: ' + e.message);
   }
 }
 
