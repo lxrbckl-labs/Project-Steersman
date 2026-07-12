@@ -45,8 +45,16 @@ const CAPABILITIES = [
     label: 'Read page (text/DOM/URL)',
     enabled: true,
     risky: false,
-    instruction: "You may read a page's visible text, DOM, and current URL to understand its state.",
+    instruction: "You may read a page's visible text, DOM, and current URL to understand its state. You can also fetch what changed since your last check, and locate elements by description.",
     restriction: 'You MUST NOT read page content — disabled by the operator.',
+  },
+  {
+    id: 'inspect',
+    label: 'Inspect (console/network)',
+    enabled: true,
+    risky: false,
+    instruction: "You may read the page's console output (logs, warnings, errors) and its network activity (requests, responses, failures) to debug how the page behaves.",
+    restriction: 'You MUST NOT read console or network activity — disabled by the operator.',
   },
   {
     id: 'screenshot',
@@ -78,11 +86,22 @@ const CAPABILITIES = [
     enabled: true,
     risky: true,
     instruction:
-      "You may run saved scripts (from the project's scripts/ folder) against a tab. " +
-      'If the project has no scripts/ folder, create one, and manage all scripts there ' +
-      '(create, read, update — never delete without asking). Each script is a .js file ' +
-      "whose body is evaluated in the tab's page context.",
+      'You may run saved scripts against a tab. Scripts live centrally at ' +
+      '`~/.project-steersman/scripts/` (shared across all windows); manage them there ' +
+      '(create, read, update — and delete via the Settings Scripts table, never by hand ' +
+      "without asking). Each script is a .js file whose body is evaluated in the tab's page context.",
     restriction: 'You MUST NOT run saved scripts — disabled by the operator.',
+  },
+  {
+    id: 'run_python',
+    label: 'Run Python scripts',
+    enabled: true,
+    risky: true,
+    instruction:
+      'You may run saved PYTHON scripts (.py). Unlike JS scripts (evaluated inside the page), ' +
+      'a .py script runs as a HOST process that drives the tab through the HTTP API — it ' +
+      'executes arbitrary code on the machine, so it is more powerful and more dangerous.',
+    restriction: 'You MUST NOT run Python scripts — this capability is disabled by the operator.',
   },
 ];
 

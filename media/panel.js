@@ -9,8 +9,14 @@
   const vscode = acquireVsCodeApi();
 
   // ── State ───────────────────────────────────────────────────
-  /** @type {{sessions: Array<{id:string,state:string,url:string,activity:(Object|null)}>, port: (number|string|null), view: ('sessions'|'settings'), settings: (Object|null), scripts: Array<{name:string}>, bookmarks: (Object|null), bookmarksBarEnabled: boolean}} */
-  let model = { sessions: [], port: null, view: 'sessions', settings: null, scripts: [], bookmarks: null, bookmarksBarEnabled: true };
+  /** @type {{sessions: Array<{id:string,state:string,url:string,activity:(Object|null)}>, port: (number|string|null), view: ('sessions'|'settings'), settings: (Object|null), scripts: Array<{name:string}>, bookmarks: (Object|null), bookmarksBarEnabled: boolean, version: string}} */
+  let model = { sessions: [], port: null, view: 'sessions', settings: null, scripts: [], bookmarks: null, bookmarksBarEnabled: true, version: '' };
+
+  // ── Update-check UI state — module-scoped (like expandedFolders/addForm)
+  // so it survives the full-rebuild render() instead of resetting each time
+  // model is pushed from the host. { status: 'idle'|'checking'|'upToDate'|
+  // 'updateAvailable'|'error', latest, releasesUrl, error, current }.
+  let updateState = { status: 'idle' };
 
   // ── Bookmark-manager UI state — kept at module scope so it survives the
   // full-rebuild render(): which folders are open, which add-form/rename is
@@ -124,6 +130,38 @@
     return svgIcon([
       'M4 1.5A1.5 1.5 0 0 0 2.5 3v11.5a.5.5 0 0 0 .8.4L8 11.62l4.7 3.28a.5.5 0 0 0 .8-.4V3A1.5 1.5 0 0 0 12 1.5H4z'
     ]);
+  }
+
+  function packageIcon() {
+    // Closed 3-D parcel glyph for the update badge — matches Project Nomeda's
+    // update-extension button icon (src/settings-panel/webview/main.ts
+    // UPDATE_EXTENSION_ICON_SVG) so both extensions' update controls read the
+    // same "box" affordance. Stroke-based (outline cube, no fill), so — like
+    // wheelIcon() above — it bypasses svgIcon's hardcoded fill/evenodd paths
+    // and builds the <svg> directly.
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('width', '13');
+    svg.setAttribute('height', '13');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('fill', 'none');
+    svg.setAttribute('stroke', 'currentColor');
+    svg.setAttribute('stroke-width', '1.9');
+    svg.setAttribute('stroke-linecap', 'round');
+    svg.setAttribute('stroke-linejoin', 'round');
+    svg.setAttribute('aria-hidden', 'true');
+    [
+      'M12 3l8 4.5l0 9l-8 4.5l-8 -4.5l0 -9l8 -4.5',
+      'M12 12l8 -4.5',
+      'M12 12l0 9',
+      'M12 12l-8 -4.5',
+      'M16 5.25l-8 4.5'
+    ].forEach(function (d) {
+      const p = document.createElementNS(NS, 'path');
+      p.setAttribute('d', d);
+      svg.appendChild(p);
+    });
+    return svg;
   }
 
   function chevronIcon() {
@@ -252,7 +290,8 @@
     placeholder.disabled = true;
     select.appendChild(placeholder);
     scripts.forEach(function (sc) {
-      const opt = h('option', {}, sc.name);
+      const lang = sc.lang || 'js';
+      const opt = h('option', {}, sc.name + '  (' + lang + ')');
       opt.value = sc.name;
       select.appendChild(opt);
     });
@@ -570,6 +609,36 @@
     );
   }
 
+  // ── Scripts section — flat list of the central script-dir entries already
+  // pushed in model.scripts (shared, read-only here, with the per-session
+  // script pickers); the only affordance is delete.
+  function scriptRow(sc) {
+    const lang = sc.lang || 'js';
+    return h(
+      'div',
+      { className: 'script-row' },
+      h('span', { className: 'script-name', title: sc.name }, sc.name),
+      h('span', { className: 'script-lang script-lang-' + lang }, lang.toUpperCase()),
+      actionButton(sc.name, 'deleteScript', 'Delete script', closeIcon(), 'danger bm-rowbtn')
+    );
+  }
+
+  function scriptsSection() {
+    const section = h('div', { className: 'scripts-section' });
+    section.appendChild(h('div', { className: 'settings-section-title' }, 'Scripts'));
+    const scripts = model.scripts || [];
+    if (!scripts.length) {
+      section.appendChild(h('div', { className: 'settings-loading' }, 'No scripts'));
+      return section;
+    }
+    const list = h('div', { className: 'scripts-list' });
+    scripts.forEach(function (sc) {
+      list.appendChild(scriptRow(sc));
+    });
+    section.appendChild(list);
+    return section;
+  }
+
   function bookmarksSection() {
     const section = h('div', { className: 'bm-section' });
     const header = h(
@@ -590,8 +659,58 @@
     return section;
   }
 
+  // ── Version/update badge — sits above the Settings body; reads
+  // model.version (host-pushed) and updateState (module-scoped, see above)
+  // so a check-in-flight or a persisted "update available" survives re-render.
+  function updateBadge() {
+    const version = model.version || '';
+    let label;
+    let stateClass = '';
+    let title = 'Check for updates';
+    let disabled = false;
+    if (updateState.status === 'checking') {
+      label = 'checking…';
+      stateClass = 'update-checking';
+      title = 'Checking for updates…';
+      disabled = true;
+    } else if (updateState.status === 'updateAvailable') {
+      label = 'v' + (updateState.latest || '?') + ' available';
+      stateClass = 'update-available';
+      title = 'Update available — click to open the releases page';
+    } else if (updateState.status === 'upToDate') {
+      label = (version || '?') + ' — up to date';
+      stateClass = 'update-uptodate';
+      title = 'Up to date';
+    } else if (updateState.status === 'error') {
+      label = 'check failed';
+      stateClass = 'update-error';
+      title = updateState.error || 'Check failed — click to retry';
+    } else {
+      label = version || '?';
+    }
+
+    // Icon + version label sit side by side unconditionally in every state —
+    // matching Project Nomeda's update-extension button, which always shows
+    // its package glyph beside the version text rather than swapping it out.
+    const btn = h(
+      'button',
+      {
+        className: 'update-badge' + (stateClass ? ' ' + stateClass : ''),
+        type: 'button',
+        dataAction: updateState.status === 'updateAvailable' ? 'openReleases' : 'checkForUpdate',
+        title: title,
+        ariaLabel: title
+      },
+      packageIcon(),
+      h('span', { className: 'update-badge-label' }, label)
+    );
+    if (disabled) { btn.disabled = true; }
+    return h('div', { className: 'settings-header-row' }, btn);
+  }
+
   function settingsView() {
     const wrap = h('div', { className: 'settings-body' });
+    wrap.appendChild(updateBadge());
     const s = model.settings;
 
     if (!s) {
@@ -617,6 +736,8 @@
       capList.appendChild(capabilityRow(cap));
     });
     wrap.appendChild(capList);
+
+    wrap.appendChild(scriptsSection());
 
     wrap.appendChild(bookmarksSection());
 
@@ -817,6 +938,15 @@
       render();
     } else if (action === 'deleteNode' && id) {
       post({ type: 'removeBookmark', id: id });
+    } else if (action === 'deleteScript' && id) {
+      post({ type: 'deleteScript', name: id });
+    } else if (action === 'checkForUpdate') {
+      if (updateState.status === 'checking') { return; } // already in flight
+      updateState = { status: 'checking' };
+      post({ type: 'checkForUpdate' });
+      render();
+    } else if (action === 'openReleases') {
+      if (updateState.releasesUrl) { post({ type: 'openExternal', url: updateState.releasesUrl }); }
     }
   });
 
@@ -1024,6 +1154,7 @@
       model.sessions = Array.isArray(msg.sessions) ? msg.sessions : [];
       model.port = msg.port != null ? msg.port : model.port;
       model.scripts = Array.isArray(msg.scripts) ? msg.scripts : (model.scripts || []);
+      model.version = msg.version != null ? msg.version : model.version;
       render();
     } else if (msg.type === 'settings' && msg.settings) {
       // Likewise: a settings push must not touch model.sessions/view.
@@ -1036,6 +1167,31 @@
       model.bookmarks = msg.tree;
       model.bookmarksBarEnabled = msg.barEnabled !== undefined ? !!msg.barEnabled : true;
       render();
+    } else if (msg.type === 'updateStatus') {
+      // Store the host's answer to our checkForUpdate post; keep it outside
+      // model (see updateState above) so it isn't clobbered by state/settings
+      // pushes. "Update available" persists until acted on; "up to date" and
+      // "error" are transient and fall back to the idle 📦-badge after a beat
+      // so the user can dismiss/retry without a stuck banner.
+      if (msg.error) {
+        updateState = { status: 'error', error: msg.error, current: msg.current };
+        render();
+        setTimeout(function () {
+          if (updateState.status === 'error') { updateState = { status: 'idle' }; render(); }
+        }, 4000);
+      } else if (msg.updateAvailable) {
+        updateState = { status: 'updateAvailable', latest: msg.latest, releasesUrl: msg.releasesUrl, current: msg.current };
+        render();
+      } else if (msg.upToDate) {
+        updateState = { status: 'upToDate', current: msg.current };
+        render();
+        setTimeout(function () {
+          if (updateState.status === 'upToDate') { updateState = { status: 'idle' }; render(); }
+        }, 4000);
+      } else {
+        updateState = { status: 'idle' };
+        render();
+      }
     } else if (msg.type === 'copied') {
       // The fleet copy reuses this same postback but has no real session id
       // (undefined/null/blank, or a sentinel that matches no row) — route

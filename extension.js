@@ -14,7 +14,7 @@ const { FaviconFetcher } = require('./favicon-fetcher');
 
 let log;
 let manager = null;
-// One saved-script runner per activation; scans <workspaceRoot>/scripts/ and runs a
+// One saved-script runner per activation; scans the central scripts dir and runs a
 // chosen script against a session's tab. Shared by the HTTP server and the panel.
 let scriptRunner = null;
 // One capability config per activation (one VS Code window). Shared, in-memory: the
@@ -27,6 +27,9 @@ let bookmarks = null;
 // so the in-page bar's img-src CSP never sees a live cross-origin request). Shared by the panel
 // (fetch-on-add) and the activation backfill below.
 let favicons = null;
+// This extension's package.json version, read once at activation and pushed into panel
+// state so the Settings "check for updates" badge can render the current version.
+let version = null;
 let extensionUri = null;
 let httpServer = null;
 let statusBarItem = null;
@@ -37,6 +40,10 @@ let startingServer = null;
 let apiToken = null;
 
 const INSTANCES_DIR = path.join(os.homedir(), '.project-steersman', 'instances');
+// Central saved-scripts dir, a sibling of the instance registry under ~/.project-steersman.
+// Shared by ALL windows/instances (replaces the old per-workspace <root>/scripts/ path), so
+// a script created in one VS Code window is visible and runnable from every other.
+const SCRIPTS_DIR = path.join(os.homedir(), '.project-steersman', 'scripts');
 let instanceFile = null;
 
 function hasProposedBrowserApi() {
@@ -50,6 +57,7 @@ function isBrowserSession(s) {
 function activate(context) {
   log = vscode.window.createOutputChannel('Project Steersman');
   extensionUri = context.extensionUri;
+  version = context.extension.packageJSON.version;
 
   // Status bar opens the webview editor tab (the sessions UI now lives there, not the Activity Bar).
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
@@ -71,28 +79,101 @@ function activate(context) {
     getStartUrl: () => vscode.workspace.getConfiguration('projectSteersman').get('startUrl', 'about:blank'),
     bookmarksStore: bookmarks,
   });
-  scriptRunner = new ScriptRunner({ manager, getScriptsDir, log });
+  scriptRunner = new ScriptRunner({
+    manager,
+    getScriptsDir,
+    // Deps the Python-subprocess path needs to point a script at this instance's HTTP API.
+    // Guarded reads so a not-yet-assigned port/token never breaks construction (the .js path
+    // does not use them). The token travels to the subprocess via env only, never logged.
+    getPort: () => actualPort,
+    getToken: () => apiToken,
+    getPython: () =>
+      vscode.workspace.getConfiguration('projectSteersman').get('pythonPath', 'python3'),
+    log,
+  });
+  // Make the central scripts dir exist up front so the panel table + dropdown work and
+  // Claude has somewhere to write scripts even before any exist.
+  ensureScriptsDir();
+  // Best-effort live cross-instance refresh: when a script is added/deleted in the central
+  // dir (by THIS window's delete handler or ANOTHER instance), re-push the open panel's
+  // state so its script table + dropdowns update without a manual reopen. Debounced ~200ms.
+  watchScriptsDir(context);
 
   context.subscriptions.push(manager.onDidChangeSessions(updateStatus));
   updateStatus();
 
-  // Remove a session when the user closes its integrated-browser editor tab: the Tab we
-  // captured at create() (session.editorTab) reappears in onDidChangeTabs' `closed` array by
-  // the same stable reference, so we match it back to its session and call manager.close()
-  // (tears down the CDPTab and fires onDidChangeSessions so the panel drops the row). This
-  // fires only on an actual tab close — a transient CDP drop leaves the tab open and is handled
-  // separately by _handleTabDisconnect — so a dropped-but-open session is never removed here.
-  // Guarded end to end: an unavailable API, a non-match, or any error is a silent no-op.
+  // Remove a session when the user closes its integrated-browser editor tab, but NOT when they
+  // merely MOVE it to another editor group. A close and a move BOTH surface the captured Tab
+  // (session.editorTab) in onDidChangeTabs' `closed` array, so we distinguish them by ORPHAN
+  // DETECTION against the LIVE tab set rather than by pairing within the event: every editor-browser
+  // tab shares one label/viewType, so an in-event pairing couldn't tell a moved tab's reappearance
+  // from an unrelated sibling that merely re-activated (closing the active tab re-activates a
+  // sibling, which then lands in `changed`). Instead, for the closing sessions we scan every
+  // currently-open editor-browser tab and subtract the ones still owned (by identity ===) by a
+  // session that ISN'T closing: what's left are ORPHANS — live browser tabs with no owning session.
+  // A genuine close leaves NO orphan (a re-activated sibling is still owned by its own open session);
+  // a move leaves exactly ONE orphan (the moved tab's fresh Tab object, since its session still
+  // points at the now-removed old one). We repoint a closing session onto a claimed orphan
+  // (manager.updateEditorTab — keep the session, so it stays in the panel and Focus/close keep
+  // working); only a session that claims NO orphan is genuinely closed (manager.close tears down its
+  // CDPTab and fires onDidChangeSessions so the panel drops the row). orphan-count == move-count, so
+  // a pure multi-close never spuriously keeps a session, and a real close with a sibling re-activating
+  // in the same event still removes the closed session. A transient CDP drop leaves the tab open and
+  // is handled separately by _handleTabDisconnect, so a dropped-but-open session is never removed
+  // here. Guarded end to end: an unavailable API, a non-match, or any error is a silent no-op.
   const tabGroups = vscode.window.tabGroups;
   if (tabGroups && typeof tabGroups.onDidChangeTabs === 'function') {
     context.subscriptions.push(
       tabGroups.onDidChangeTabs((e) => {
         try {
+          // Closed tabs that map to a live session, each with its session's old placement column.
+          const closing = [];
           for (const tab of (e.closed || [])) {
             const id = manager.sessionIdForEditorTab(tab);
             if (!id) continue;
-            log.appendLine('[Bridge] browser tab closed; removing session ' + id);
-            manager.close(id).catch((err) =>
+            const s = manager.get(id);
+            closing.push({ sessionId: id, oldColumn: (s && s.viewColumn) || null });
+          }
+          if (!closing.length) return;
+
+          // Input-identity keys of the just-closed browser tabs. Every editor-browser tab shares
+          // one viewType, so these keys recognise any OTHER live browser tab (see isLiveBrowserTab).
+          const browserKeys = new Set((e.closed || []).map((t) => tabInputKey(t)));
+
+          // Every editor-browser tab currently open across all groups (excludes our own panel).
+          const liveBrowserTabs = [];
+          for (const group of (tabGroups.all || [])) {
+            for (const t of (group.tabs || [])) {
+              if (isLiveBrowserTab(t, browserKeys)) liveBrowserTabs.push(t);
+            }
+          }
+
+          // Tabs still owned (by identity) by a session that is NOT closing — "accounted for".
+          const closingIds = new Set(closing.map((c) => c.sessionId));
+          const accounted = [];
+          for (const w of manager.list()) {
+            if (closingIds.has(w.id)) continue;
+            const s = manager.get(w.id);
+            if (s && s.editorTab) accounted.push(s.editorTab);
+          }
+
+          // Orphans = live browser tabs with no owning (non-closing) session: a move drops exactly
+          // one (the moved tab's fresh object); a genuine close (even with a sibling re-activating)
+          // drops none, because the sibling is still accounted for by its own open session.
+          const orphans = liveBrowserTabs.filter((t) => !accounted.some((a) => a === t));
+
+          for (const { sessionId, oldColumn } of closing) {
+            const moved = claimOrphan(orphans, oldColumn);
+            if (moved) {
+              log.appendLine(
+                '[Bridge] browser tab moved (viewColumn ' + ((moved.group && moved.group.viewColumn) || '?') +
+                '); keeping session ' + sessionId + ', repointing its tab reference'
+              );
+              manager.updateEditorTab(sessionId, moved);
+              continue;
+            }
+            log.appendLine('[Bridge] browser tab closed; removing session ' + sessionId);
+            manager.close(sessionId).catch((err) =>
               log.appendLine('[Bridge] close on tab-close failed: ' + (err && err.message ? err.message : err))
             );
           }
@@ -252,6 +333,38 @@ function describeTabInput(input) {
   return (input.constructor && input.constructor.name) || typeof input;
 }
 
+// Coarse identity key for a Tab's input. Every editor-browser tab shares one webview viewType,
+// so all browser tabs map to the same key — which is exactly what the move/close decision
+// (onDidChangeTabs) wants: it uses a just-closed browser tab's key to recognise the OTHER live
+// browser tabs (isLiveBrowserTab), never to tell two live browser tabs apart.
+function tabInputKey(tab) {
+  const input = tab && tab.input;
+  if (!input) return 'none';
+  if (typeof input.viewType === 'string') return 'vt:' + input.viewType;
+  return 'ctor:' + ((input.constructor && input.constructor.name) || typeof input);
+}
+
+// Is `tab` one of our integrated-browser editor tabs (and NOT the Steersman panel webview)?
+// Recognised by its input key matching a known browser tab's key (browserKeys, seeded from the
+// just-closed browser tabs in the same event): every editor-browser tab shares one viewType, so
+// this positively identifies live browser tabs while reusing the existing tabInputKey/panel
+// helpers rather than inventing a second, drift-prone heuristic.
+function isLiveBrowserTab(tab, browserKeys) {
+  if (!tab || isSteersmanPanelTab(tab)) return false;
+  return browserKeys.has(tabInputKey(tab));
+}
+
+// Claim one orphan tab for a closing session, splicing it out so two moves in one event each take
+// a DISTINCT orphan. Prefers an orphan whose new group column differs from the session's old column
+// (the shape of a genuine move between groups); falls back to any remaining orphan. Returns null
+// when the pool is empty — meaning this session was genuinely CLOSED, not moved.
+function claimOrphan(orphans, oldColumn) {
+  if (!orphans.length) return null;
+  let idx = orphans.findIndex((o) => ((o.group && o.group.viewColumn) || null) !== oldColumn);
+  if (idx === -1) idx = 0;
+  return orphans.splice(idx, 1)[0];
+}
+
 // Begin watching for the editor-browser tab to open. Registering the onDidChangeTabs
 // listener BEFORE the launch means we reliably see the tab in e.opened rather than
 // racing an activeTabGroup snapshot taken after the async CDP handshake (which often
@@ -343,38 +456,59 @@ function captureBrowserPlacementSnapshot(t) {
   }
 }
 
-// Best-effort: make the ACTIVE editor group something OTHER than the Steersman
-// panel's own column before we launch, so the editor-browser debug session (which
-// opens in whatever group is active at startDebugging time) lands beside the panel
-// instead of covering it. Preference order:
-//   1. Reuse an existing editor group that isn't the panel's.
-//   2. Otherwise split a fresh empty group to the RIGHT of the panel's group.
-// The panel is left in its own column, visible. Any failure degrades silently to
-// VS Code's default placement (browser opens wherever) rather than aborting launch.
+// Best-effort: force an EDITOR GROUP to be the active view before we launch, so the
+// editor-browser debug session — which opens relative to whatever view is active at
+// startDebugging time — lands as a normal editor tab in an editor column and NOT in the
+// sidebar/panel/aux area (the reported bug: if focus sits in a non-editor view, or the
+// Steersman webview panel isn't the active editor, the browser inherits that location).
+// Preference order:
+//   1. When the panel's column is known: reuse an existing editor group that isn't the
+//      panel's, else split a fresh empty group to the RIGHT of the panel's group.
+//   2. When the panel's column is unknown (panel hidden -> viewColumn undefined, or not
+//      open yet): still force a real editor group active — prefer one not showing our own
+//      panel — so the browser never falls back to the sidebar. There is essentially always
+//      at least one editor group; if somehow none, split a new one.
+// The panel is left in its own column, visible. Any failure degrades silently to VS Code's
+// default placement rather than aborting launch.
 async function arrangeBrowserPlacement() {
   try {
-    const panel = ProjectSteersmanPanel.current && ProjectSteersmanPanel.current._panel;
-    const panelColumn = panel && panel.viewColumn;
-    if (!panelColumn) {
-      log.appendLine('[Bridge] placement: no visible Steersman panel column; using default editor group');
-      return;
-    }
     const tabGroups = vscode.window.tabGroups;
     const groups = (tabGroups && tabGroups.all) || [];
-    const others = groups.filter((g) => g.viewColumn && g.viewColumn !== panelColumn);
-    if (others.length) {
-      const target = others[0];
-      log.appendLine(
-        '[Bridge] placement: reusing existing editor group (viewColumn ' + target.viewColumn +
-        ') beside panel (viewColumn ' + panelColumn + ')'
-      );
-      await focusEditorGroupByColumn(target.viewColumn);
+    const panel = ProjectSteersmanPanel.current && ProjectSteersmanPanel.current._panel;
+    const panelColumn = panel && panel.viewColumn;
+
+    if (panelColumn) {
+      const others = groups.filter((g) => g.viewColumn && g.viewColumn !== panelColumn);
+      if (others.length) {
+        const target = others[0];
+        log.appendLine(
+          '[Bridge] placement: reusing existing editor group (viewColumn ' + target.viewColumn +
+          ') beside panel (viewColumn ' + panelColumn + ')'
+        );
+        await focusEditorGroupByColumn(target.viewColumn);
+        return;
+      }
+      // Only the panel's group is open: focus it so the split is relative to it, then
+      // open a fresh empty group to its right for the browser to land in.
+      log.appendLine('[Bridge] placement: no other editor group; splitting a new group right of panel (viewColumn ' + panelColumn + ')');
+      if (typeof panel.reveal === 'function') panel.reveal(panelColumn, false);
+      await vscode.commands.executeCommand('workbench.action.newGroupRight');
       return;
     }
-    // Only the panel's group is open: focus it so the split is relative to it, then
-    // open a fresh empty group to its right for the browser to land in.
-    log.appendLine('[Bridge] placement: no other editor group; splitting a new group right of panel (viewColumn ' + panelColumn + ')');
-    if (typeof panel.reveal === 'function') panel.reveal(panelColumn, false);
+
+    // No visible panel column: the editor-browser would otherwise open relative to the
+    // current (possibly non-editor) active view. Force a real editor group active instead,
+    // preferring one that isn't showing our own panel so we don't cover it.
+    const editorGroup =
+      groups.find((g) => g.viewColumn && !(g.tabs || []).some(isSteersmanPanelTab)) ||
+      groups.find((g) => g.viewColumn) ||
+      null;
+    if (editorGroup) {
+      log.appendLine('[Bridge] placement: no panel column; focusing editor group (viewColumn ' + editorGroup.viewColumn + ') to keep browser in the editor area');
+      await focusEditorGroupByColumn(editorGroup.viewColumn);
+      return;
+    }
+    log.appendLine('[Bridge] placement: no editor group available; creating one for the browser');
     await vscode.commands.executeCommand('workbench.action.newGroupRight');
   } catch (e) {
     log.appendLine('[Bridge] placement: arranging editor group failed (' + (e && e.message ? e.message : e) + '); using default placement');
@@ -451,16 +585,51 @@ function launchViaDebug(url) {
   });
 }
 
-// Resolve <workspaceRoot>/scripts/ once per call. workspaceRoot is the first open
-// workspace folder; with no folder open we fall back to the extension's own directory so
-// scanning still resolves somewhere sane. The folder is never created here — a missing
-// one simply yields an empty script list (Claude creates it per its capability rule).
+// Resolve the central scripts dir (~/.project-steersman/scripts/), shared across all
+// windows/instances. This replaces the old per-workspace <root>/scripts/ path — no
+// migration of old per-project scripts is done. The dir is created once on activation
+// (ensureScriptsDir), so listing/running resolve against a folder that always exists.
 function getScriptsDir() {
-  const root =
-    (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0].uri.fsPath) ||
-    (extensionUri && extensionUri.fsPath) ||
-    process.cwd();
-  return path.join(root, 'scripts');
+  return SCRIPTS_DIR;
+}
+
+// Best-effort create of the central scripts dir. Guarded — a failure (permissions, etc.)
+// is logged and swallowed so it never blocks activation; listing simply yields [] until
+// the dir exists.
+function ensureScriptsDir() {
+  try {
+    fs.mkdirSync(SCRIPTS_DIR, { recursive: true });
+  } catch (e) {
+    if (log) log.appendLine('[Scripts] could not create ' + SCRIPTS_DIR + ': ' + (e && e.message ? e.message : e));
+  }
+}
+
+// Watch the central scripts dir and re-push the open panel's state on any change, so a
+// script added/deleted by this OR another instance updates live windows. Best-effort:
+// fs.watch is unsupported on some platforms/filesystems and can throw — any failure is
+// swallowed so it never blocks activation. Change events are debounced (~200ms) to collapse
+// the burst a single add/delete can emit, then routed through the panel's public refresh().
+function watchScriptsDir(context) {
+  let timer = null;
+  try {
+    const watcher = fs.watch(SCRIPTS_DIR, () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        try {
+          if (ProjectSteersmanPanel.current) ProjectSteersmanPanel.current.refresh();
+        } catch { /* panel gone / mid-dispose — ignore */ }
+      }, 200);
+    });
+    context.subscriptions.push({
+      dispose() {
+        if (timer) clearTimeout(timer);
+        try { watcher.close(); } catch { /* already closed */ }
+      },
+    });
+  } catch (e) {
+    if (log) log.appendLine('[Scripts] fs.watch unavailable on ' + SCRIPTS_DIR + ': ' + (e && e.message ? e.message : e));
+  }
 }
 
 // Shared deps handed to the webview panel (fresh-open and serializer-revive both use it).
@@ -479,6 +648,8 @@ function panelDeps() {
     // Lets the panel re-inject the live in-page bookmarks bar after a Settings-editor edit.
     refreshBookmarkBars: () => manager.refreshBookmarkBars(),
     token: apiToken,
+    // Current package.json version; the panel pushes it into state for the update-check badge.
+    version,
   };
 }
 

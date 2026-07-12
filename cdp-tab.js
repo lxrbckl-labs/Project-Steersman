@@ -17,6 +17,9 @@ try {
 
 const BROWSER_SESSION_TYPES = ['pwa-editor-browser', 'editor-browser', 'pwa-chrome', 'chrome'];
 
+// Cap for the rolling console/network ring buffers (entries beyond this are shifted off the front).
+const BUFFER_CAP = 200;
+
 class CDPTab {
   constructor(log) {
     this.log = log;
@@ -41,6 +44,15 @@ class CDPTab {
     // Optional callback returning the global "show bookmarks bar" flag (boolean). Set by the
     // SessionManager; when unset the bar defaults to injecting (backward-compatible).
     this.getBarEnabled = null;
+    // Rolling capture buffers (Feature 1): console + network, each a ring of <= BUFFER_CAP entries.
+    this._console = [];
+    this._consoleSeq = 0;
+    this._network = [];
+    this._networkSeq = 0;
+    // Correlates Network.requestWillBeSent -> response/failure by requestId (bounded, insertion-ordered).
+    this._netByReqId = new Map();
+    // Baseline line-set for getChanges() (Feature 2); null until the first snapshot is taken.
+    this._lastChangesText = null;
   }
 
   _emitDisconnect() {
@@ -183,6 +195,7 @@ class CDPTab {
       this.send('Runtime.enable').catch(() => {}),
       this.send('Page.enable').catch(() => {}),
       this.send('DOM.enable').catch(() => {}),
+      this.send('Network.enable').catch(() => {}),
     ]);
   }
 
@@ -201,7 +214,106 @@ class CDPTab {
     } else if (msg.method === 'Page.loadEventFired') {
       // A load replaces the document and drops our host node — re-inject the bar.
       this._reinjectBookmarks();
+    } else if (msg.method === 'Runtime.consoleAPICalled') {
+      try {
+        const params = msg.params || {};
+        const args = Array.isArray(params.args) ? params.args : [];
+        const text = args.map((a) => this._remoteObjToText(a)).join(' ');
+        this._pushConsole({
+          seq: ++this._consoleSeq,
+          type: params.type || 'log',
+          text: text.length > 2000 ? text.slice(0, 2000) : text,
+          ts: params.timestamp || null,
+        });
+      } catch {}
+    } else if (msg.method === 'Runtime.exceptionThrown') {
+      try {
+        const params = msg.params || {};
+        const det = params.exceptionDetails || {};
+        let text = (det.exception && det.exception.description) || det.text || 'exception';
+        text = String(text);
+        this._pushConsole({
+          seq: ++this._consoleSeq,
+          type: 'error',
+          text: text.length > 2000 ? text.slice(0, 2000) : text,
+          ts: params.timestamp || null,
+        });
+      } catch {}
+    } else if (msg.method === 'Network.requestWillBeSent') {
+      try {
+        const params = msg.params || {};
+        this._netByReqId.set(params.requestId, {
+          method: params.request && params.request.method,
+          url: params.request && params.request.url,
+          ts: params.timestamp || null,
+        });
+        // Bound the correlation map (Map preserves insertion order — evict the oldest key).
+        if (this._netByReqId.size > 500) {
+          const oldest = this._netByReqId.keys().next().value;
+          this._netByReqId.delete(oldest);
+        }
+      } catch {}
+    } else if (msg.method === 'Network.responseReceived') {
+      try {
+        const params = msg.params || {};
+        const stored = this._netByReqId.get(params.requestId) || {};
+        const resp = params.response || {};
+        this._pushNetwork({
+          seq: ++this._networkSeq,
+          method: stored.method,
+          url: stored.url || resp.url,
+          status: resp.status,
+          mimeType: resp.mimeType,
+          failed: false,
+          ts: params.timestamp || null,
+        });
+        this._netByReqId.delete(params.requestId);
+      } catch {}
+    } else if (msg.method === 'Network.loadingFailed') {
+      try {
+        const params = msg.params || {};
+        const stored = this._netByReqId.get(params.requestId) || {};
+        this._pushNetwork({
+          seq: ++this._networkSeq,
+          method: stored.method,
+          url: stored.url,
+          status: null,
+          failed: true,
+          errorText: params.errorText || 'failed',
+          canceled: !!params.canceled,
+          ts: params.timestamp || null,
+        });
+        this._netByReqId.delete(params.requestId);
+      } catch {}
     }
+  }
+
+  // Flatten a CDP RemoteObject to a compact display string for the console buffer.
+  _remoteObjToText(a) {
+    if (!a) return '';
+    if (a.value !== undefined) {
+      if (typeof a.value === 'string') return a.value;
+      try {
+        return JSON.stringify(a.value);
+      } catch {
+        return String(a.value);
+      }
+    }
+    if (a.description !== undefined) return String(a.description);
+    if (a.unserializableValue !== undefined) return String(a.unserializableValue);
+    return String(a.type || '');
+  }
+
+  // Push a console entry and trim the ring buffer to BUFFER_CAP (oldest shifted off).
+  _pushConsole(entry) {
+    this._console.push(entry);
+    if (this._console.length > BUFFER_CAP) this._console.shift();
+  }
+
+  // Push a network entry and trim the ring buffer to BUFFER_CAP (oldest shifted off).
+  _pushNetwork(entry) {
+    this._network.push(entry);
+    if (this._network.length > BUFFER_CAP) this._network.shift();
   }
 
   send(method, params, opts = {}) {
@@ -540,6 +652,122 @@ class CDPTab {
       return await this.evaluate('location.href');
     } catch {
       return this.url;
+    }
+  }
+
+  // ---- capture readers (Feature 1) ----
+
+  // Return the last `limit` console entries in chronological order (oldest-of-slice first).
+  // limit clamps to [1,200], default 50. Entries are plain {seq,type,text,ts} objects.
+  getConsole(limit) {
+    const n = Math.max(1, Math.min(200, Number(limit) || 50));
+    return this._console.slice(-n).map((e) => ({ seq: e.seq, type: e.type, text: e.text, ts: e.ts }));
+  }
+
+  // Return the last `limit` network entries in chronological order (oldest-of-slice first).
+  // When failedOnly is truthy the source is filtered to failed requests first. limit clamps
+  // to [1,200], default 50. Entries are returned as pushed.
+  getNetwork(limit, failedOnly) {
+    const source = failedOnly ? this._network.filter((e) => e.failed) : this._network;
+    const n = Math.max(1, Math.min(200, Number(limit) || 50));
+    return source.slice(-n);
+  }
+
+  // ---- DOM-diff "what changed" (Feature 2) ----
+
+  // Compare the current visible (bar-free) page text against the previous snapshot. The first
+  // call has no baseline: it stores the current lines and returns them as `added` with
+  // baseline:true. Subsequent calls return a multiset line diff (added/removed) vs the prior
+  // snapshot and re-baseline to the current lines. added/removed cap at 200 (truncated flag set).
+  async getChanges() {
+    const text = await this.getTextStripped();
+    const lines = String(text || '')
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    if (this._lastChangesText === null) {
+      this._lastChangesText = lines;
+      const capped = lines.slice(0, 200);
+      return { baseline: true, added: capped, removed: [], truncated: capped.length < lines.length };
+    }
+
+    const before = new Map();
+    for (const l of this._lastChangesText) before.set(l, (before.get(l) || 0) + 1);
+    const now = new Map();
+    for (const l of lines) now.set(l, (now.get(l) || 0) + 1);
+
+    const added = [];
+    for (const [line, count] of now) {
+      const delta = count - (before.get(line) || 0);
+      for (let i = 0; i < delta; i++) added.push(line);
+    }
+    const removed = [];
+    for (const [line, count] of before) {
+      const delta = count - (now.get(line) || 0);
+      for (let i = 0; i < delta; i++) removed.push(line);
+    }
+
+    this._lastChangesText = lines;
+    const truncated = added.length > 200 || removed.length > 200;
+    return { baseline: false, added: added.slice(0, 200), removed: removed.slice(0, 200), truncated };
+  }
+
+  // ---- find-by-description resolver (Feature 3) ----
+
+  // Resolve a natural-language `query` to up to `limit` (clamped [1,25], default 8) on-page
+  // elements, scored by how well each element's accessible name / role / attributes match the
+  // query tokens. Excludes the bookmarks bar host and its subtree, and invisible elements.
+  // Returns { matches: [{selector,text,role,tag,rect:{x,y,w,h},score}, ...] } (empty on failure).
+  async findElements(query, limit) {
+    const cap = Math.max(1, Math.min(25, Number(limit) || 8));
+    const expr =
+      `(function(query, cap){try{` +
+      `var q=String(query||'').toLowerCase();` +
+      `var tokens=q.split(/\\s+/).filter(Boolean);` +
+      `var bar=document.getElementById('__steersman_bookmarks_bar');` +
+      `function esc(s){if(window.CSS&&CSS.escape)return CSS.escape(s);return String(s).replace(/[^a-zA-Z0-9_-]/g,function(ch){return '\\\\'+ch;});}` +
+      `function visible(el){var r=el.getBoundingClientRect();if(r.width===0&&r.height===0)return false;` +
+      `var cs=window.getComputedStyle(el);if(!cs)return true;if(cs.display==='none'||cs.visibility==='hidden')return false;return true;}` +
+      `function accName(el){var cand=[el.getAttribute('aria-label'),el.getAttribute('title'),el.getAttribute('placeholder'),` +
+      `((el.tagName==='INPUT'||el.tagName==='BUTTON')?el.value:''),el.getAttribute('alt'),(el.innerText||el.textContent||'')];` +
+      `for(var i=0;i<cand.length;i++){var c=cand[i];if(c!=null){c=String(c).trim();if(c)return c.slice(0,120);}}return '';}` +
+      `function selectorFor(el){` +
+      `if(el.id&&/^[A-Za-z][\\w-]*$/.test(el.id)){var s='#'+esc(el.id);if(document.querySelectorAll(s).length===1)return s;}` +
+      `var tag=el.tagName.toLowerCase();var attrs=['data-testid','name','aria-label'];` +
+      `for(var i=0;i<attrs.length;i++){var v=el.getAttribute(attrs[i]);if(v){var sel=tag+'['+attrs[i]+'=\"'+String(v).replace(/\"/g,'\\\\\"')+'\"]';` +
+      `if(document.querySelectorAll(sel).length===1)return sel;}}` +
+      `var parts=[];var cur=el;var depth=0;while(cur&&cur.nodeType===1&&depth<5){` +
+      `var ct=cur.tagName.toLowerCase();var k=1;var sib=cur;while((sib=sib.previousElementSibling)){if(sib.tagName===cur.tagName)k++;}` +
+      `parts.unshift(ct+':nth-of-type('+k+')');` +
+      `if(cur!==el&&cur.id&&/^[A-Za-z][\\w-]*$/.test(cur.id)){parts[0]='#'+esc(cur.id);return parts.join(' > ');}` +
+      `cur=cur.parentElement;depth++;}return parts.join(' > ');}` +
+      `var sel='a,button,input,textarea,select,[role],[onclick],label,summary,h1,h2,h3,[aria-label],[placeholder],[title]';` +
+      `var nodes=document.querySelectorAll(sel);var scored=[];` +
+      `for(var i=0;i<nodes.length;i++){var el=nodes[i];` +
+      `if(bar&&(el===bar||bar.contains(el)))continue;` +
+      `if(!visible(el))continue;` +
+      `var name=accName(el);var role=el.getAttribute('role')||el.tagName.toLowerCase();` +
+      `var nameL=name.toLowerCase();` +
+      `var meta=[role,el.tagName.toLowerCase(),el.id||'',el.getAttribute('name')||'',el.getAttribute('placeholder')||''].join(' ').toLowerCase();` +
+      `var score=0;` +
+      `for(var t=0;t<tokens.length;t++){var tok=tokens[t];` +
+      `var wordRe=new RegExp('(^|\\\\W)'+tok.replace(/[.*+?^\${}()|[\\]\\\\]/g,'\\\\$&')+'(\\\\W|$)');` +
+      `if(wordRe.test(nameL))score+=3;else if(nameL.indexOf(tok)!==-1)score+=2;` +
+      `if(meta.indexOf(tok)!==-1)score+=1;}` +
+      `if(q&&nameL.indexOf(q)!==-1)score+=2;` +
+      `if(score<=0)continue;` +
+      `scored.push({el:el,name:name,role:role,tag:el.tagName.toLowerCase(),score:score});}` +
+      `scored.sort(function(a,b){return b.score-a.score;});scored=scored.slice(0,cap);` +
+      `return scored.map(function(s){var r=s.el.getBoundingClientRect();` +
+      `return {selector:selectorFor(s.el),text:s.name,role:s.role,tag:s.tag,` +
+      `rect:{x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)},score:s.score};});` +
+      `}catch(e){return [];}})(${JSON.stringify(query)}, ${JSON.stringify(cap)})`;
+    try {
+      const matches = await this.evaluate(expr);
+      return { matches: Array.isArray(matches) ? matches : [] };
+    } catch {
+      return { matches: [] };
     }
   }
 

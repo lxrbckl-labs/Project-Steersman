@@ -188,6 +188,25 @@ class SessionManager {
     return matches.length === 1 ? matches[0] : null;
   }
 
+  // Re-point a session at its integrated-browser tab after VS Code MOVED that tab to another
+  // editor group. A drag between groups fires onDidChangeTabs with the old Tab in `closed`
+  // (which the extension would otherwise treat as a close and remove the session) and a fresh
+  // Tab in `opened`; the extension pairs them and calls this to swap in the new Tab. Updates
+  // the stored editorTab/viewColumn (and mirrors them onto the live CDPTab) so the panel's
+  // Focus/close keep targeting the right tab, then fires so the roster stays consistent.
+  // Unknown id or a missing tab is a guarded no-op.
+  updateEditorTab(id, tab) {
+    const s = this._sessions.get(id);
+    if (!s || !tab) return;
+    s.editorTab = tab;
+    s.viewColumn = (tab.group && tab.group.viewColumn) || s.viewColumn;
+    if (s.tab) {
+      s.tab.editorTab = tab;
+      s.tab.viewColumn = s.viewColumn;
+    }
+    this._fire();
+  }
+
   // Most-recently-created connected session (HTTP default routing).
   latestConnected() {
     let found;
@@ -320,7 +339,7 @@ class SessionManager {
   // mostly complete until the caller threads the live config through.
   _enabledSet(config) {
     if (!config || typeof config.getState !== 'function') {
-      return new Set(['create_window', 'close_window', 'navigate', 'read', 'screenshot', 'interact', 'run_script']);
+      return new Set(['create_window', 'close_window', 'navigate', 'read', 'inspect', 'screenshot', 'interact', 'run_script']);
     }
     const caps = (config.getState() && config.getState().capabilities) || [];
     return new Set(caps.filter((c) => c && c.enabled).map((c) => c.id));
@@ -349,7 +368,15 @@ class SessionManager {
     // disabled capability (e.g. eval when off) is omitted entirely, matching compose().
     const groups = [
       ['navigate', 'NAVIGATE', ['- POST /navigate {instance,url} — load a URL in the window.']],
-      ['read', 'READ', ['- GET /text?instance=' + instance + '&selector=<sel> — visible text (whole page if selector omitted).']],
+      ['read', 'READ', [
+        '- GET /text?instance=' + instance + '&selector=<sel> — visible text (whole page if selector omitted).',
+        '- GET /changes?instance=' + instance + ' — what visible text was added/removed since your last /changes call (call it after an action to see the effect).',
+        '- GET /find?instance=' + instance + '&query=<description> — locate elements by a natural-language description; returns candidate CSS selectors with their text, role, and on-screen rect (you pick the best one to click/type).',
+      ]],
+      ['inspect', 'INSPECT (console/network)', [
+        '- GET /console?instance=' + instance + '&limit=<n> — recent console logs/warnings/errors from the page (newest last).',
+        '- GET /network?instance=' + instance + '&limit=<n>&failed=<0|1> — recent network requests (method, url, status); set failed=1 for only failed requests.',
+      ]],
       ['interact', 'INTERACT', [
         '- POST /click {instance,selector} — click the element matching a CSS selector.',
         '- POST /type {instance,selector,text} — type text into a field.',
@@ -401,6 +428,13 @@ class SessionManager {
         'list) is under manual human control. Do NOT navigate, click, type, eval, scroll, read, ' +
         'screenshot, run scripts against, or close it — those calls return `403 window under ' +
         'manual control`. It appears in the window list so you know it exists; leave it alone.',
+      '',
+      '**Scripts:** `GET /scripts` lists saved scripts as `.js` or `.py`. A `.js` script is ' +
+        'evaluated inside the page. A `.py` script runs as a HOST PROCESS that drives the tab ' +
+        'via this API — it receives `STEERSMAN_URL`, `STEERSMAN_INSTANCE`, and ' +
+        '`STEERSMAN_TOKEN` as env vars and must call the API itself to act. Running a `.js` ' +
+        'script requires the `run_script` capability; a `.py` script requires `run_python`. ' +
+        'Manual-mode windows reject script runs either way.',
       '',
     ];
 

@@ -9,10 +9,16 @@ const crypto = require('crypto');
 // Sensitive route -> the capability id that must be enabled for it to run. Observation
 // routes (/health, /capabilities, /url, GET /windows, /scripts, GET /window) carry no
 // entry and stay open (still behind host + token). GET /window strips its dom field
-// separately when `read` is off. Keyed by "METHOD /path".
+// separately when `read` is off. Keyed by "METHOD /path". POST /script/run is deliberately
+// NOT listed here — its required capability depends on the target script's language (js ->
+// run_script, py -> run_python), so it is gated dynamically inside its own handler instead.
 const ROUTE_CAPABILITY = {
   'POST /navigate': 'navigate',
   'GET /text': 'read',
+  'GET /changes': 'read',
+  'GET /find': 'read',
+  'GET /console': 'inspect',
+  'GET /network': 'inspect',
   'POST /click': 'interact',
   'POST /type': 'interact',
   'POST /scroll': 'interact',
@@ -22,7 +28,6 @@ const ROUTE_CAPABILITY = {
   'GET /screenshot': 'screenshot',
   'POST /windows': 'create_window',
   'POST /window/close': 'close_window',
-  'POST /script/run': 'run_script',
 };
 
 // Anti-DNS-rebinding: accept only a Host header whose hostname is a loopback name (any
@@ -236,6 +241,17 @@ async function startHttpServer(preferredPort, ctx) {
           if (runId && manager.isAutopilot(runId) === false) {
             return send(403, { error: 'window under manual control', instance: runId });
           }
+          // Per-language capability gate: a .js script needs run_script, a .py script needs
+          // run_python (host subprocess — arbitrary code execution, so it is gated separately
+          // and off by default). An unresolved name (lang null) is left to runScript's own
+          // SCRIPT_NOT_FOUND -> 404 below rather than 403'd here.
+          const lang = runner.scriptLang ? runner.scriptLang(name) : null;
+          if (lang === 'js' && !isCapEnabled(config, 'run_script')) {
+            return send(403, { error: 'capability disabled', capability: 'run_script' });
+          }
+          if (lang === 'py' && !isCapEnabled(config, 'run_python')) {
+            return send(403, { error: 'capability disabled', capability: 'run_python' });
+          }
           try {
             const out = await runner.runScript(instance, name);
             // A saved script ran against a concrete session — mark it agent-active (out.instance
@@ -314,6 +330,24 @@ async function startHttpServer(preferredPort, ctx) {
         case '/text':
           // Stripped read: a text pull never includes the injected bookmarks bar.
           return send(200, { instance: session.id, text: await tab.getTextStripped(q('selector') || undefined) });
+        case '/console': {
+          const limit = q('limit');
+          return send(200, { instance: session.id, entries: tab.getConsole(limit != null ? Number(limit) : undefined) });
+        }
+        case '/network': {
+          const limit = q('limit');
+          const failed = q('failed');
+          const failedOnly = failed === '1' || failed === 'true';
+          return send(200, { instance: session.id, entries: tab.getNetwork(limit != null ? Number(limit) : undefined, failedOnly) });
+        }
+        case '/changes':
+          return send(200, { instance: session.id, changes: await tab.getChanges() });
+        case '/find': {
+          const query = q('query');
+          if (!query) return send(400, { error: 'query required' });
+          const limit = q('limit');
+          return send(200, { instance: session.id, ...(await tab.findElements(query, limit != null ? Number(limit) : undefined)) });
+        }
         case '/click': {
           const sel = q('selector');
           if (!sel) return send(400, { error: 'selector required' });

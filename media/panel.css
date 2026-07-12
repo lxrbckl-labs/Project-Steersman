@@ -187,6 +187,87 @@ button.icon-button.btn-fleet-copy {
   padding: 8px 2px;
 }
 
+/* Version/update-check badge — a compact header row pinned above the rest of
+   the Settings body (right-aligned), so it stays out of the way of the
+   Instruction/Capabilities/Bookmarks sections below it. */
+.settings-header-row {
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* Idle chrome matches Project Nomeda's update-extension button (input-material
+   framed look: input-background fill, input-border, 3px corners) rather than
+   a pill, so both extensions' update controls read the same. State classes
+   below re-tint the border/text for checking/up-to-date/update-available/
+   error without changing that shape. */
+.update-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 3px 7px;
+  border-radius: 3px;
+  border: 1px solid var(--vscode-input-border, transparent);
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  cursor: pointer;
+}
+
+.update-badge:hover:not(:disabled) {
+  background: var(--vscode-input-background);
+  border-color: var(--vscode-focusBorder, #007fd4);
+}
+
+.update-badge:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder, #007fd4);
+  outline-offset: -1px;
+}
+
+.update-badge:disabled {
+  cursor: default;
+  opacity: 0.8;
+}
+
+.update-badge svg {
+  display: block;
+  vertical-align: middle;
+}
+
+/* Version/status text beside the icon — small and muted, matching Nomeda's
+   .update-btn-version (caption-style text distinct from the icon's color). */
+.update-badge-label {
+  white-space: nowrap;
+  color: var(--vscode-descriptionForeground);
+}
+
+/* Checking — same neutral tint as idle, just non-interactive while in flight. */
+.update-badge.update-checking {
+  color: var(--vscode-descriptionForeground);
+}
+
+/* Up to date — brief green confirmation, reusing the app's existing "success"
+   green (autopilot-on / bm-confirm hover). */
+.update-badge.update-uptodate {
+  color: var(--vscode-charts-green, var(--vscode-testing-iconPassed, #4caf50));
+  border-color: var(--vscode-charts-green, var(--vscode-testing-iconPassed, #4caf50));
+}
+
+/* Update available — amber attention state; persists until the user clicks
+   through to the releases page. */
+.update-badge.update-available {
+  color: var(--vscode-charts-yellow, #d7ba7d);
+  border-color: var(--vscode-charts-yellow, #d7ba7d);
+}
+
+/* Error — muted red, matching .capability-risky's error tint, reverts to the
+   idle badge after a beat so the user can retry. */
+.update-badge.update-error {
+  color: var(--vscode-errorForeground, #f14c4c);
+  border-color: var(--vscode-errorForeground, #f14c4c);
+  opacity: 0.85;
+}
+
 /* Section heading — reused above the instruction box, the capability list,
    and the composed-preview block. First one sits flush with the top. */
 .settings-section-title {
@@ -293,8 +374,8 @@ button.icon-button.btn-fleet-copy {
 /* Composed-preview block — read-only, visually distinct as a "generated
    output" region: monospace, slightly recessed, no resize handle. */
 .settings-preview {
-  min-height: 80px;
-  max-height: 260px;
+  min-height: 240px;
+  max-height: 480px;
   overflow: auto;
   margin: 0;
   font-family: var(--vscode-editor-font-family, monospace);
@@ -830,5 +911,75 @@ button.icon-button.bm-confirm:hover:not(:disabled) {
 .bm-input:focus-visible {
   outline: 1px solid var(--vscode-focusBorder, #007fd4);
   outline-offset: -1px;
+}
+
+/* ─── Scripts section — flat list of the central script-dir entries, list-only
+   (the run/edit/rename affordances stay on the per-session pickers); the sole
+   control here is delete. Mirrors .bm-section's spacing/heading rhythm. ──── */
+
+.scripts-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 28px;
+}
+
+/* Bounded, scrollable card — same frame as .bm-tree-wrap, shorter since rows
+   are flat (no nesting/add-forms to make room for). */
+.scripts-list {
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  border-radius: 4px;
+  background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.06));
+  padding: 4px;
+  max-height: 220px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--vscode-scrollbarSlider-background) transparent;
+}
+
+.script-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 3px 6px;
+  border-radius: 3px;
+}
+
+.script-row:hover {
+  background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.12));
+}
+
+.script-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--vscode-foreground);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Small lang badge — same compact pill aesthetic as .capability-risky, ──
+   JS neutral (foreground-tinted), PY a subtle blue/green so the two read ──
+   apart at a glance without shouting. */
+.script-lang {
+  flex: 0 0 auto;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  border-radius: 3px;
+  padding: 1px 5px;
+  line-height: 1.4;
+}
+
+.script-lang-js {
+  color: var(--vscode-descriptionForeground, #999);
+  border: 1px solid var(--vscode-descriptionForeground, #999);
+}
+
+.script-lang-py {
+  color: var(--vscode-charts-blue, #3794ff);
+  border: 1px solid var(--vscode-charts-blue, #3794ff);
 }
 

@@ -240,6 +240,67 @@ function makeTools(readEnabled) {
       call: (a) => ({ method: 'GET', path: '/text' + qs({ instance: a.instance, selector: a.selector }) }),
     },
     {
+      name: 'read_console',
+      cap: 'inspect',
+      description: 'Read recent console output (logs, warnings, errors) from a window to debug page behavior.',
+      inputSchema: {
+        type: 'object',
+        properties: { ...INSTANCE_PROP, limit: { type: 'number', description: 'Max entries to return (default 50, max 200).' } },
+        required: ['instance'],
+        additionalProperties: false,
+      },
+      call: (a) => ({ method: 'GET', path: '/console' + qs({ instance: a.instance, limit: a.limit }) }),
+    },
+    {
+      name: 'read_network',
+      cap: 'inspect',
+      description: 'Read recent network activity (requests, responses, failures) for a window. Set failed=true for only failed requests.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          ...INSTANCE_PROP,
+          limit: { type: 'number', description: 'Max entries (default 50, max 200).' },
+          failed: { type: 'boolean', description: 'Only failed requests when true.' },
+        },
+        required: ['instance'],
+        additionalProperties: false,
+      },
+      call: (a) => ({ method: 'GET', path: '/network' + qs({ instance: a.instance, limit: a.limit, failed: a.failed ? 1 : null }) }),
+    },
+    {
+      name: 'page_changes',
+      cap: 'read',
+      description:
+        'Return what visible text was added/removed since the last page_changes call for this window — call it right ' +
+        'after an action (click/navigate/type) to see the effect without re-reading the whole page.',
+      inputSchema: {
+        type: 'object',
+        properties: { ...INSTANCE_PROP },
+        required: ['instance'],
+        additionalProperties: false,
+      },
+      call: (a) => ({ method: 'GET', path: '/changes' + qs({ instance: a.instance }) }),
+    },
+    {
+      name: 'find_element',
+      cap: 'read',
+      description:
+        'Locate elements on a page by a natural-language description (e.g. "the blue Sign In button"). Returns ' +
+        'candidate elements with a CSS selector, visible text, role, and on-screen rectangle; choose the best ' +
+        'selector to click or type into.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          ...INSTANCE_PROP,
+          query: { type: 'string', description: 'Natural-language description of the element to find.' },
+          limit: { type: 'number', description: 'Max candidates (default 8, max 25).' },
+        },
+        required: ['instance', 'query'],
+        additionalProperties: false,
+      },
+      call: (a) => ({ method: 'GET', path: '/find' + qs({ instance: a.instance, query: a.query, limit: a.limit }) }),
+    },
+    {
       name: 'click',
       cap: 'interact',
       description: 'Click the first element matching a CSS selector.',
@@ -499,7 +560,7 @@ async function main() {
 
   // The composed capability prompt is delivered to the client's model via `instructions`.
   const server = new Server(
-    { name: 'project-steersman', version: '0.1.0' },
+    { name: 'project-steersman', version: '0.2.0' },
     { capabilities: { tools: {}, resources: {} }, instructions }
   );
 

@@ -9,6 +9,9 @@ const crypto = require('crypto');
 const { CapabilityConfig } = require('./capability-config');
 
 const VIEW_TYPE = 'projectSteersmanPanel';
+// GitHub repo backing the Settings "check for updates" badge; the webview can't fetch
+// external URLs under CSP, so the host does the GitHub release lookup on its behalf.
+const REPO = 'lxRbckl/Project-Steersman';
 
 class ProjectSteersmanPanel {
   // deps: { manager, scriptRunner, getPort: () => number|null, log, extensionUri,
@@ -73,6 +76,9 @@ class ProjectSteersmanPanel {
     // Loopback auth token the HTTP API now requires; included in the copy-prompt so manual/
     // direct HTTP driving still works. Local/ephemeral only — never written to a log line.
     this._token = deps.token || null;
+    // Current extension version (package.json), pushed into state so the Settings badge
+    // can render it and the checkForUpdate handler has a local version to compare against.
+    this._version = deps.version || null;
     this._disposed = false;
     this._disposables = [];
 
@@ -193,6 +199,18 @@ class ProjectSteersmanPanel {
         }
         this._postState();
         break;
+      case 'deleteScript':
+        // Operator action (Settings Scripts table): unlink the .js from the central dir.
+        // deleteScript is idempotent (a missing file is a no-op), but a bad name can still
+        // throw SCRIPT_NOT_FOUND — either way we re-push fresh state so the table + every
+        // window's dropdown re-scan the central dir and drop the removed script.
+        try {
+          if (this._scriptRunner) this._scriptRunner.deleteScript(msg.name);
+        } catch (e) {
+          this._log.appendLine('[Panel] deleteScript ' + (msg && msg.name) + ' failed: ' + (e && e.message ? e.message : e));
+        }
+        this._postState();
+        break;
       case 'getBookmarks':
         this._postBookmarks();
         break;
@@ -256,10 +274,87 @@ class ProjectSteersmanPanel {
         await vscode.env.openExternal(vscode.Uri.parse(msg.url));
         break;
       }
+      case 'checkForUpdate':
+        await this._checkForUpdate();
+        break;
       default:
         this._log.appendLine('[Panel] unhandled message: ' + type);
         break;
     }
+  }
+
+  // Fetch the latest GitHub release for REPO and post an updateStatus verdict back to the
+  // webview. Host-side only (the webview can't reach api.github.com under its CSP). Bounded
+  // by a 6s AbortController timeout; every failure mode (network error, timeout, non-2xx,
+  // no releases yet, malformed body) is caught and reported as a short error string instead
+  // of throwing, so a flaky connection never breaks the Settings panel.
+  async _checkForUpdate() {
+    const current = this._version || '0.0.0';
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 6000);
+    try {
+      const res = await fetch(`https://api.github.com/repos/${REPO}/releases/latest`, {
+        headers: { 'Accept': 'application/vnd.github+json', 'User-Agent': 'project-steersman' },
+        signal: controller.signal,
+      });
+      if (res.status === 404) {
+        this._post({ type: 'updateStatus', current, error: 'no releases found' });
+        return;
+      }
+      if (!res.ok) {
+        this._log.appendLine('[Panel] checkForUpdate: GitHub returned ' + res.status);
+        this._post({ type: 'updateStatus', current, error: 'check failed' });
+        return;
+      }
+      // Parsing/shape failures here (bad JSON, missing tag_name) are a bad API response,
+      // not a network problem — report 'check failed', not 'offline'.
+      let data, latest;
+      try {
+        data = await res.json();
+        const tag = typeof data.tag_name === 'string' ? data.tag_name : '';
+        latest = tag.replace(/^v/, '').trim();
+      } catch (e) {
+        this._log.appendLine('[Panel] checkForUpdate: malformed response body: ' + (e && e.message ? e.message : e));
+        this._post({ type: 'updateStatus', current, error: 'check failed' });
+        return;
+      }
+      // Reject anything that isn't a plain dotted-numeric version (e.g. 'nightly',
+      // 'release-1') before comparing, so a bad tag never renders a garbage verdict.
+      if (!/^\d+(\.\d+)*$/.test(latest)) {
+        this._post({ type: 'updateStatus', current, error: 'check failed' });
+        return;
+      }
+      const releasesUrl = data.html_url || `https://github.com/${REPO}/releases`;
+      const cmp = this._compareSemver(latest, current);
+      this._post({
+        type: 'updateStatus',
+        current,
+        latest,
+        upToDate: cmp <= 0,
+        updateAvailable: cmp > 0,
+        releasesUrl,
+      });
+    } catch (e) {
+      this._log.appendLine('[Panel] checkForUpdate failed: ' + (e && e.message ? e.message : e));
+      this._post({ type: 'updateStatus', current, error: 'offline' });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // Numeric, part-by-part semver compare (missing trailing parts treated as 0). Returns a
+  // positive number when a > b, negative when a < b, 0 when equal — plain ints, never NaN,
+  // since a non-numeric part just falls back to 0.
+  _compareSemver(a, b) {
+    const pa = String(a).split('.');
+    const pb = String(b).split('.');
+    const len = Math.max(pa.length, pb.length);
+    for (let i = 0; i < len; i++) {
+      const na = parseInt(pa[i], 10) || 0;
+      const nb = parseInt(pb[i], 10) || 0;
+      if (na !== nb) return na - nb;
+    }
+    return 0;
   }
 
   // Ordinal "activate the Nth tab in the active group" commands, indexed by (tabIndex).
@@ -465,7 +560,14 @@ class ProjectSteersmanPanel {
       };
     });
     const scripts = this._scriptRunner ? this._scriptRunner.listScripts() : [];
-    this._post({ type: 'state', sessions, port: port == null ? null : port, scripts });
+    this._post({ type: 'state', sessions, port: port == null ? null : port, scripts, version: this._version || null });
+  }
+
+  // Public re-push hook for external triggers (e.g. the central-scripts fs.watch in
+  // extension.js): re-scan and post fresh state so the script table + dropdowns update when
+  // another instance adds/deletes a script. Guarded no-op once the panel is disposed.
+  refresh() {
+    this._postState();
   }
 
   // Push the current capability settings (composedPreview recomputed fresh) to the webview.
