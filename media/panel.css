@@ -151,6 +151,11 @@ button.icon-button.danger:hover:not(:disabled) {
   color: var(--vscode-errorForeground, #f14c4c);
 }
 
+/* Copy buttons briefly swap their glyph to a green checkmark on copy (Mandrake-style, no text). */
+button.icon-button.copied-check {
+  color: var(--vscode-charts-green, var(--vscode-testing-iconPassed, #4caf50));
+}
+
 /* Framed variant — used for the ＋ New Session box button in the Tabs-view body
    toolbar, so it still reads as a clickable control even without label text. */
 button.icon-button.btn-add {
@@ -175,16 +180,16 @@ button.icon-button.btn-fleet-copy {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
-  padding: 12px 14px 20px;
+  padding: 10px 14px 14px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
 }
 
 .settings-loading {
   color: var(--vscode-descriptionForeground);
   font-size: 12px;
-  padding: 8px 2px;
+  padding: 6px 2px;
 }
 
 /* Cover hero — pixel-art banner at the top of Settings, sized for the
@@ -200,7 +205,7 @@ button.icon-button.btn-fleet-copy {
   background-position: center;
   background-repeat: no-repeat;
   border-radius: 6px;
-  margin-bottom: 12px;
+  margin-bottom: 6px;
   overflow: hidden;
 }
 .settings-hero::after {
@@ -212,12 +217,40 @@ button.icon-button.btn-fleet-copy {
   pointer-events: none;
 }
 
-/* Version/update-check badge — a compact header row pinned above the rest of
-   the Settings body (right-aligned), so it stays out of the way of the
-   Instruction/Capabilities/Bookmarks sections below it. */
-.settings-header-row {
+/* Top bar above the cover photo — bold title on the left, the package
+   (update-check) button and the GitHub button pushed to the far right. A
+   sibling of .settings-hero inside .settings-body, so its left/right edges
+   line up with the cover photo (both share the body's horizontal padding). */
+.settings-topbar {
   display: flex;
-  justify-content: flex-end;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Bold product title; margin-right:auto pushes the two right-hand buttons out
+   to the far edge of the row. */
+.settings-title {
+  margin-right: auto;
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--vscode-foreground);
+  white-space: nowrap;
+}
+
+/* GitHub button — right-most in the top bar. A uniform 26px icon-only square (like every other
+   icon-only button), keeping the input-material frame so it still reads as a framed control. */
+button.icon-button.settings-github-btn {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--vscode-input-border, transparent);
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+}
+
+button.icon-button.settings-github-btn:hover:not(:disabled) {
+  background: var(--vscode-input-background);
+  border-color: var(--vscode-focusBorder, #007fd4);
 }
 
 /* Idle chrome matches Project Nomeda's update-extension button (input-material
@@ -301,11 +334,59 @@ button.icon-button.btn-fleet-copy {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--vscode-descriptionForeground);
-  margin: 28px 0 6px;
+  margin: 14px 0 4px;
 }
 
 .settings-section-title:first-child {
   margin-top: 2px;
+}
+
+/* ─── Collapsible Settings sections ───────────────────────────────────────
+   Each top-level section header (plain .settings-section-title ones + the compound
+   .bm-section-header ones) is clickable to collapse/expand its body. A caret rotates to
+   reflect state; collapse state persists in the webview's vscode.setState (like scroll). */
+.settings-section-toggle {
+  cursor: pointer;
+  user-select: none;
+}
+
+.settings-section-toggle:hover {
+  color: var(--vscode-foreground);
+}
+
+/* Plain-title headers become a flex row (caret + label) when they're the toggle target. */
+.settings-section-title.settings-section-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Caret + label group inside a compound (.bm-section-header) header, so the header's
+   space-between keeps the group left and the action buttons right. */
+.settings-section-titlegroup {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+/* The rotating caret — right-pointing when collapsed, down when expanded (open). */
+.settings-chevron {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  color: var(--vscode-descriptionForeground);
+  transition: transform 0.1s ease;
+}
+
+.settings-chevron.open {
+  transform: rotate(90deg);
+}
+
+.settings-chevron svg {
+  width: 11px;
+  height: 11px;
+  display: block;
 }
 
 /* Free-text areas — instruction box + composed preview share the same frame
@@ -320,7 +401,7 @@ button.icon-button.btn-fleet-copy {
   color: var(--vscode-foreground);
   font-family: inherit;
   font-size: 12px;
-  padding: 8px;
+  padding: 6px;
   resize: vertical;
 }
 
@@ -334,14 +415,14 @@ button.icon-button.btn-fleet-copy {
 .capability-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 5px;
 }
 
 .capability-row {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 8px 10px;
+  gap: 4px;
+  padding: 6px 8px;
   border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
   border-radius: 4px;
   background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.06));
@@ -379,14 +460,21 @@ button.icon-button.btn-fleet-copy {
   line-height: 1.4;
 }
 
+/* Auto-grows to fit its content via panel.js (autoSizeInstruction); the JS
+   clamps the height to this same 250px cap, past which the box scrolls
+   internally. resize:none since the JS drives the height — a manual drag would
+   just be undone on the next keystroke. min-height keeps an empty box tappable. */
 .capability-instruction {
-  min-height: 44px;
+  min-height: 36px;
+  max-height: 250px;
+  overflow-y: hidden;
+  resize: none;
 }
 
 /* Top-level role-debrief instruction — needs room for a multi-sentence
    brief, unlike the terser per-capability overrides above. */
 .settings-textarea {
-  min-height: 140px;
+  min-height: 100px;
 }
 
 /* Read-only, but text stays selectable/copyable and normally coloured —
@@ -399,8 +487,8 @@ button.icon-button.btn-fleet-copy {
 /* Composed-preview block — read-only, visually distinct as a "generated
    output" region: monospace, slightly recessed, no resize handle. */
 .settings-preview {
-  min-height: 240px;
-  max-height: 480px;
+  min-height: 160px;
+  max-height: 360px;
   overflow: auto;
   margin: 0;
   font-family: var(--vscode-editor-font-family, monospace);
@@ -699,11 +787,11 @@ select.script-picker:focus-visible {
 .bm-section {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
   /* Section wrapper itself (not the nested title) sits between Capabilities
      and Bookmarks in .settings-body, so the inter-segment gap has to live
-     here to match the ~34px (gap 6px + title margin-top 28px) other segments get. */
-  margin-top: 28px;
+     here to match the ~18px (gap 4px + title margin-top 14px) other segments get. */
+  margin-top: 14px;
 }
 
 /* Section header — reuses the .settings-section-title label, with the
@@ -743,8 +831,8 @@ select.script-picker:focus-visible {
   border-radius: 4px;
   background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.06));
   padding: 4px;
-  min-height: 360px;
-  max-height: 640px;
+  min-height: 200px;
+  max-height: 440px;
   overflow: auto;
   scrollbar-width: thin;
   scrollbar-color: var(--vscode-scrollbarSlider-background) transparent;
@@ -769,7 +857,7 @@ select.script-picker:focus-visible {
   align-items: center;
   gap: 6px;
   min-height: 26px;
-  padding: 3px 6px;
+  padding: 2px 6px;
   border-radius: 3px;
   cursor: grab;
 }
@@ -789,22 +877,14 @@ select.script-picker:focus-visible {
   background: var(--vscode-list-dropBackground, rgba(0, 127, 212, 0.18));
 }
 
-/* Compact icon buttons inside rows (smaller than the 26px session buttons). */
-.bm-row .icon-button,
-.bm-actions .icon-button {
-  width: 22px;
-  height: 22px;
-}
+/* Icon-only buttons are a uniform 26px square everywhere (from base .icon-button); row action
+   buttons no longer shrink to 22px — part of the panel-wide square-button normalization. (The
+   two-glyph .bm-add ＋bookmark/＋folder buttons keep their auto width — they hold two glyphs.) */
 
-/* Expand/collapse chevron — a drawn SVG triangle (chevronIcon() in panel.js)
-   rotated to point down when open, rather than the old text '▸' glyph, so its
-   bounding box is roughly square and it turns cleanly about the button's
-   center. Given a comfortable ~24px square hit box (wider than the 22px
-   row-icon default) so the whole box, not just the small triangle, toggles
-   the folder; flex centering on .icon-button keeps the svg centered. */
+/* Expand/collapse folder chevron — a drawn SVG triangle (chevronIcon() in panel.js) rotated to
+   point down when open. Uses the uniform 26px square hit box (the whole box toggles the folder);
+   flex centering on .icon-button keeps the svg centered. */
 button.icon-button.bm-chevron {
-  width: 24px;
-  height: 24px;
   transition: transform 0.1s ease;
 }
 
@@ -903,7 +983,7 @@ button.icon-button.bm-confirm:hover:not(:disabled) {
 /* Insertion line between siblings — invisible at rest, a bright bar on hover
    while dragging (the reorder drop affordance). */
 .bm-dropline {
-  height: 4px;
+  height: 3px;
   margin: 1px 0;
   border-radius: 2px;
 }
@@ -917,7 +997,7 @@ button.icon-button.bm-confirm:hover:not(:disabled) {
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 3px 6px;
+  padding: 2px 6px;
 }
 
 .bm-input {
@@ -945,8 +1025,8 @@ button.icon-button.bm-confirm:hover:not(:disabled) {
 .scripts-section {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  margin-top: 28px;
+  gap: 4px;
+  margin-top: 14px;
 }
 
 /* Bounded, scrollable card — same frame as .bm-tree-wrap, shorter since rows
@@ -956,7 +1036,7 @@ button.icon-button.bm-confirm:hover:not(:disabled) {
   border-radius: 4px;
   background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.06));
   padding: 4px;
-  max-height: 220px;
+  max-height: 180px;
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: var(--vscode-scrollbarSlider-background) transparent;
@@ -967,7 +1047,7 @@ button.icon-button.bm-confirm:hover:not(:disabled) {
   align-items: center;
   gap: 6px;
   min-height: 26px;
-  padding: 3px 6px;
+  padding: 2px 6px;
   border-radius: 3px;
 }
 
@@ -1006,5 +1086,178 @@ button.icon-button.bm-confirm:hover:not(:disabled) {
 .script-lang-py {
   color: var(--vscode-charts-blue, #3794ff);
   border: 1px solid var(--vscode-charts-blue, #3794ff);
+}
+
+/* ─── Extensions section (Phase 1) — operator-only list of userscript-style page modifiers.
+   Mirrors .scripts-section / .bm-section spacing + card frame and the compact density; the
+   inline add/edit form reuses .bm-input for the name and .capability-instruction (auto-grow)
+   for the JS editor. Match-patterns/CSS/run-at controls arrive in later phases. ──────────── */
+
+.ext-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 14px;
+}
+
+/* Bounded, scrollable card — same frame as .scripts-list / .bm-tree-wrap. */
+.ext-list {
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  border-radius: 4px;
+  background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.06));
+  padding: 4px;
+  max-height: 220px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--vscode-scrollbarSlider-background) transparent;
+}
+
+.ext-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+
+.ext-row:hover {
+  background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.12));
+}
+
+.ext-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--vscode-foreground);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* "Applies to current page" dot — hollow grey ring by default, filled green when the extension
+   currently matches an open tab (mirrors the connection-dot vocabulary). */
+.ext-here {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1.5px var(--vscode-descriptionForeground, #888);
+}
+
+.ext-here.active {
+  background: var(--vscode-charts-green, var(--vscode-testing-iconPassed, #4caf50));
+  box-shadow: none;
+}
+
+/* "hidden from agent reads" row badge — muted, quiet until it matters. */
+.ext-hidden-badge {
+  flex: 0 0 auto;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  border-radius: 3px;
+  padding: 1px 5px;
+  line-height: 1.4;
+  color: var(--vscode-descriptionForeground, #999);
+  border: 1px solid var(--vscode-descriptionForeground, #999);
+}
+
+/* Compact control row in the add/edit form: run-at + world selects, then the hide-from-agent
+   toggle, wrapped tight and consistent with the density. */
+.ext-form-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.ext-hide-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+/* Tiny JS / CSS / JS+CSS payload indicator — a compact neutral pill like .script-lang. */
+.ext-kind {
+  flex: 0 0 auto;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  border-radius: 3px;
+  padding: 1px 5px;
+  line-height: 1.4;
+  color: var(--vscode-descriptionForeground, #999);
+  border: 1px solid var(--vscode-descriptionForeground, #999);
+}
+
+/* Per-row match summary — muted, capped, ellipsized; sits between the name and the row actions. */
+.ext-summary {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 45%;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Small section labels inside the add/edit form (above the match-patterns / JS editors). */
+.ext-form-label {
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  margin-top: 2px;
+}
+
+/* Inline validation error (e.g. a malformed match pattern), shown left of the ✓/✕ + run-at. */
+.ext-form-error {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--vscode-errorForeground, #f14c4c);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Run-at picker in the form action row — compact dropdown matching the density. */
+select.ext-runat {
+  height: 24px;
+  background: var(--vscode-dropdown-background, var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.06)));
+  color: var(--vscode-dropdown-foreground, var(--vscode-foreground));
+  border: 1px solid var(--vscode-dropdown-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
+  border-radius: 3px;
+  font: inherit;
+  font-size: 11px;
+  padding: 0 6px;
+  cursor: pointer;
+}
+
+select.ext-runat:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder, #007fd4);
+  outline-offset: -1px;
+}
+
+/* Inline add/edit form — a bordered card (matching .capability-row) stacking the name input,
+   the auto-grow JS editor, and a right-aligned ✓/✕ action pair. */
+.ext-form {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  border-radius: 4px;
+  background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.06));
+  margin-top: 4px;
+}
+
+.ext-form-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  justify-content: flex-end;
 }
 

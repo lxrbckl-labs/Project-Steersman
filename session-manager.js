@@ -22,6 +22,7 @@ class SessionManager {
     this.getPort = ctx.getPort;
     this.getStartUrl = ctx.getStartUrl;
     this.bookmarksStore = ctx.bookmarksStore || null;
+    this.extensionsStore = ctx.extensionsStore || null;
     this._counter = 0;
     // id -> { id, state, url, tab, viewColumn, editorTab, script } (insertion order = FIFO).
     // viewColumn/editorTab record the integrated-browser editor tab's placement so the
@@ -260,6 +261,15 @@ class SessionManager {
           }
         } catch {}
       }
+      // Wire extensions the same way (feature-flag: only when a store was provided). The tab
+      // re-injects the active set on every page load via getExtensions; we also run the initial
+      // injection now against the already-loaded page.
+      if (this.extensionsStore) {
+        tab.getExtensions = () => this.extensionsStore.getActive();
+        try {
+          await tab.injectExtensions(this.extensionsStore.getActive());
+        } catch {}
+      }
       this._fire();
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);
@@ -332,6 +342,28 @@ class SessionManager {
     );
   }
 
+  // Re-apply the active extensions across every connected tab. The panel's Settings handlers call
+  // this after a mutation (add/edit/toggle/delete or the master flag flip) so a change lands on the
+  // CURRENT documents immediately, not just on the next load. CSS and other injected/tagged nodes
+  // revert LIVE on disable/delete/unmatch/master-off via the per-tab reconcile (see cdp-tab
+  // injectExtensions); only a JS body's DOM side-effects that already ran can't be undone (they
+  // stop on the next load, but their prior mutations persist). Isolated-world JS is not live-applied
+  // either — it takes effect on the next navigation. Safe no-op when no store is wired; per-tab
+  // errors are swallowed so one bad tab can't sink the rest.
+  async refreshExtensions() {
+    if (!this.extensionsStore) return;
+    const items = this.extensionsStore.getActive();
+    await Promise.all(
+      Array.from(this._sessions.values()).map(async (s) => {
+        if (s.tab && s.state === 'connected') {
+          try {
+            await s.tab.injectExtensions(items);
+          } catch {}
+        }
+      })
+    );
+  }
+
   // Resolve the enabled-capability id set that filters buildPrompt's endpoint reference.
   // `config` is the shared CapabilityConfig (anything with getState()); when it's absent
   // (the current single-arg caller) we fall back to the default operator posture — every
@@ -388,9 +420,9 @@ class SessionManager {
       ['eval', 'EVAL', ['- POST /eval {instance,js} — run arbitrary JavaScript in the page and return the result.']],
       ['create_window', 'CREATE WINDOWS', ['- POST /windows — open a new browser window (returns its new instance id).']],
       ['close_window', 'CLOSE WINDOWS', ['- POST /window/close {instance} — close a window.']],
-      ['run_script', 'RUN SAVED SCRIPTS', [
-        '- GET /scripts — list saved scripts from the project scripts/ folder.',
-        '- POST /script/run {instance,name} — run a saved script against the window.',
+      ['run_script', 'RUN SAVED AUTOMATIONS', [
+        '- GET /scripts — list saved automations from the project scripts/ folder.',
+        '- POST /script/run {instance,name} — run a saved automation against the window.',
       ]],
     ];
     for (const [capId, heading, endpoints] of groups) {
@@ -426,15 +458,15 @@ class SessionManager {
       '',
       '**Manual windows:** a window whose `autopilot` is `false` (shown in the `GET /windows` ' +
         'list) is under manual human control. Do NOT navigate, click, type, eval, scroll, read, ' +
-        'screenshot, run scripts against, or close it — those calls return `403 window under ' +
+        'screenshot, run automations against, or close it — those calls return `403 window under ' +
         'manual control`. It appears in the window list so you know it exists; leave it alone.',
       '',
-      '**Scripts:** `GET /scripts` lists saved scripts as `.js` or `.py`. A `.js` script is ' +
-        'evaluated inside the page. A `.py` script runs as a HOST PROCESS that drives the tab ' +
+      '**Automations:** `GET /scripts` lists saved automations as `.js` or `.py`. A `.js` automation is ' +
+        'evaluated inside the page. A `.py` automation runs as a HOST PROCESS that drives the tab ' +
         'via this API — it receives `STEERSMAN_URL`, `STEERSMAN_INSTANCE`, and ' +
         '`STEERSMAN_TOKEN` as env vars and must call the API itself to act. Running a `.js` ' +
-        'script requires the `run_script` capability; a `.py` script requires `run_python`. ' +
-        'Manual-mode windows reject script runs either way.',
+        'automation requires the `run_script` capability; a `.py` automation requires `run_python`. ' +
+        'Manual-mode windows reject automation runs either way.',
       '',
     ];
 

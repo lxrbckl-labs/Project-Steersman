@@ -84,16 +84,35 @@ class BookmarksStore {
     return this._root;
   }
 
-  // The global "show bookmarks bar" flag (defaults to true when nothing is stored, so the bar
-  // shows by default). Independent of the tree; never throws on a bad/absent stored value.
+  // Total number of BOOKMARK nodes in the tree, counting those nested inside folders too
+  // (folders themselves are not counted). Used to gate the bar off when there are none.
+  countBookmarks(node = this._root) {
+    let n = 0;
+    for (const child of (node && node.children) || []) {
+      if (child.type === 'folder') n += this.countBookmarks(child);
+      else n += 1;
+    }
+    return n;
+  }
+
+  // The global "show bookmarks bar" flag. Two rules layered on the stored value:
+  //   1. With ZERO bookmarks the bar is always off — there is nothing to show, so an empty tree
+  //      reads false regardless of any stored flag. This one gate cleanly covers a fresh/empty
+  //      install, a delete-to-empty, AND a legacy install that stored `true` while empty, with no
+  //      separate write needed on the last removal.
+  //   2. Otherwise the stored flag wins, and its UNSET default is now FALSE (was true): a
+  //      non-empty tree stays off until the 0→≥1 auto-enable (PanelController._mutateBookmarks)
+  //      or a manual toggle turns it on.
+  // Independent of tree mutation; never throws on a bad/absent stored value.
   getBarEnabled() {
+    if (this.countBookmarks() === 0) return false;
     let stored;
     try {
       stored = this._globalState && this._globalState.get(BAR_ENABLED_KEY);
     } catch {
       stored = undefined;
     }
-    return stored === undefined ? true : !!stored;
+    return stored === undefined ? false : !!stored;
   }
 
   // Persist the "show bookmarks bar" flag, coercing to a plain boolean. Fire-and-forget (the

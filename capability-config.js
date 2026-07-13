@@ -82,26 +82,26 @@ const CAPABILITIES = [
   },
   {
     id: 'run_script',
-    label: 'Run saved scripts',
+    label: 'Run saved automations',
     enabled: true,
     risky: true,
     instruction:
-      'You may run saved scripts against a tab. Scripts live centrally at ' +
+      'You may run saved automations against a tab. Automations live centrally at ' +
       '`~/.project-steersman/scripts/` (shared across all windows); manage them there ' +
-      '(create, read, update — and delete via the Settings Scripts table, never by hand ' +
-      "without asking). Each script is a .js file whose body is evaluated in the tab's page context.",
-    restriction: 'You MUST NOT run saved scripts — disabled by the operator.',
+      '(create, read, update — and delete via the Settings Automations table, never by hand ' +
+      "without asking). Each automation is a .js file whose body is evaluated in the tab's page context.",
+    restriction: 'You MUST NOT run saved automations — disabled by the operator.',
   },
   {
     id: 'run_python',
-    label: 'Run Python scripts',
+    label: 'Run Python automations',
     enabled: true,
     risky: true,
     instruction:
-      'You may run saved PYTHON scripts (.py). Unlike JS scripts (evaluated inside the page), ' +
-      'a .py script runs as a HOST process that drives the tab through the HTTP API — it ' +
+      'You may run saved PYTHON automations (.py). Unlike JS automations (evaluated inside the page), ' +
+      'a .py automation runs as a HOST process that drives the tab through the HTTP API — it ' +
       'executes arbitrary code on the machine, so it is more powerful and more dangerous.',
-    restriction: 'You MUST NOT run Python scripts — this capability is disabled by the operator.',
+    restriction: 'You MUST NOT run Python automations — this capability is disabled by the operator.',
   },
 ];
 
@@ -172,7 +172,7 @@ class CapabilityConfig {
     // are off-limits no matter what the operator has toggled above.
     parts.push(
       'MANUAL WINDOWS: Some browser windows may be under manual human control (shown as ' +
-      '`autopilot: false` in the window list). Do NOT act on, run scripts against, or close ' +
+      '`autopilot: false` in the window list). Do NOT act on, run automations against, or close ' +
       'a window whose autopilot is false — those calls are rejected. Check the window list ' +
       'and leave manual windows alone.'
     );

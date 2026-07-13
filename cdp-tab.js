@@ -44,6 +44,25 @@ class CDPTab {
     // Optional callback returning the global "show bookmarks bar" flag (boolean). Set by the
     // SessionManager; when unset the bar defaults to injecting (backward-compatible).
     this.getBarEnabled = null;
+    // Optional callback returning the active extensions to inject (array of records; already
+    // gated by the master flag + per-extension enabled). Set by the SessionManager; when unset
+    // (feature off) nothing is injected. All record fields are honoured now: matches (URL filter),
+    // js + runAt, css, world (main/isolated registration split), and hideFromAgent (drives the
+    // agent-read strip in getDomStripped/getTextStripped).
+    this.getExtensions = null;
+    // Identifiers of THIS tab's current Page.addScriptToEvaluateOnNewDocument registrations for the
+    // extensions bootstrap, so a config change can remove the old registrations before adding new
+    // ones. Phase 4 splits by execution world: the MAIN-world registration carries every
+    // extension's CSS plus the main-world JS bodies; the ISOLATED-world registration (added with a
+    // worldName) carries only the isolated-world JS bodies. null when nothing is registered.
+    this._extScriptId = null;
+    this._extScriptIdIsolated = null;
+    // Whether we've currently forced Page.setBypassCSP(true) on THIS tab (Phase 3). We only turn it
+    // on when at least one active extension carries CSS (an injected <style> element can be blocked
+    // by a page's style-src CSP), and turn it back off when the last CSS-bearing extension is gone,
+    // so pages that don't need it keep their own CSP intact. Tracked per-tab so we don't thrash the
+    // CDP call on every refresh.
+    this._extCssBypass = false;
     // Rolling capture buffers (Feature 1): console + network, each a ring of <= BUFFER_CAP entries.
     this._console = [];
     this._consoleSeq = 0;
@@ -157,6 +176,9 @@ class CDPTab {
     // getBookmarks callback hasn't been wired yet (the SessionManager triggers the real
     // first injection right after it sets the callback).
     this._reinjectBookmarks();
+    // Same idea for extensions: run the active set against the already-loaded page. No-ops until
+    // the SessionManager wires getExtensions (it triggers the real first injection after that).
+    this._reinjectExtensions();
   }
 
   async establishPageSession() {
@@ -214,6 +236,9 @@ class CDPTab {
     } else if (msg.method === 'Page.loadEventFired') {
       // A load replaces the document and drops our host node — re-inject the bar.
       this._reinjectBookmarks();
+      // Extensions need NO re-inject on load: our Page.addScriptToEvaluateOnNewDocument
+      // registration (Phase 2) runs the active set at document-start of every new document
+      // automatically. We only (re)register + live-apply on connect and on config changes.
     } else if (msg.method === 'Runtime.consoleAPICalled') {
       try {
         const params = msg.params || {};
@@ -520,18 +545,250 @@ class CDPTab {
     this.injectBookmarksBar(tree).catch(() => {});
   }
 
+  // Build the single page-bootstrap expression for the active extensions (Phase 2 + 3).
+  //
+  // The bootstrap carries the per-extension METADATA (id + matches + runAt + css) as JSON — the
+  // same "stringify data into an IIFE" trick the bookmarks bar uses for its tree. Two important
+  // distinctions in how the two payloads are carried:
+  //   • JS bodies are inlined as RAW functions (NOT eval'd), so — run via
+  //     Page.addScriptToEvaluateOnNewDocument or Runtime.evaluate — they execute in the page's main
+  //     world and bypass the page CSP even on strict-CSP sites. CAVEAT (unchanged from P2): because
+  //     bodies are inlined raw, a SYNTAX error in one body fails the whole bootstrap parse; operator
+  //     bodies are expected to be valid JS.
+  //   • CSS is carried purely as a STRING in META (JSON data, never code), so it adds no parse
+  //     hazard. It's applied by inserting a <style id="__steersman_ext_css_<id>"> element.
+  //
+  // At run time the bootstrap URL-filters each extension against `location.href` with an embedded
+  // port of match-pattern.js. For a match it applies the CSS immediately (as early as possible,
+  // regardless of runAt — an injected <style> at document-start lands even before <head> exists,
+  // via a documentElement fallback), then runs the JS body per runAt: immediately for
+  // 'document_start', else deferred to DOMContentLoaded ('document_idle') — or immediately when the
+  // document is already past loading (the live-apply case). Each JS body runs in its own try/catch.
+  //
+  // `reconcile` (live-apply only): first REMOVE any of our `__steersman_ext_css_*` <style> nodes
+  // whose ext-id is not in the currently-active-AND-matching-AND-has-css set, so disabling/deleting/
+  // unmatching an extension (or flipping the master off) strips its CSS from the LIVE document
+  // without a reload. Fresh documents (the registration path) have nothing to remove, so they skip
+  // this. NOTE: only injected CSS nodes are live-revertible — a JS body's DOM side-effects that
+  // already ran cannot be undone (that remains the sole un-revert gap).
+  //
+  // WORLD SPLIT (Phase 4): `opts.world` selects which bootstrap this is.
+  //   • 'main'     — carries EVERY applicable extension's CSS (CSS is world-independent; a <style>
+  //                  node inserted from either world affects the shared DOM) plus the JS bodies of
+  //                  main-world extensions. This is the only path that touches CSS + reconcile.
+  //   • 'isolated' — carries ONLY the JS bodies of isolated-world extensions (no CSS, no reconcile);
+  //                  registered with a worldName so it runs in a JS-isolated world that can't touch
+  //                  or collide with the page's own globals.
+  // Returns null for the registration path (opts.reconcile false) when this world has nothing to
+  // run. The reconcile (live-apply) path — only used for 'main' — ALWAYS returns an expression, even
+  // for an empty set, so stale CSS still gets cleaned up when the last extension goes away.
+  _buildExtensionsBootstrap(list, opts) {
+    opts = opts || {};
+    const world = opts.world === 'isolated' ? 'isolated' : 'main';
+    const reconcile = !!opts.reconcile && world === 'main';
+    const items = Array.isArray(list) ? list : [];
+    const hasJs = (e) => e && typeof e.js === 'string' && e.js.trim();
+    const hasCss = (e) => e && typeof e.css === 'string' && e.css.trim();
+    const worldOf = (e) => (e && e.world === 'isolated' ? 'isolated' : 'main');
+    // Main bootstrap: anything with CSS (any world) OR a main-world JS body. Isolated bootstrap:
+    // only isolated-world JS bodies.
+    const applicable =
+      world === 'main'
+        ? items.filter((e) => hasCss(e) || (hasJs(e) && worldOf(e) === 'main'))
+        : items.filter((e) => hasJs(e) && worldOf(e) === 'isolated');
+    if (!applicable.length && !opts.reconcile) return null;
+    const meta = JSON.stringify(
+      applicable.map((e) => ({
+        id: e.id || '?',
+        matches: Array.isArray(e.matches) ? e.matches : [],
+        runAt: e.runAt === 'document_start' ? 'document_start' : 'document_idle',
+        // CSS is applied only by the main bootstrap (world-independent, but centralised there so
+        // the reconcile sees the full set); the isolated bootstrap never carries CSS.
+        css: world === 'main' && hasCss(e) ? e.css : '',
+      }))
+    );
+    // Bodies correlated to META by index; a slot is null unless the extension's JS belongs to THIS
+    // world (so the main bootstrap gets null for isolated extensions' bodies, and vice-versa, while
+    // still carrying their CSS via META above when this is the main bootstrap).
+    const bodies = applicable
+      .map((e) => (hasJs(e) && worldOf(e) === world ? '(function(steersman){\n' + e.js + '\n})' : 'null'))
+      .join(',');
+    // Embedded, self-contained port of match-pattern.js's matchesUrl (kept in sync with that file).
+    const matcher =
+      'function __sm_glob(g){var r="^";for(var i=0;i<g.length;i++){var c=g[i];' +
+      'r+=(c==="*")?".*":c.replace(/[.*+?^${}()|[\\]\\\\]/g,"\\\\$&");}return new RegExp(r+"$");}' +
+      'function __sm_host(ph,uh){if(ph==="*")return true;' +
+      'if(ph.indexOf("*.")===0){var b=ph.slice(2);return uh===b||uh.slice(-(b.length+1))==="."+b;}return uh===ph;}' +
+      'function __sm_parse(p){if(typeof p!=="string")return null;p=p.trim();if(!p)return null;' +
+      'if(p==="<all_urls>")return{allUrls:true};var s=p.indexOf("://");if(s===-1)return null;' +
+      'var sc=p.slice(0,s);if(!/^(\\*|https?|file|ftp)$/.test(sc))return null;var rest=p.slice(s+3);' +
+      'var sl=rest.indexOf("/");if(sl===-1)return null;var h=rest.slice(0,sl),pa=rest.slice(sl);' +
+      'if(pa[0]!=="/")return null;if(sc==="file"){if(h!=="")return null;}else{if(h==="")return null;' +
+      'if(h!=="*"){if(h.indexOf("*.")===0){var bb=h.slice(2);if(!bb||bb.indexOf("*")!==-1)return null;}' +
+      'else if(h.indexOf("*")!==-1)return null;}}return{allUrls:false,scheme:sc,host:h,path:pa};}' +
+      'function __sm_single(pr,u){if(!pr)return false;var sc=u.protocol.replace(/:$/,"");' +
+      'if(pr.allUrls)return["http","https","file","ftp"].indexOf(sc)!==-1;' +
+      'if(pr.scheme==="*"){if(sc!=="http"&&sc!=="https")return false;}else if(pr.scheme!==sc)return false;' +
+      'if(sc!=="file"&&!__sm_host(pr.host,u.hostname))return false;' +
+      'return __sm_glob(pr.path).test(u.pathname+u.search);}' +
+      'function __sm_matches(pats,url){if(!Array.isArray(pats)||!pats.length)return false;var u;' +
+      'try{u=new URL(url);}catch(e){return false;}for(var i=0;i<pats.length;i++){' +
+      'var pr=__sm_parse(pats[i]);if(pr&&__sm_single(pr,u))return true;}return false;}';
+    // Idempotent CSS injection: stable per-ext id, replace-in-place. Falls back to documentElement
+    // when <head> doesn't exist yet (document-start), so CSS lands as early as possible.
+    const cssHelper =
+      'var __sm_pfx="__steersman_ext_css_";' +
+      'function __sm_css(id,css){var eid=__sm_pfx+id;var el=document.getElementById(eid);' +
+      'if(!el){el=document.createElement("style");el.id=eid;(document.head||document.documentElement).appendChild(el);}' +
+      'if(el.textContent!==css)el.textContent=css;}';
+    // Live-apply reconcile: drop our CSS nodes whose ext-id is no longer wanted (removes disabled/
+    // deleted/unmatched/master-off styling from the live doc). Skipped on the registration path.
+    const reconcilePass = reconcile
+      ? 'var __sm_want={};META.forEach(function(m){if(m.css&&__sm_matches(m.matches,location.href))__sm_want[m.id]=1;});' +
+        'Array.prototype.forEach.call(document.querySelectorAll(\'style[id^="__steersman_ext_css_"]\'),' +
+        'function(el){if(!__sm_want[el.id.slice(__sm_pfx.length)])el.remove();});'
+      : '';
+    return (
+      '(function(){try{' +
+      'var META=' + meta + ';var BODIES=[' + bodies + '];' +
+      matcher +
+      cssHelper +
+      // Marker helper handed to each JS body as its `steersman` argument: `id` is the extension's
+      // own id, and `mark(node)` tags a node the body creates with data-steersman-ext=<id> so a
+      // hideFromAgent extension's injected nodes can be stripped from agent reads (see
+      // getDomStripped/getTextStripped). Best-effort: only nodes the author marks (plus the CSS
+      // style node) are strippable — arbitrary DOM mutations can't be reverted.
+      'function __sm_help(id){return{id:id,mark:function(n){try{if(n&&n.setAttribute)n.setAttribute("data-steersman-ext",id);}catch(e){}return n;}};}' +
+      'function __sm_run(i){try{BODIES[i](__sm_help(META[i].id));}catch(e){try{console.error("[Steersman extension "+META[i].id+"]",e);}catch(_){}}}' +
+      reconcilePass +
+      'META.forEach(function(m,i){if(!__sm_matches(m.matches,location.href))return;' +
+      'if(m.css)__sm_css(m.id,m.css);' +
+      'if(!BODIES[i])return;' +
+      'if(m.runAt==="document_start"){__sm_run(i);}' +
+      'else if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",function(){__sm_run(i);});}' +
+      'else{__sm_run(i);}});' +
+      '}catch(e){}})()'
+    );
+  }
+
+  // (Re)apply the active extensions to THIS tab (Phase 2–4). Steps:
+  //   1. CSP bypass (Phase 3) — force Page.setBypassCSP(true) ONLY when some active extension carries
+  //      CSS (an injected <style> can be blocked by a page's style-src CSP), and back to false when
+  //      the last CSS-bearing extension is gone, so pages that don't need it keep their own CSP. Set
+  //      BEFORE the live-apply below so the <style> insert isn't refused. The CDP request only fires
+  //      when the state actually flips (no thrashing).
+  //   2. Registration for FUTURE documents — remove the previous registrations and add fresh ones,
+  //      so every navigation runs the current set at document-start (URL-filtered in-page). Phase 4
+  //      splits this by world: a MAIN-world registration (CSS + main JS) and, when any isolated-world
+  //      JS exists, a second registration added with worldName so it runs in a JS-isolated world.
+  //   3. Live-apply + reconcile on the CURRENT document via Runtime.evaluate (MAIN world only), so
+  //      enabling/editing takes effect (and disabling/removing strips CSS) without a reload. Runs
+  //      even for an empty set, so the last extension's CSS is cleaned up. LIMITATION: isolated-world
+  //      JS is NOT live-applied (Runtime.evaluate targets the main world) — an isolated extension's
+  //      JS takes effect on the NEXT navigation via its document-start registration; its CSS, handled
+  //      by the main bootstrap, still applies/reverts live.
+  // Swallows its own transport/CDP errors and no-ops when disconnected — never throws.
+  async injectExtensions(list) {
+    const items = Array.isArray(list) ? list : [];
+    // 1. CSP bypass — only flip when the "any CSS-bearing extension?" answer changes.
+    const needBypass = items.some((e) => e && typeof e.css === 'string' && e.css.trim());
+    if (needBypass !== this._extCssBypass) {
+      try {
+        await this.send('Page.setBypassCSP', { enabled: needBypass });
+        this._extCssBypass = needBypass;
+      } catch {}
+    }
+    // 2. Registrations for future documents — MAIN (CSS + main JS) and ISOLATED (isolated JS only).
+    const mainExpr = this._buildExtensionsBootstrap(items, { world: 'main', reconcile: false });
+    const isoExpr = this._buildExtensionsBootstrap(items, { world: 'isolated', reconcile: false });
+    try {
+      if (this._extScriptId) {
+        await this.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: this._extScriptId });
+        this._extScriptId = null;
+      }
+    } catch {}
+    try {
+      if (this._extScriptIdIsolated) {
+        await this.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: this._extScriptIdIsolated });
+        this._extScriptIdIsolated = null;
+      }
+    } catch {}
+    if (mainExpr) {
+      try {
+        const r = await this.send('Page.addScriptToEvaluateOnNewDocument', { source: mainExpr });
+        this._extScriptId = r && r.identifier ? r.identifier : null;
+      } catch {}
+    }
+    if (isoExpr) {
+      try {
+        const r = await this.send('Page.addScriptToEvaluateOnNewDocument', {
+          source: isoExpr,
+          worldName: 'steersman_isolated',
+        });
+        this._extScriptIdIsolated = r && r.identifier ? r.identifier : null;
+      } catch {}
+    }
+    // 3. Live-apply + reconcile on the current document (MAIN world; always — even empty, to strip
+    //    stale CSS). Isolated JS is intentionally not live-applied (see LIMITATION above).
+    const liveExpr = this._buildExtensionsBootstrap(items, { world: 'main', reconcile: true });
+    if (liveExpr) {
+      try {
+        await this.evaluate(liveExpr);
+      } catch {}
+    }
+  }
+
+  // Fire-and-forget (re)registration of the active extensions, called from bootstrap() after
+  // connect. Reads the active set via the SessionManager-supplied getExtensions callback; if it's
+  // unset (feature off / not yet wired) we no-op. The SessionManager also calls injectExtensions
+  // directly right after it wires the callback, so the first real registration happens there.
+  _reinjectExtensions() {
+    let items = null;
+    try {
+      items = this.getExtensions ? this.getExtensions() : null;
+    } catch {
+      items = null;
+    }
+    if (!items) return;
+    this.injectExtensions(items).catch(() => {});
+  }
+
+  // Ids of the currently-active extensions marked hideFromAgent (Phase 4). Read from the
+  // SessionManager-supplied getExtensions callback (the active set, so master-off/disabled
+  // extensions aren't considered). Used by the read-strip paths below to hide an extension's
+  // injected nodes from agent reads. BEST-EFFORT scope: only an extension's own CSS <style> node
+  // and any nodes its JS explicitly tagged (via the `steersman.mark(node)` helper →
+  // data-steersman-ext=<id>) are strippable; arbitrary DOM mutations a body made cannot be reverted
+  // (the same limitation class as JS-side-effect irreversibility).
+  _hiddenExtIds() {
+    let items = null;
+    try {
+      items = this.getExtensions ? this.getExtensions() : null;
+    } catch {
+      items = null;
+    }
+    if (!Array.isArray(items)) return [];
+    return items.filter((e) => e && e.hideFromAgent && e.id).map((e) => e.id);
+  }
+
   // DOM read for agents: the page's outerHTML with the bookmarks-bar host removed AND the injected
   // body shift neutralized. We clone documentElement and, on the CLONE only, strip
   // #__steersman_bookmarks_bar and clear the transform/transformOrigin inline styles plus the
   // data-steersman-shifted attribute on <body> so the returned DOM shows the page without our
   // offset; the live bar and live body are untouched. Shadow content is already excluded from
-  // outerHTML, so the returned markup is exactly the page's own DOM and nothing of ours.
+  // outerHTML, so the returned markup is exactly the page's own DOM and nothing of ours. Phase 4:
+  // for each hideFromAgent extension we also strip its own `#__steersman_ext_css_<id>` style node
+  // and any `[data-steersman-ext="<id>"]`-tagged nodes from the clone (visible extensions leave
+  // reads untouched).
   async getDomStripped() {
+    const hidden = JSON.stringify(this._hiddenExtIds());
     return this.evaluate(
       `(function(){var c=document.documentElement.cloneNode(true);` +
         `var b=c.querySelector('#__steersman_bookmarks_bar');if(b)b.remove();` +
         `var bd=c.querySelector('body');if(bd){bd.style.transform='';bd.style.transformOrigin='';` +
         `bd.removeAttribute('data-steersman-shifted');if(!bd.getAttribute('style'))bd.removeAttribute('style');}` +
+        `try{(${hidden}).forEach(function(id){var s=c.querySelector('#__steersman_ext_css_'+id);if(s)s.remove();` +
+        `Array.prototype.forEach.call(c.querySelectorAll('[data-steersman-ext="'+id+'"]'),function(n){n.remove();});});}catch(e){}` +
         `return c.outerHTML;})()`
     );
   }
@@ -539,13 +796,28 @@ class CDPTab {
   // Text read for agents, guaranteed free of the bookmarks bar. The bar host lives on <html>
   // (outside <body>) and all its UI renders inside a shadow root, so it never contributes to
   // innerText; every text read still funnels through here so a bar-free read is the DEFAULT.
-  // We read LIVE innerText (a detached clone's innerText degrades to textContent per spec,
-  // losing fidelity) and defensively return '' if the selector targets the bar host itself.
+  // When no extension is hideFromAgent we read LIVE innerText (a detached clone's innerText degrades
+  // to textContent per spec, losing fidelity), defensively returning '' if the selector targets the
+  // bar host. When some extension IS hidden we read from a CLONE with its tagged nodes removed
+  // (best-effort; a hidden extension's CSS never affects innerText anyway) — accepting the minor
+  // clone-innerText fidelity cost only on the paths that actually need stripping.
   async getTextStripped(selector) {
+    const hidden = this._hiddenExtIds();
+    if (!hidden.length) {
+      const expr = selector
+        ? `(function(){var el=document.querySelector(${JSON.stringify(selector)});` +
+          `if(!el||el.id==='__steersman_bookmarks_bar')return '';return el.innerText||'';})()`
+        : `document.body ? document.body.innerText : ''`;
+      return this.evaluate(expr);
+    }
+    const H = JSON.stringify(hidden);
+    const strip = `(${H}).forEach(function(id){Array.prototype.forEach.call(c.querySelectorAll('[data-steersman-ext="'+id+'"]'),function(n){n.remove();});var s=c.querySelector('#__steersman_ext_css_'+id);if(s)s.remove();});`;
     const expr = selector
       ? `(function(){var el=document.querySelector(${JSON.stringify(selector)});` +
-        `if(!el||el.id==='__steersman_bookmarks_bar')return '';return el.innerText||'';})()`
-      : `document.body ? document.body.innerText : ''`;
+        `if(!el||el.id==='__steersman_bookmarks_bar')return '';var c=el.cloneNode(true);try{${strip}}catch(e){}` +
+        `return c.innerText||c.textContent||'';})()`
+      : `(function(){if(!document.body)return '';var c=document.body.cloneNode(true);try{${strip}}catch(e){}` +
+        `return c.innerText||c.textContent||'';})()`;
     return this.evaluate(expr);
   }
 

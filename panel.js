@@ -73,6 +73,10 @@ class ProjectSteersmanPanel {
     // Settings-editor mutation; both are optional so the panel still works feature-off.
     this._bookmarks = deps.bookmarksStore || null;
     this._refreshBars = deps.refreshBookmarkBars || null;
+    // Extensions store (Phase 1) + the hook that re-applies the live in-page extensions after a
+    // Settings-editor mutation; both optional so the panel still works feature-off.
+    this._extensions = deps.extensionsStore || null;
+    this._refreshExtensions = deps.refreshExtensions || null;
     // Best-effort favicon fetcher (Phase 3); optional so bookmarks still work without it.
     this._favicons = deps.faviconFetcher || null;
     // Loopback auth token the HTTP API now requires; included in the copy-prompt so manual/
@@ -156,6 +160,14 @@ class ProjectSteersmanPanel {
         // Same 'copied' postback shape the per-session copy uses; id:'fleet' sentinel tells
         // the webview it was the fleet button that flashed (no per-window instance applies).
         this._post({ type: 'copied', id: 'fleet' });
+        break;
+      }
+      case 'copyText': {
+        // Generic clipboard write for static webview-authored text (e.g. the Extensions "copy agent
+        // briefing" button). Reuses the same vscode.env.clipboard path as copyPrompt; echoes a
+        // 'copied' postback carrying the webview-supplied flash sentinel so the right button flashes.
+        await vscode.env.clipboard.writeText(String(msg.text || ''));
+        this._post({ type: 'copied', id: msg.flash || 'text' });
         break;
       }
       case 'getSettings':
@@ -265,6 +277,65 @@ class ProjectSteersmanPanel {
         }
         break;
       }
+      case 'getExtensions':
+        this._postExtensions();
+        break;
+      case 'setExtensionsEnabled':
+        // Flip the persisted master kill-switch, re-apply across every live tab, then repost the
+        // list so the webview's master toggle reflects the new state; guarded no-op (never a
+        // throw) when the extensions store is off.
+        if (this._extensions) {
+          try {
+            this._extensions.setExtensionsEnabled(!!msg.enabled);
+            if (this._refreshExtensions) await this._refreshExtensions();
+          } catch (e) {
+            this._log.appendLine('[Panel] setExtensionsEnabled failed: ' + (e && e.message ? e.message : e));
+          }
+          this._postExtensions();
+        }
+        break;
+      case 'addExtension': {
+        // Authoritative JS syntax guard (the webview's own new Function check is inert under the
+        // panel CSP). A parse error in a main-world body would break the shared bootstrap for every
+        // main extension, so we refuse to persist it and bounce the error + the operator's values
+        // back to re-open the form.
+        const addErr = this._jsSyntaxError(msg.js);
+        if (addErr) {
+          this._postExtensionError(addErr, null, {
+            name: msg.name, js: msg.js, css: msg.css, matches: msg.matches,
+            runAt: msg.runAt, world: msg.world, hideFromAgent: msg.hideFromAgent,
+          });
+          break;
+        }
+        await this._mutateExtensions(() =>
+          this._extensions.add({
+            name: msg.name,
+            js: msg.js,
+            css: msg.css,
+            matches: msg.matches,
+            runAt: msg.runAt,
+            world: msg.world,
+            hideFromAgent: msg.hideFromAgent,
+          })
+        );
+        break;
+      }
+      case 'updateExtension': {
+        const uf = msg.fields || {};
+        const updErr = this._jsSyntaxError(uf.js);
+        if (updErr) {
+          this._postExtensionError(updErr, msg.id, uf);
+          break;
+        }
+        await this._mutateExtensions(() => this._extensions.update(msg.id, uf));
+        break;
+      }
+      case 'toggleExtension':
+        await this._mutateExtensions(() => this._extensions.toggle(msg.id, !!msg.enabled));
+        break;
+      case 'removeExtension':
+        await this._mutateExtensions(() => this._extensions.remove(msg.id));
+        break;
       case 'openExternal': {
         let parsed;
         try { parsed = new URL(msg.url); }
@@ -584,7 +655,7 @@ class ProjectSteersmanPanel {
     this._post({
       type: 'bookmarks',
       tree: this._bookmarks ? this._bookmarks.getTree() : { children: [] },
-      barEnabled: this._bookmarks ? this._bookmarks.getBarEnabled() : true,
+      barEnabled: this._bookmarks ? this._bookmarks.getBarEnabled() : false,
     });
   }
 
@@ -600,10 +671,28 @@ class ProjectSteersmanPanel {
   // are logged, never thrown, so a failed edit still leaves the UI showing a consistent tree.
   async _mutateBookmarks(fn) {
     if (!this._bookmarks) return;
+    // Count bookmarks (folder-inclusive) before and after the mutation so we can auto-enable the
+    // bar the moment the user adds their FIRST bookmark. Only the exact 0→≥1 transition flips the
+    // flag — adding another while already ≥1 never re-enables a bar the user turned off (the guard
+    // is transition-based, not "any add"). Delete-to-empty needs no write here: getBarEnabled()
+    // already reads false whenever the count is 0.
+    let before = 0;
+    try { before = this._bookmarks.countBookmarks(); } catch { before = 0; }
     try {
       fn();
     } catch (e) {
       this._log.appendLine('[Panel] bookmark mutation failed: ' + (e && e.message ? e.message : e));
+    }
+    let after = before;
+    try { after = this._bookmarks.countBookmarks(); } catch { after = before; }
+    if (before === 0 && after >= 1) {
+      // First bookmark just landed — persist enabled BEFORE refreshing so the injection pass and
+      // the reposted checkbox both see the bar as on. Awaited so the stored flag is settled first.
+      try {
+        await this._bookmarks.setBarEnabled(true);
+      } catch (e) {
+        this._log.appendLine('[Panel] auto-enable bookmarks bar failed: ' + (e && e.message ? e.message : e));
+      }
     }
     try {
       if (this._refreshBars) await this._refreshBars();
@@ -611,6 +700,71 @@ class ProjectSteersmanPanel {
       this._log.appendLine('[Panel] refreshBookmarkBars failed: ' + (e && e.message ? e.message : e));
     }
     this._postBookmarks();
+  }
+
+  // Push the current extensions list + the persisted master-enable flag to the webview; an empty
+  // list and enabled:true when the store is off (feature-off is a no-op, never a throw).
+  _postExtensions() {
+    this._post({
+      type: 'extensions',
+      items: this._extensions ? this._extensions.list() : [],
+      extensionsEnabled: this._extensions ? this._extensions.getExtensionsEnabled() : true,
+    });
+  }
+
+  // Parse-check a JS body in the Node host (no CSP here, unlike the webview, so new Function
+  // actually parses). Returns a SyntaxError message when the body fails to PARSE, else null. This
+  // is a PARSE guard, NOT a sandbox: only SyntaxError blocks — any other unexpected error is logged
+  // and treated as "no error" so it can never block a legitimate save. Empty/non-string body -> null.
+  _jsSyntaxError(js) {
+    if (typeof js !== 'string' || !js.trim()) return null;
+    try {
+      new Function(js); // eslint-disable-line no-new-func
+      return null;
+    } catch (e) {
+      if (e instanceof SyntaxError) return e.message || 'invalid JavaScript';
+      this._log.appendLine('[Panel] extension JS syntax check unexpected error (allowing save): ' + (e && e.message ? e.message : e));
+      return null;
+    }
+  }
+
+  // Bounce a failed add/update back to the webview so the form re-opens with the operator's typed
+  // values + an inline error (the optimistic close-on-submit is reconciled by re-opening). `id` is
+  // null for an add, the extension id for an update. `values` carries the fields the form needs to
+  // repopulate (matches is the array the webview joins back to one-per-line).
+  _postExtensionError(message, id, values) {
+    const v = values || {};
+    this._post({
+      type: 'extensionError',
+      error: 'JS syntax error: ' + message,
+      id: id || null,
+      name: v.name,
+      js: v.js,
+      css: v.css,
+      matches: v.matches,
+      runAt: v.runAt,
+      world: v.world,
+      hideFromAgent: v.hideFromAgent,
+    });
+  }
+
+  // Run an extension mutation against this._extensions (guarded no-op when the store is off), then
+  // re-apply the live in-page extensions and push the fresh list back to the webview. Mirrors
+  // _mutateBookmarks: errors are logged, never thrown, so a failed edit still leaves the UI showing
+  // a consistent list.
+  async _mutateExtensions(fn) {
+    if (!this._extensions) return;
+    try {
+      fn();
+    } catch (e) {
+      this._log.appendLine('[Panel] extension mutation failed: ' + (e && e.message ? e.message : e));
+    }
+    try {
+      if (this._refreshExtensions) await this._refreshExtensions();
+    } catch (e) {
+      this._log.appendLine('[Panel] refreshExtensions failed: ' + (e && e.message ? e.message : e));
+    }
+    this._postExtensions();
   }
 
   // Fire-and-forget favicon fetch for a bookmark that was just added/re-pointed: never awaited

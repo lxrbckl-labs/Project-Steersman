@@ -398,7 +398,7 @@ function makeTools(readEnabled) {
     {
       name: 'list_scripts',
       cap: 'run_script',
-      description: 'List the named scripts available to run_script.',
+      description: 'List the named automations available to run_script.',
       inputSchema: { type: 'object', properties: {}, additionalProperties: false },
       call: () => ({ method: 'GET', path: '/scripts' }),
     },
@@ -406,14 +406,14 @@ function makeTools(readEnabled) {
       name: 'run_script',
       cap: 'run_script',
       description:
-        'Run a named script against a window and return its result. If the script itself ' +
+        'Run a named automation against a window and return its result. If the automation itself ' +
         'throws, this still succeeds at the tool level and returns {ok:false, status:"error", ' +
-        'error}; only a missing script/instance or a disconnected window is reported as a tool error.',
+        'error}; only a missing automation/instance or a disconnected window is reported as a tool error.',
       inputSchema: {
         type: 'object',
         properties: {
           ...INSTANCE_PROP,
-          name: { type: 'string', description: 'Name of the script to run.' },
+          name: { type: 'string', description: 'Name of the automation to run.' },
         },
         required: ['instance', 'name'],
         additionalProperties: false,
@@ -560,7 +560,7 @@ async function main() {
 
   // The composed capability prompt is delivered to the client's model via `instructions`.
   const server = new Server(
-    { name: 'project-steersman', version: '0.2.1' },
+    { name: 'project-steersman', version: '0.3.0' },
     { capabilities: { tools: {}, resources: {} }, instructions }
   );
 

@@ -14,7 +14,7 @@
 
   // ── State ───────────────────────────────────────────────────
   /** @type {{sessions: Array<{id:string,state:string,url:string,activity:(Object|null)}>, port: (number|string|null), view: ('sessions'|'settings'), settings: (Object|null), scripts: Array<{name:string}>, bookmarks: (Object|null), bookmarksBarEnabled: boolean, version: string}} */
-  let model = { sessions: [], port: null, view: 'sessions', settings: null, scripts: [], bookmarks: null, bookmarksBarEnabled: true, version: '', coverUri: '' };
+  let model = { sessions: [], port: null, view: 'sessions', settings: null, scripts: [], bookmarks: null, bookmarksBarEnabled: false, extensions: [], extensionsEnabled: true, version: '', coverUri: '' };
 
   // ── Update-check UI state — module-scoped (like expandedFolders/addForm)
   // so it survives the full-rebuild render() instead of resetting each time
@@ -28,10 +28,23 @@
   const expandedFolders = new Set();
   let addForm = null;     // { parentId: 'root'|<folderId>, kind: 'bookmark'|'folder' }
   let renameId = null;    // id of the node currently being renamed inline
+  let extForm = null;     // Extensions add/edit form: null=closed, else { id: null(add)|<extId>(edit), name, js }
   let draggingId = null;  // id of the node being dragged (null when idle)
   let draggingIsFolder = false; // whether the in-flight drag is a folder (folders may only land at root)
   let invalidIds = null;  // Set of ids the dragged node may NOT drop into (itself + descendants)
   let hoverEl = null;     // current highlighted drop target (dropline or folder row)
+
+  // Per-section collapse state for the Settings view, persisted in the webview's vscode.setState
+  // (the same store as scroll) so it survives reloads. Shape { sectionKey: true }; absent/false =
+  // expanded (the default). Toggled by clicking a section header (see toggleSection).
+  let collapsedSections = (function () {
+    try {
+      const st = vscode.getState();
+      return (st && st.collapsed && typeof st.collapsed === 'object') ? st.collapsed : {};
+    } catch (e) {
+      return {};
+    }
+  })();
 
   // Debounce timers for textarea edits, keyed by action (+ capability id). ──
   const debounceTimers = {};
@@ -41,6 +54,104 @@
       delete debounceTimers[key];
       fn();
     }, delay || 300);
+  }
+
+  // ── Capability-instruction auto-grow ────────────────────────
+  // These textareas size to their content instead of scrolling internally for
+  // short/medium text, capped at 250px (matching .capability-instruction's
+  // max-height in panel.css) past which they scroll. scrollHeight is only
+  // meaningful once the element is laid out, so this is called both on input
+  // (as the user types) and after each render() (so a long saved instruction
+  // shows at full height immediately). Keep the clamp in sync with the CSS cap.
+  const INSTRUCTION_MAX_HEIGHT = 250;
+  function autoSizeInstruction(el) {
+    if (!el) { return; }
+    el.style.height = 'auto';
+    const full = el.scrollHeight; // raw content height, measured while unclamped
+    el.style.height = Math.min(full, INSTRUCTION_MAX_HEIGHT) + 'px';
+    // Only show the internal scrollbar when content actually exceeds the cap —
+    // a fitting box stays overflow:hidden so it never grabs the scroll wheel
+    // as the user scrolls the Settings page past it.
+    el.style.overflowY = full > INSTRUCTION_MAX_HEIGHT ? 'auto' : 'hidden';
+  }
+
+  // Compact webview port of match-pattern.js — parse a single pattern (returns a descriptor or null)
+  // and test a URL against an array of patterns. Used to (a) reject malformed patterns inline in the
+  // Extensions add/edit form and (b) compute the "applies to current page" row indicator. Keep in
+  // sync with match-pattern.js / the in-page bootstrap port in cdp-tab.js.
+  function webParsePattern(p) {
+    if (typeof p !== 'string') { return null; }
+    p = p.trim();
+    if (!p) { return null; }
+    if (p === '<all_urls>') { return { allUrls: true }; }
+    const s = p.indexOf('://');
+    if (s === -1) { return null; }
+    const sc = p.slice(0, s);
+    if (!/^(\*|https?|file|ftp)$/.test(sc)) { return null; }
+    const rest = p.slice(s + 3);
+    const sl = rest.indexOf('/');
+    if (sl === -1) { return null; }
+    const host = rest.slice(0, sl);
+    const path = rest.slice(sl);
+    if (path[0] !== '/') { return null; }
+    if (sc === 'file') {
+      if (host !== '') { return null; }
+    } else {
+      if (host === '') { return null; }
+      if (host !== '*') {
+        if (host.indexOf('*.') === 0) {
+          const bare = host.slice(2);
+          if (!bare || bare.indexOf('*') !== -1) { return null; }
+        } else if (host.indexOf('*') !== -1) {
+          return null;
+        }
+      }
+    }
+    return { allUrls: false, scheme: sc, host: host, path: path };
+  }
+
+  function isValidMatchPattern(p) {
+    return webParsePattern(p) !== null;
+  }
+
+  function webGlob(g) {
+    let r = '^';
+    for (let i = 0; i < g.length; i++) {
+      const c = g[i];
+      r += c === '*' ? '.*' : c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+    return new RegExp(r + '$');
+  }
+
+  function webMatchSingle(pr, u) {
+    if (!pr) { return false; }
+    const sc = u.protocol.replace(/:$/, '');
+    if (pr.allUrls) { return ['http', 'https', 'file', 'ftp'].indexOf(sc) !== -1; }
+    if (pr.scheme === '*') { if (sc !== 'http' && sc !== 'https') { return false; } }
+    else if (pr.scheme !== sc) { return false; }
+    if (sc !== 'file') {
+      const uh = u.hostname;
+      if (pr.host !== '*') {
+        if (pr.host.indexOf('*.') === 0) {
+          const b = pr.host.slice(2);
+          if (!(uh === b || uh.slice(-(b.length + 1)) === '.' + b)) { return false; }
+        } else if (uh !== pr.host) {
+          return false;
+        }
+      }
+    }
+    return webGlob(pr.path).test(u.pathname + u.search);
+  }
+
+  function webMatchesUrl(patterns, url) {
+    if (!Array.isArray(patterns) || !patterns.length) { return false; }
+    let u;
+    try { u = new URL(url); } catch (e) { return false; }
+    for (let i = 0; i < patterns.length; i++) {
+      const pr = webParsePattern(patterns[i]);
+      if (pr && webMatchSingle(pr, u)) { return true; }
+    }
+    return false;
   }
 
   // ── DOM helper ──────────────────────────────────────────────
@@ -97,6 +208,17 @@
     ]);
     // Shrink ~20% (16 -> 13) vs. the other icons; keep the 0 0 16 16 viewBox
     // so the glyph scales down cleanly instead of clipping.
+    svg.setAttribute('width', '13');
+    svg.setAttribute('height', '13');
+    return svg;
+  }
+
+  function checkIcon() {
+    // Checkmark glyph — briefly swapped in for the copy glyph as the "Copied" affordance
+    // (Mandrake-style icon swap, no text). Sized to match copyIcon() (13) for a clean swap.
+    const svg = svgIcon([
+      'M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z'
+    ]);
     svg.setAttribute('width', '13');
     svg.setAttribute('height', '13');
     return svg;
@@ -166,6 +288,37 @@
       svg.appendChild(p);
     });
     return svg;
+  }
+
+  function githubIcon() {
+    // GitHub "Octocat" mark — a single filled glyph on the same 0 0 16 16
+    // viewBox svgIcon() uses, sized to sit beside the package glyph in the
+    // Settings top bar. Opens the project repo (see githubButton / GITHUB_URL).
+    const svg = svgIcon([
+      'M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z'
+    ]);
+    svg.setAttribute('width', '14');
+    svg.setAttribute('height', '14');
+    return svg;
+  }
+
+  // Project repo — opened via the host's existing openExternal handler
+  // (panel.js: vscode.env.openExternal), the same postMessage route the
+  // "update available → releases page" badge uses.
+  const GITHUB_URL = 'https://github.com/lxRbckl/Project-Steersman';
+
+  function githubButton() {
+    return h(
+      'button',
+      {
+        className: 'icon-button settings-github-btn',
+        type: 'button',
+        dataAction: 'openGithub',
+        title: 'Open on GitHub',
+        ariaLabel: 'Open on GitHub'
+      },
+      githubIcon()
+    );
   }
 
   function chevronIcon() {
@@ -287,9 +440,9 @@
       className: 'script-picker',
       dataAction: 'runScript',
       dataId: s.id,
-      ariaLabel: 'Run script'
+      ariaLabel: 'Run automation'
     });
-    const placeholder = h('option', {}, scripts.length ? 'Run script…' : 'No scripts');
+    const placeholder = h('option', {}, scripts.length ? 'Run automation…' : 'No automations');
     placeholder.value = '';
     placeholder.disabled = true;
     select.appendChild(placeholder);
@@ -303,7 +456,7 @@
     if (!scripts.length) { select.disabled = true; }
     if (manual) {
       select.disabled = true;
-      select.title = 'Manual mode — scripts disabled for this window';
+      select.title = 'Manual mode — automations disabled for this window';
     }
     return select;
   }
@@ -613,6 +766,36 @@
     );
   }
 
+  // ── Collapsible section headers ─────────────────────────────
+  function isSectionCollapsed(key) { return !!collapsedSections[key]; }
+
+  function settingsChevron(key) {
+    return h('span', { className: 'settings-chevron' + (isSectionCollapsed(key) ? '' : ' open') }, chevronIcon());
+  }
+
+  // Clickable header for a PLAIN section (a bare .settings-section-title): caret + label; clicking
+  // toggles collapse. The label span inherits the .settings-section-title font from the wrapper.
+  function sectionTitleHeader(key, text) {
+    return h(
+      'div',
+      { className: 'settings-section-title settings-section-toggle', dataAction: 'toggleSection', 'data-section-key': key },
+      settingsChevron(key),
+      h('span', {}, text)
+    );
+  }
+
+  // Clickable header for a COMPOUND section (.bm-section-header with right-side actions): caret +
+  // label grouped left (that group toggles collapse), the action buttons on the right keep their
+  // own data-action so clicking them doesn't toggle the section.
+  function bmSectionHeader(key, text, actionsEl) {
+    return h(
+      'div',
+      { className: 'bm-section-header settings-section-toggle', dataAction: 'toggleSection', 'data-section-key': key },
+      h('div', { className: 'settings-section-titlegroup' }, settingsChevron(key), h('span', { className: 'settings-section-title' }, text)),
+      actionsEl
+    );
+  }
+
   // ── Scripts section — flat list of the central script-dir entries already
   // pushed in model.scripts (shared, read-only here, with the per-session
   // script pickers); the only affordance is delete.
@@ -623,16 +806,17 @@
       { className: 'script-row' },
       h('span', { className: 'script-name', title: sc.name }, sc.name),
       h('span', { className: 'script-lang script-lang-' + lang }, lang.toUpperCase()),
-      actionButton(sc.name, 'deleteScript', 'Delete script', closeIcon(), 'danger bm-rowbtn')
+      actionButton(sc.name, 'deleteScript', 'Delete automation', closeIcon(), 'danger bm-rowbtn')
     );
   }
 
   function scriptsSection() {
     const section = h('div', { className: 'scripts-section' });
-    section.appendChild(h('div', { className: 'settings-section-title' }, 'Scripts'));
+    section.appendChild(sectionTitleHeader('automations', 'Automations'));
+    if (isSectionCollapsed('automations')) { return section; }
     const scripts = model.scripts || [];
     if (!scripts.length) {
-      section.appendChild(h('div', { className: 'settings-loading' }, 'No scripts'));
+      section.appendChild(h('div', { className: 'settings-loading' }, 'No automations'));
       return section;
     }
     const list = h('div', { className: 'scripts-list' });
@@ -643,14 +827,314 @@
     return section;
   }
 
+  // Agent-oriented briefing copied by the "Copy agent briefing" button beside ＋Add. Paste into a
+  // dev agent to have it author an extension. Kept as a line array (joined with \n) so markdown code
+  // fences (```) don't collide with a JS template literal's backticks. MUST stay accurate to what
+  // the feature actually does — update this if the injector/record shape changes.
+  const EXTENSIONS_BRIEFING = [
+    '# Project Steersman — Extensions: authoring guide',
+    '',
+    'You are helping author an **Extension** for Project Steersman (a VS Code extension that drives',
+    "VS Code's integrated browser). Use this guide to produce a correct extension record.",
+    '',
+    '## What an Extension is',
+    'An operator-authored, **persistent, URL-matched** page modifier: JavaScript and/or CSS that',
+    'auto-injects into **every matching page load, across all tabs**, until disabled. (Contrast: an',
+    '*Automation* is an on-demand, one-shot script run against a single tab.)',
+    '',
+    '## Record fields',
+    '- `name` — display label (optional).',
+    '- `matches` — array of URL match patterns. **Required to run** (empty array ⇒ never runs).',
+    '- `js` — JavaScript body run on matching pages (optional; **must be valid JS** — see below).',
+    '- `css` — CSS applied on matching pages (optional).',
+    '- `runAt` — `document_start` or `document_idle` (default).',
+    '- `world` — `main` (default) or `isolated`.',
+    '- `hideFromAgent` — boolean, default `false`.',
+    '- `enabled` — boolean. Must be true (and the global master toggle on) for the extension to run.',
+    '',
+    'Minimum to do anything: **at least one match pattern** plus a `js` or `css` body.',
+    '',
+    '## Match patterns (Chrome-style)',
+    'Format `<scheme>://<host><path>`, or the special `<all_urls>`.',
+    '- **scheme**: `*` (means http OR https), or explicit `http` / `https` / `file` / `ftp`.',
+    '- **host**: `*` (any host), `*.domain.com` (the domain AND all subdomains), or an exact host.',
+    '  (`file://` has no host.)',
+    '- **path**: must start with `/`; `*` matches any run of characters.',
+    '',
+    'Examples:',
+    '- `*://*.github.com/*` — github.com and all subdomains, http or https.',
+    '- `https://example.com/*` — any page on example.com, https only.',
+    '- `https://example.com/docs/*` — only the /docs section.',
+    '- `<all_urls>` — every http/https/file/ftp page.',
+    '',
+    'Empty `matches` ⇒ the extension never runs (fail-safe).',
+    '',
+    '## Gating (when it runs)',
+    'Both JS and CSS run **only** when ALL hold: the global Extensions master toggle is ON, the',
+    "extension's `enabled` is true, AND one of its match patterns matches the page URL.",
+    '',
+    '## JS execution',
+    '- **world: main** (default) — runs in the page\'s own JS world: can read/call page globals and',
+    "  bypasses the page's Content-Security-Policy. Also visible to the page.",
+    '- **world: isolated** — runs in a separate JS world: CANNOT see or collide with the page\'s JS',
+    '  globals (shares only the DOM). Use when you don\'t need page globals.',
+    '- **runAt**: `document_start` runs at document creation (before the page\'s own scripts);',
+    '  `document_idle` (default) defers to DOMContentLoaded (or runs immediately if already loaded).',
+    '- Each body runs in its own try/catch, so one extension\'s runtime error can\'t break others.',
+    '- **JS must be syntactically valid** — a save with an unparseable body is REJECTED with an inline',
+    '  error (a syntax error would otherwise break injection for all main-world extensions).',
+    '- Your body receives a `steersman` argument: `{ id, mark(node) }` (see hideFromAgent).',
+    '',
+    '## CSS',
+    'Injected as a stable `<style>` node. It **applies and reverts live** on toggle/edit/delete — no',
+    'reload needed. It works on strict-CSP sites too (CSP bypass is enabled automatically whenever a',
+    'CSS-bearing extension is active).',
+    '',
+    '## hideFromAgent + steersman.mark(node)',
+    'Extensions are **visible to agent page-reads by default** (the agent sees the modified page —',
+    'usually the point). If you inject operator-only UI you don\'t want the agent to see, set',
+    '`hideFromAgent: true` and call `steersman.mark(el)` on each node your JS creates. Marked nodes',
+    '(tagged `data-steersman-ext`) plus the extension\'s own CSS `<style>` node are stripped from',
+    'agent DOM/text reads. **Best-effort**: only injected/marked nodes and the CSS node are hidden —',
+    'it CANNOT hide arbitrary changes your JS made to pre-existing page DOM.',
+    '',
+    '## Known limitations',
+    '- Disabling/deleting a **JS** extension stops future runs but CANNOT undo DOM mutations it',
+    '  already made (CSS fully reverts live).',
+    '- **isolated-world JS** takes effect on the NEXT navigation, not instantly on toggle (its CSS',
+    '  still applies live).',
+    '- **SPA route changes** (same-document history navigation) do NOT re-fire document-start',
+    '  injection — it fires on real document loads. Handle in-page SPA nav yourself if needed.',
+    '',
+    '## Worked example',
+    'Name: "Night-dim GitHub diffs"  ·  matches: `*://*.github.com/*`  ·  runAt: document_idle  ·  world: main',
+    '',
+    'CSS:',
+    '```css',
+    '.diff-table { filter: brightness(0.9); }',
+    '```',
+    '',
+    'JS:',
+    '```js',
+    '// runs on every matching github.com page',
+    'var banner = document.createElement("div");',
+    'banner.textContent = "Steersman extension active";',
+    'banner.style.cssText = "position:fixed;bottom:8px;right:8px;z-index:99999;' +
+      'background:#222;color:#eee;padding:4px 8px;border-radius:4px;font:12px sans-serif";',
+    'steersman.mark(banner);   // lets it be hidden from agent reads when hideFromAgent is on',
+    'document.body.appendChild(banner);',
+    '```',
+    ''
+  ].join('\n');
+
+  // ── Extensions section — operator-only CRUD over the userscript-style page modifiers. Surface:
+  // a master on/off toggle, an ＋Add button, a list of rows (enabled checkbox + name + JS/CSS badge
+  // + match summary + an "applies to current page" dot + edit/delete), and an inline add/edit form
+  // (name, match patterns, JS, CSS, and a compact run-at / world / hide-from-agent control row).
+
+  // URLs of every currently-connected tab — the pool the "applies here" indicator tests against.
+  // There is no single "active/focused tab" in the webview model, so an extension reads as applying
+  // "here" when it matches ANY connected tab's URL (see extAppliesHere). Limitation noted in report.
+  function connectedUrls() {
+    return (model.sessions || [])
+      .filter(function (s) { return s && s.state === 'connected' && s.url; })
+      .map(function (s) { return s.url; });
+  }
+
+  // Would this extension currently apply to an open tab? Same both-gates-AND-url-match test the
+  // injector uses: master on, this extension enabled, and its patterns match a connected tab's URL.
+  function extAppliesHere(ext, urls) {
+    if (!model.extensionsEnabled || !ext.enabled) { return false; }
+    for (let i = 0; i < urls.length; i++) {
+      if (webMatchesUrl(ext.matches, urls[i])) { return true; }
+    }
+    return false;
+  }
+
+  function extMasterToggle() {
+    const toggle = h('input', {
+      type: 'checkbox',
+      className: 'capability-toggle',
+      dataAction: 'toggleExtensionsEnabled',
+      ariaLabel: 'Enable extensions'
+    });
+    toggle.checked = !!model.extensionsEnabled;
+    return h(
+      'label',
+      { className: 'bm-bar-toggle-row' },
+      toggle,
+      h('span', { className: 'capability-label' }, 'Enable extensions'),
+      !model.extensionsEnabled ? h('span', { className: 'bm-bar-hint' }, '(all disabled)') : null
+    );
+  }
+
+  // One-line match summary for a row: the sole pattern, a count, or a "no patterns" hint.
+  function extMatchSummary(ext) {
+    const m = Array.isArray(ext.matches) ? ext.matches : [];
+    if (!m.length) { return 'no patterns'; }
+    if (m.length === 1) { return m[0]; }
+    return m.length + ' patterns';
+  }
+
+  function extensionRow(ext, urls) {
+    const toggle = h('input', {
+      type: 'checkbox',
+      className: 'capability-toggle',
+      dataAction: 'toggleExtension',
+      dataId: ext.id,
+      ariaLabel: 'Enable ' + (ext.name || 'extension')
+    });
+    toggle.checked = !!ext.enabled;
+    // "Applies to current page" dot — filled when this extension currently affects an open tab.
+    const applies = extAppliesHere(ext, urls);
+    const dot = h('span', {
+      className: 'ext-here' + (applies ? ' active' : ''),
+      title: applies ? 'Active on an open tab' : 'Not matching any open tab'
+    });
+    const name = h('span', { className: 'ext-name', title: ext.name || '' }, ext.name || 'Untitled extension');
+    // Tiny JS/CSS indicator of which payload(s) the extension carries; a lock glyph when hidden.
+    const kinds = [];
+    if (typeof ext.js === 'string' && ext.js.trim()) { kinds.push('JS'); }
+    if (typeof ext.css === 'string' && ext.css.trim()) { kinds.push('CSS'); }
+    const kindEl = kinds.length ? h('span', { className: 'ext-kind' }, kinds.join('+')) : null;
+    const hiddenEl = ext.hideFromAgent
+      ? h('span', { className: 'ext-hidden-badge', title: 'Hidden from agent reads' }, 'hidden')
+      : null;
+    const summary = h(
+      'span',
+      { className: 'ext-summary', title: (Array.isArray(ext.matches) ? ext.matches : []).join('\n') },
+      extMatchSummary(ext)
+    );
+    const actions = h(
+      'div', { className: 'bm-actions' },
+      actionButton(ext.id, 'editExtension', 'Edit extension', editIcon(), 'bm-rowbtn'),
+      actionButton(ext.id, 'deleteExtension', 'Delete extension', closeIcon(), 'danger bm-rowbtn')
+    );
+    return h('div', { className: 'ext-row', dataId: ext.id }, dot, toggle, name, kindEl, hiddenEl, summary, actions);
+  }
+
+  function extFormRow() {
+    const box = h('div', { className: 'ext-form' });
+    const nameInp = textInput('name', 'Extension name', extForm.name, 'ext-name-input');
+
+    const matchesArea = h('textarea', {
+      className: 'capability-instruction ext-matches',
+      'data-field': 'matches',
+      rows: '2',
+      ariaLabel: 'URL match patterns, one per line',
+      placeholder: 'URL match patterns — one per line, e.g.\nhttps://example.com/*\n*://*.foo.com/*\n<all_urls>'
+    });
+    matchesArea.value = extForm.matches || '';
+
+    const jsArea = h('textarea', {
+      className: 'capability-instruction ext-js',
+      'data-field': 'js',
+      rows: '3',
+      ariaLabel: 'Extension JavaScript',
+      placeholder: '// JavaScript to run on matching pages'
+    });
+    jsArea.value = extForm.js || '';
+
+    const cssArea = h('textarea', {
+      className: 'capability-instruction ext-css',
+      'data-field': 'css',
+      rows: '3',
+      ariaLabel: 'Extension CSS',
+      placeholder: '/* CSS to apply on matching pages */'
+    });
+    cssArea.value = extForm.css || '';
+
+    const runAtSel = h('select', { className: 'ext-runat', 'data-field': 'runAt', ariaLabel: 'Run at' });
+    [['document_idle', 'Run at: idle (default)'], ['document_start', 'Run at: document start']].forEach(function (o) {
+      const opt = h('option', {}, o[1]);
+      opt.value = o[0];
+      if ((extForm.runAt || 'document_idle') === o[0]) { opt.selected = true; }
+      runAtSel.appendChild(opt);
+    });
+
+    const worldSel = h('select', { className: 'ext-runat ext-world', 'data-field': 'world', ariaLabel: 'Execution world' });
+    [['main', 'World: main'], ['isolated', 'World: isolated']].forEach(function (o) {
+      const opt = h('option', {}, o[1]);
+      opt.value = o[0];
+      if ((extForm.world || 'main') === o[0]) { opt.selected = true; }
+      worldSel.appendChild(opt);
+    });
+
+    const hideToggle = h('input', {
+      type: 'checkbox', className: 'capability-toggle', 'data-field': 'hideFromAgent', ariaLabel: 'Hide from agent reads'
+    });
+    hideToggle.checked = !!extForm.hideFromAgent;
+    const hideLabel = h('label', { className: 'ext-hide-row', title: 'Strip this extension\'s injected/tagged nodes from agent page reads' },
+      hideToggle, h('span', { className: 'capability-label' }, 'Hide from agent reads'));
+
+    // Compact control row: run-at + world selects, then the hide-from-agent toggle.
+    const controls = h('div', { className: 'ext-form-controls' }, runAtSel, worldSel, hideLabel);
+
+    const btns = h(
+      'div', { className: 'ext-form-actions' },
+      extForm.error ? h('span', { className: 'ext-form-error' }, extForm.error) : null,
+      h('button', {
+        className: 'icon-button bm-confirm', type: 'button',
+        dataAction: 'submitExtension', title: 'Save', ariaLabel: 'Save'
+      }, '✓'),
+      h('button', {
+        className: 'icon-button bm-cancel', type: 'button',
+        dataAction: 'cancelExtension', title: 'Cancel', ariaLabel: 'Cancel'
+      }, '✕')
+    );
+
+    box.appendChild(h('div', { className: 'ext-form-name' }, nameInp));
+    box.appendChild(h('div', { className: 'ext-form-label' }, 'Match patterns'));
+    box.appendChild(matchesArea);
+    box.appendChild(h('div', { className: 'ext-form-label' }, 'JavaScript'));
+    box.appendChild(jsArea);
+    box.appendChild(h('div', { className: 'ext-form-label' }, 'CSS'));
+    box.appendChild(cssArea);
+    box.appendChild(controls);
+    box.appendChild(btns);
+    return box;
+  }
+
+  function extensionsSection() {
+    const section = h('div', { className: 'ext-section' });
+    const actions = h('div', { className: 'bm-root-actions' },
+      h('button', {
+        className: 'icon-button bm-rowbtn',
+        type: 'button',
+        dataAction: 'copyBriefing',
+        title: 'Copy agent briefing',
+        ariaLabel: 'Copy agent briefing (how to author an extension)'
+      }, copyIcon()),
+      h('button', {
+        className: 'icon-button bm-rowbtn',
+        type: 'button',
+        dataAction: 'addExtension',
+        title: 'Add extension',
+        ariaLabel: 'Add extension'
+      }, h('span', { className: 'bm-add-plus' }, '＋'))
+    );
+    section.appendChild(bmSectionHeader('extensions', 'Extensions', actions));
+    if (isSectionCollapsed('extensions')) { return section; }
+    section.appendChild(extMasterToggle());
+
+    const items = model.extensions || [];
+    if (items.length) {
+      const urls = connectedUrls();
+      const list = h('div', { className: 'ext-list' });
+      items.forEach(function (ext) { list.appendChild(extensionRow(ext, urls)); });
+      section.appendChild(list);
+    } else if (!extForm) {
+      section.appendChild(h('div', { className: 'settings-loading' }, 'No extensions'));
+    }
+    if (extForm) { section.appendChild(extFormRow()); }
+    return section;
+  }
+
   function bookmarksSection() {
     const section = h('div', { className: 'bm-section' });
-    const header = h(
-      'div', { className: 'bm-section-header' },
-      h('span', { className: 'settings-section-title' }, 'Bookmarks'),
-      h('div', { className: 'bm-root-actions' }, addBtn('root', 'bookmark'), addBtn('root', 'folder'))
-    );
-    section.appendChild(header);
+    const actions = h('div', { className: 'bm-root-actions' }, addBtn('root', 'bookmark'), addBtn('root', 'folder'));
+    section.appendChild(bmSectionHeader('bookmarks', 'Bookmarks', actions));
+    if (isSectionCollapsed('bookmarks')) { return section; }
     section.appendChild(barToggle());
 
     const tree = model.bookmarks;
@@ -709,17 +1193,30 @@
       h('span', { className: 'update-badge-label' }, label)
     );
     if (disabled) { btn.disabled = true; }
-    return h('div', { className: 'settings-header-row' }, btn);
+    // Returns just the button now — it lives inside the Settings top bar
+    // (see settingsView) rather than its own right-aligned header row.
+    return btn;
   }
 
   function settingsView() {
     const wrap = h('div', { className: 'settings-body' });
+
+    // Top bar above the cover photo: bold title on the left, then the package
+    // (update-check) button and the GitHub button pinned to the far right, in
+    // that order. The title's margin-right:auto pushes the two buttons right.
+    const topbar = h(
+      'div', { className: 'settings-topbar' },
+      h('span', { className: 'settings-title' }, 'PROJECT STEERSMAN'),
+      updateBadge(),
+      githubButton()
+    );
+    wrap.appendChild(topbar);
+
     if (model.coverUri) {
       const hero = h('div', { className: 'settings-hero' });
       hero.style.backgroundImage = 'url("' + model.coverUri + '")';
       wrap.appendChild(hero);
     }
-    wrap.appendChild(updateBadge());
     const s = model.settings;
 
     if (!s) {
@@ -727,33 +1224,39 @@
       return wrap;
     }
 
-    wrap.appendChild(h('div', { className: 'settings-section-title' }, 'Instruction'));
-    const instructionArea = h('textarea', {
-      className: 'settings-textarea',
-      dataAction: 'setInstruction',
-      rows: '7',
-      ariaLabel: 'Instruction',
-      placeholder: 'Instruction for Claude…',
-      readonly: 'readonly'
-    });
-    instructionArea.value = s.instruction || '';
-    wrap.appendChild(instructionArea);
+    wrap.appendChild(sectionTitleHeader('instruction', 'Instruction'));
+    if (!isSectionCollapsed('instruction')) {
+      const instructionArea = h('textarea', {
+        className: 'settings-textarea',
+        dataAction: 'setInstruction',
+        rows: '7',
+        ariaLabel: 'Instruction',
+        placeholder: 'Instruction for Claude…',
+        readonly: 'readonly'
+      });
+      instructionArea.value = s.instruction || '';
+      wrap.appendChild(instructionArea);
+    }
 
-    wrap.appendChild(h('div', { className: 'settings-section-title' }, 'Capabilities'));
-    const capList = h('div', { className: 'capability-list' });
-    (s.capabilities || []).forEach(function (cap) {
-      capList.appendChild(capabilityRow(cap));
-    });
-    wrap.appendChild(capList);
+    wrap.appendChild(sectionTitleHeader('capabilities', 'Capabilities'));
+    if (!isSectionCollapsed('capabilities')) {
+      const capList = h('div', { className: 'capability-list' });
+      (s.capabilities || []).forEach(function (cap) {
+        capList.appendChild(capabilityRow(cap));
+      });
+      wrap.appendChild(capList);
+    }
 
     wrap.appendChild(scriptsSection());
 
+    wrap.appendChild(extensionsSection());
+
     wrap.appendChild(bookmarksSection());
 
-    wrap.appendChild(
-      h('div', { className: 'settings-section-title' }, 'Composed instruction (preview)')
-    );
-    wrap.appendChild(h('pre', { className: 'settings-preview' }, s.composedPreview || ''));
+    wrap.appendChild(sectionTitleHeader('preview', 'Composed instruction (preview)'));
+    if (!isSectionCollapsed('preview')) {
+      wrap.appendChild(h('pre', { className: 'settings-preview' }, s.composedPreview || ''));
+    }
 
     return wrap;
   }
@@ -789,10 +1292,17 @@
     if (model.view === 'settings') {
       const body = settingsView();
       app.appendChild(body);
+      // Auto-grow the capability instruction boxes to fit their (possibly long,
+      // host-pushed) content now that they're laid out in the DOM — done before
+      // the scroll restore below since it changes the body's total height.
+      body.querySelectorAll('.capability-instruction').forEach(autoSizeInstruction);
       // Restore the captured scroll position (synchronously, then once more on
       // the next frame in case layout wasn't settled) so re-renders don't jump.
       body.scrollTop = prevSettingsScroll;
-      requestAnimationFrame(function () { body.scrollTop = prevSettingsScroll; });
+      requestAnimationFrame(function () {
+        body.querySelectorAll('.capability-instruction').forEach(autoSizeInstruction);
+        body.scrollTop = prevSettingsScroll;
+      });
       return;
     }
 
@@ -852,32 +1362,47 @@
     vscode.setState(st);
   }
 
-  // ── Copied! flash on a row's copy button ────────────────────
-  function flashCopied(id) {
-    const btn = app.querySelector(
-      '.session-actions button[data-action="copyPrompt"][data-id="' + cssEscape(id) + '"]'
-    );
-    if (!btn) { return; }
-    const actions = btn.parentNode;
-    if (actions.querySelector('.copied-flash')) { return; }
-    const flash = h('span', { className: 'copied-flash' }, 'Copied!');
-    actions.insertBefore(flash, actions.firstChild);
+  // Persist the collapse map alongside scroll in the webview's vscode state (survives reload).
+  function saveCollapsed() {
+    const st = vscode.getState() || {};
+    st.collapsed = collapsedSections;
+    vscode.setState(st);
+  }
+
+  // ── Copied feedback — Mandrake-style: briefly swap the button's copy glyph to a green
+  // checkmark, then revert (no text). Shared by all copy buttons (per-row, fleet, briefing).
+  // Only touches the icon + title; the clipboard write + host postback are unchanged. A
+  // re-render during the swap just rebuilds the button at its resting copy glyph (harmless).
+  function flashCopyCheck(btn) {
+    if (!btn || btn.getAttribute('data-copied') === '1') { return; }
+    btn.setAttribute('data-copied', '1');
+    const prevTitle = btn.getAttribute('title') || '';
+    btn.textContent = '';
+    btn.appendChild(checkIcon());
+    btn.classList.add('copied-check');
+    btn.setAttribute('title', 'Copied');
     setTimeout(function () {
-      if (flash.parentNode) { flash.parentNode.removeChild(flash); }
+      if (!btn.parentNode) { return; } // button was re-rendered away
+      btn.textContent = '';
+      btn.appendChild(copyIcon());
+      btn.classList.remove('copied-check');
+      btn.setAttribute('title', prevTitle);
+      btn.removeAttribute('data-copied');
     }, 1200);
   }
 
-  // ── Copied! flash on the fleet copy button (rail-level, no session id) ──
+  function flashCopied(id) {
+    flashCopyCheck(app.querySelector(
+      '.session-actions button[data-action="copyPrompt"][data-id="' + cssEscape(id) + '"]'
+    ));
+  }
+
   function flashFleetCopied() {
-    const btn = app.querySelector('.body-toolbar button[data-action="copyFleetPrompt"]');
-    if (!btn) { return; }
-    const toolbar = btn.parentNode;
-    if (toolbar.querySelector('.copied-flash')) { return; }
-    const flash = h('span', { className: 'copied-flash' }, 'Copied!');
-    toolbar.insertBefore(flash, btn);
-    setTimeout(function () {
-      if (flash.parentNode) { flash.parentNode.removeChild(flash); }
-    }, 1200);
+    flashCopyCheck(app.querySelector('.body-toolbar button[data-action="copyFleetPrompt"]'));
+  }
+
+  function flashBriefing() {
+    flashCopyCheck(app.querySelector('.ext-section button[data-action="copyBriefing"]'));
   }
 
   function cssEscape(value) {
@@ -915,6 +1440,7 @@
       render();
       post({ type: 'getSettings' });
       post({ type: 'getBookmarks' });
+      post({ type: 'getExtensions' });
     } else if (action === 'toggleCapability' && id) {
       post({ type: 'setCapabilityEnabled', id: id, enabled: target.checked });
     } else if (action === 'toggleBookmarksBarEnabled') {
@@ -956,6 +1482,49 @@
       render();
     } else if (action === 'openReleases') {
       if (updateState.releasesUrl) { post({ type: 'openExternal', url: updateState.releasesUrl }); }
+    } else if (action === 'openGithub') {
+      post({ type: 'openExternal', url: GITHUB_URL });
+    } else if (action === 'toggleSection') {
+      // Collapse/expand a Settings section; persisted in the webview vscode state (survives reload).
+      const key = target.getAttribute('data-section-key');
+      if (key) {
+        if (collapsedSections[key]) { delete collapsedSections[key]; } else { collapsedSections[key] = true; }
+        saveCollapsed();
+        render();
+      }
+    } else if (action === 'copyBriefing') {
+      // Reuse the host clipboard path (vscode.env.clipboard.writeText) the copy-prompt buttons use:
+      // post the text, host copies it and echoes { type:'copied', id } back for the flash.
+      post({ type: 'copyText', text: EXTENSIONS_BRIEFING, flash: 'ext-briefing' });
+    } else if (action === 'toggleExtensionsEnabled') {
+      post({ type: 'setExtensionsEnabled', enabled: target.checked });
+    } else if (action === 'toggleExtension' && id) {
+      post({ type: 'toggleExtension', id: id, enabled: target.checked });
+    } else if (action === 'addExtension') {
+      extForm = { id: null, name: '', js: '', css: '', matches: '', runAt: 'document_idle', world: 'main', hideFromAgent: false };
+      render();
+      focusFirst('.ext-form input[data-field="name"]');
+    } else if (action === 'editExtension' && id) {
+      const ex = (model.extensions || []).find(function (e) { return e.id === id; });
+      extForm = {
+        id: id,
+        name: ex ? ex.name : '',
+        js: ex ? ex.js : '',
+        css: ex ? ex.css : '',
+        matches: ex && Array.isArray(ex.matches) ? ex.matches.join('\n') : '',
+        runAt: ex && ex.runAt ? ex.runAt : 'document_idle',
+        world: ex && ex.world === 'isolated' ? 'isolated' : 'main',
+        hideFromAgent: !!(ex && ex.hideFromAgent)
+      };
+      render();
+      focusFirst('.ext-form input[data-field="name"]');
+    } else if (action === 'submitExtension') {
+      submitExtension();
+    } else if (action === 'cancelExtension') {
+      extForm = null;
+      render();
+    } else if (action === 'deleteExtension' && id) {
+      post({ type: 'removeExtension', id: id });
     }
   });
 
@@ -998,6 +1567,65 @@
     render();
   }
 
+  // Read the Extensions add/edit form and post the right message (add vs update), then close it;
+  // the host push refreshes the list. A blank name is allowed (renders as "Untitled extension").
+  function submitExtension() {
+    if (!extForm) { return; }
+    const nameEl = app.querySelector('.ext-form input[data-field="name"]');
+    const jsEl = app.querySelector('.ext-form textarea[data-field="js"]');
+    const cssEl = app.querySelector('.ext-form textarea[data-field="css"]');
+    const matchesEl = app.querySelector('.ext-form textarea[data-field="matches"]');
+    const runAtEl = app.querySelector('.ext-form select[data-field="runAt"]');
+    const worldEl = app.querySelector('.ext-form select[data-field="world"]');
+    const hideEl = app.querySelector('.ext-form input[data-field="hideFromAgent"]');
+    const name = nameEl ? nameEl.value.trim() : '';
+    const js = jsEl ? jsEl.value : '';
+    const css = cssEl ? cssEl.value : '';
+    const rawMatches = matchesEl ? matchesEl.value : '';
+    const runAt = runAtEl && runAtEl.value === 'document_start' ? 'document_start' : 'document_idle';
+    const world = worldEl && worldEl.value === 'isolated' ? 'isolated' : 'main';
+    const hideFromAgent = !!(hideEl && hideEl.checked);
+    // One pattern per line; trim and drop blanks. Validate each; a malformed one blocks the save
+    // with an inline error (and we preserve the user's typed values across the re-render).
+    const lines = rawMatches.split('\n').map(function (s) { return s.trim(); }).filter(function (s) { return s.length; });
+    const bad = lines.filter(function (p) { return !isValidMatchPattern(p); });
+    if (bad.length) {
+      extForm = { id: extForm.id, name: name, js: js, css: css, matches: rawMatches, runAt: runAt, world: world, hideFromAgent: hideFromAgent, error: 'Invalid match pattern: ' + bad[0] };
+      render();
+      return;
+    }
+    // Best-effort JS syntax pre-check. Main-world bodies are inlined into ONE shared bootstrap, so a
+    // PARSE error in one body would break every main extension's JS/CSS/reconcile — contain it here.
+    // This is a parse guard, NOT a sandbox: new Function only surfaces SyntaxErrors; runtime errors
+    // are already per-body try/caught downstream. This webview's CSP (script-src 'nonce-…', no
+    // 'unsafe-eval') refuses Function construction, throwing an EvalError rather than parsing — so we
+    // act ONLY on a genuine SyntaxError and swallow anything else. Under strict CSP that makes this a
+    // safe no-op that never blocks a save; it activates automatically if the CSP ever allows Function.
+    // The AUTHORITATIVE syntax guard runs host-side in panel.js (addExtension/updateExtension →
+    // _jsSyntaxError), which parses without CSP and bounces an `extensionError` back if it fails.
+    if (js.trim()) {
+      let jsSyntaxError = null;
+      try {
+        new Function(js); // eslint-disable-line no-new-func
+      } catch (e) {
+        if (e instanceof SyntaxError) { jsSyntaxError = e.message || 'invalid JavaScript'; }
+      }
+      if (jsSyntaxError) {
+        extForm = { id: extForm.id, name: name, js: js, css: css, matches: rawMatches, runAt: runAt, world: world, hideFromAgent: hideFromAgent, error: 'JS syntax error: ' + jsSyntaxError };
+        render();
+        return;
+      }
+    }
+    const fields = { name: name, js: js, css: css, matches: lines, runAt: runAt, world: world, hideFromAgent: hideFromAgent };
+    if (extForm.id) {
+      post({ type: 'updateExtension', id: extForm.id, fields: fields });
+    } else {
+      post({ type: 'addExtension', name: name, js: js, css: css, matches: lines, runAt: runAt, world: world, hideFromAgent: hideFromAgent });
+    }
+    extForm = null;
+    render();
+  }
+
   // Delegated 'input' (debounced) for the free-text areas: the top-level
   // instruction and each capability's per-capability instruction override.
   app.addEventListener('input', function (ev) {
@@ -1008,7 +1636,11 @@
       debounce('setInstruction', function () {
         post({ type: 'setInstruction', value: value });
       });
+    } else if (target.matches('textarea.ext-js') || target.matches('textarea.ext-css') || target.matches('textarea.ext-matches')) {
+      // Extensions JS/CSS/match-patterns editors: auto-grow only (form is submit-based, nothing posted).
+      autoSizeInstruction(target);
     } else if (target.matches('textarea[data-action="setCapabilityInstruction"]')) {
+      autoSizeInstruction(target);
       const id = target.getAttribute('data-id');
       const value = target.value;
       debounce('setCapabilityInstruction:' + id, function () {
@@ -1175,7 +1807,30 @@
       // defaulting true) without touching sessions/settings/view or the open
       // add-form/rename state.
       model.bookmarks = msg.tree;
-      model.bookmarksBarEnabled = msg.barEnabled !== undefined ? !!msg.barEnabled : true;
+      model.bookmarksBarEnabled = msg.barEnabled !== undefined ? !!msg.barEnabled : false;
+      render();
+    } else if (msg.type === 'extensions') {
+      // Additive: store the host's extensions list + the master-enable flag (defaulting true)
+      // without touching sessions/settings/view or the open extension add/edit form state.
+      model.extensions = Array.isArray(msg.items) ? msg.items : [];
+      model.extensionsEnabled = msg.extensionsEnabled !== undefined ? !!msg.extensionsEnabled : true;
+      render();
+    } else if (msg.type === 'extensionError') {
+      // The host refused an add/update (authoritative JS syntax guard — see panel.js). Re-open the
+      // add/edit form with the operator's values + the inline error, reconciling the optimistic
+      // close-on-submit so they can see why the save didn't take and fix it. matches arrives as the
+      // parsed array; the form's textarea wants one pattern per line.
+      extForm = {
+        id: msg.id || null,
+        name: msg.name || '',
+        js: msg.js || '',
+        css: msg.css || '',
+        matches: Array.isArray(msg.matches) ? msg.matches.join('\n') : (msg.matches || ''),
+        runAt: msg.runAt === 'document_start' ? 'document_start' : 'document_idle',
+        world: msg.world === 'isolated' ? 'isolated' : 'main',
+        hideFromAgent: !!msg.hideFromAgent,
+        error: msg.error || 'Save failed'
+      };
       render();
     } else if (msg.type === 'updateStatus') {
       // Store the host's answer to our checkForUpdate post; keep it outside
@@ -1203,11 +1858,14 @@
         render();
       }
     } else if (msg.type === 'copied') {
-      // The fleet copy reuses this same postback but has no real session id
-      // (undefined/null/blank, or a sentinel that matches no row) — route
-      // those to the rail flash instead of the per-row one.
-      const isRow = msg.id && model.sessions.some(function (s) { return s.id === msg.id; });
-      if (isRow) { flashCopied(msg.id); } else { flashFleetCopied(); }
+      // The fleet copy and the extensions-briefing copy reuse this same postback but have no real
+      // session id — route the briefing sentinel to its own flash, then the fleet fallback.
+      if (msg.id === 'ext-briefing') {
+        flashBriefing();
+      } else {
+        const isRow = msg.id && model.sessions.some(function (s) { return s.id === msg.id; });
+        if (isRow) { flashCopied(msg.id); } else { flashFleetCopied(); }
+      }
     }
   });
 
@@ -1216,4 +1874,5 @@
   post({ type: 'ready' });
   post({ type: 'getSettings' });
   post({ type: 'getBookmarks' });
+  post({ type: 'getExtensions' });
 })();

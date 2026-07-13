@@ -10,6 +10,7 @@ const { ProjectSteersmanPanel } = require('./panel');
 const { CapabilityConfig } = require('./capability-config');
 const { ScriptRunner } = require('./script-runner');
 const { BookmarksStore } = require('./bookmarks-store');
+const { ExtensionsStore } = require('./extensions-store');
 const { FaviconFetcher } = require('./favicon-fetcher');
 
 let log;
@@ -23,6 +24,10 @@ let capabilityConfig = null;
 // Global bookmark tree (folders + bookmarks), persisted in globalState so it is shared
 // across all windows. The session layer injects it as an in-page bar; Phase 2's UI edits it.
 let bookmarks = null;
+// Global list of userscript-style "extensions" (auto-injected page modifiers), persisted in
+// globalState so it is shared across all windows. The session layer injects each active one on
+// page load; the panel's Settings UI (Phase 1) does operator-only CRUD.
+let extensions = null;
 // One favicon fetcher per activation: resolves a bookmark's favicon to a data: URI (Node-side,
 // so the in-page bar's img-src CSP never sees a live cross-origin request). Shared by the panel
 // (fetch-on-add) and the activation backfill below.
@@ -66,6 +71,7 @@ function activate(context) {
 
   capabilityConfig = new CapabilityConfig();
   bookmarks = new BookmarksStore(context.globalState);
+  extensions = new ExtensionsStore(context.globalState);
   favicons = new FaviconFetcher();
   apiToken = crypto.randomBytes(32).toString('hex');
 
@@ -78,6 +84,7 @@ function activate(context) {
     getPort: () => actualPort,
     getStartUrl: () => vscode.workspace.getConfiguration('projectSteersman').get('startUrl', 'about:blank'),
     bookmarksStore: bookmarks,
+    extensionsStore: extensions,
   });
   scriptRunner = new ScriptRunner({
     manager,
@@ -643,10 +650,13 @@ function panelDeps() {
     focusEditorGroupByColumn,
     capabilityConfig,
     bookmarksStore: bookmarks,
+    extensionsStore: extensions,
     // Lets the panel fetch a data-URI favicon (Node-side) when a bookmark is added.
     faviconFetcher: favicons,
     // Lets the panel re-inject the live in-page bookmarks bar after a Settings-editor edit.
     refreshBookmarkBars: () => manager.refreshBookmarkBars(),
+    // Lets the panel re-apply the live in-page extensions after a Settings-editor edit.
+    refreshExtensions: () => manager.refreshExtensions(),
     token: apiToken,
     // Current package.json version; the panel pushes it into state for the update-check badge.
     version,
