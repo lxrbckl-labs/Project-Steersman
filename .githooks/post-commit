@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Project Steersman — post-commit release hook.
+#
+# Activate once with (both):
+#   git config core.hooksPath .githooks     # run this hook on every commit
+#   git config push.followTags true         # make `git push` also send annotated tags
+# See .githooks/README.md for the workflow / how to disable.
+#
+# Fires after EVERY commit but is a silent NO-OP unless package.json's "version" string
+# changed to a NEW value (compared against the parent commit). package.json is the SOLE source
+# of truth — there is no VERSION file. On a confirmed change it: builds the VSIX, installs it via
+# the `code` CLI, then tags v<version> LOCALLY. It does NOT push — you push manually, and with
+# push.followTags your `git push` carries the tag too.
+#
+# A post-commit hook's exit code is IGNORED by git — the commit already happened — so this
+# script never aborts the terminal: every step is individually guarded, failures print a clear
+# message and we always exit 0.
+#
+# LOOP SAFETY: this hook creates a git TAG (and builds/installs) but NEVER creates a commit, so
+# it cannot re-trigger post-commit. No recursion.
+
+# No `set -e`: we guard each step ourselves and must survive a failed sub-step.
+set -u
+
+# ── 0. Manual skip: STEERSMAN_SKIP_HOOK=1 git commit -m "wip" bypasses everything ─────────
+if [ -n "${STEERSMAN_SKIP_HOOK:-}" ]; then
+  exit 0
+fi
+
+# Run from the repo root regardless of where git invoked us.
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+cd "$repo_root" || exit 0
+
+# ── 1. Version-change detection (the gate) — node only, no jq dependency ──────────────────
+# Current version from the just-committed working tree.
+current="$(node -p "require('./package.json').version" 2>/dev/null)"
+[ -n "${current:-}" ] || exit 0   # can't read current version → ambiguous → do nothing
+
+# Previous version from the PARENT commit's package.json. Any failure (initial commit with no
+# HEAD~1, package.json absent there, unreadable / invalid JSON) yields an empty string, which
+# we treat as "no confirmable previous version".
+previous="$(git show HEAD~1:package.json 2>/dev/null \
+  | node -pe 'JSON.parse(require("fs").readFileSync(0)).version' 2>/dev/null)"
+
+# SAFE gate: only release when we can POSITIVELY confirm the version changed to a new value.
+# Ambiguous states (no previous version) and unchanged versions are silent no-ops.
+[ -n "${previous:-}" ] || exit 0
+[ "$current" != "$previous" ] || exit 0
+
+version="$current"
+tag="v$version"
+vsix="project-steersman-$version.vsix"   # *.vsix is gitignored — won't pollute git
+echo "[steersman-release] package.json version changed: $previous -> $version"
+
+# ── Tag-exists guard: if v$version is already tagged, assume already released and stop ─────
+if git rev-parse -q --verify "refs/tags/$tag" >/dev/null 2>&1; then
+  echo "[steersman-release] tag $tag already exists, skipping (no rebuild/reinstall/retag)"
+  exit 0
+fi
+
+# Resolve the `code` CLI defensively — a hook's PATH may not include it. Prefer PATH; fall back
+# to the NEWEST VS Code remote-cli shim (the bin/<hash> dir changes across VS Code updates, so
+# never hardcode it); degrade gracefully if absent.
+resolve_code() {
+  if command -v code >/dev/null 2>&1; then command -v code; return 0; fi
+  local c
+  c="$(ls -t "$HOME"/.vscode-server/bin/*/bin/remote-cli/code 2>/dev/null | head -n1)"
+  if [ -n "${c:-}" ] && [ -x "$c" ]; then echo "$c"; return 0; fi
+  return 1
+}
+
+built=0
+installed=0
+
+# ── 1. Build VSIX ─────────────────────────────────────────────────────────────────────────
+# npx/npm may be missing when the commit came from the VS Code Source Control GUI (its env often
+# lacks npm on PATH). In that case we skip build+install but STILL tag below (tagging only needs git).
+if command -v npx >/dev/null 2>&1; then
+  echo "[steersman-release] building VSIX ($vsix)…"
+  if npx --yes @vscode/vsce package --out "$vsix"; then
+    built=1
+    echo "[steersman-release] VSIX built: $vsix"
+  else
+    echo "[steersman-release] VSIX build FAILED — skipping install. Re-run in a WSL shell: npx --yes @vscode/vsce package --out $vsix"
+  fi
+else
+  echo "[steersman-release] npm/vsce not available — skipping build+install (commit from a WSL shell to get the full flow)"
+fi
+
+# ── 2. Install VSIX (only if the build succeeded) ────────────────────────────────────────
+if [ "$built" = 1 ]; then
+  code_bin="$(resolve_code)"
+  if [ -n "${code_bin:-}" ]; then
+    echo "[steersman-release] installing via $code_bin…"
+    if "$code_bin" --install-extension "$vsix" --force; then
+      installed=1
+      echo "[steersman-release] installed $vsix"
+    else
+      echo "[steersman-release] install FAILED — run: code --install-extension $vsix --force"
+    fi
+  else
+    echo "[steersman-release] code CLI not on PATH — skipping auto-install; run: code --install-extension $vsix --force"
+  fi
+fi
+
+# ── 3. Tag LOCALLY only (NO push — the user pushes manually; push.followTags carries the tag) ─
+if git tag -a "$tag" -m "$tag" 2>/dev/null; then
+  echo "[steersman-release] tagged $tag (local)"
+else
+  echo "[steersman-release] WARNING: could not create tag $tag"
+fi
+
+# ── 4. Final summary + the one remaining manual step ─────────────────────────────────────
+if [ "$installed" = 1 ]; then
+  did="built + installed + tagged locally"
+elif [ "$built" = 1 ]; then
+  did="built + tagged locally (install skipped)"
+else
+  did="tagged locally (build+install skipped)"
+fi
+echo "[steersman-release] ✔ $tag — $did."
+echo "[steersman-release] ➜ Run \`git push\` to send the commit + tag to origin."
+exit 0
