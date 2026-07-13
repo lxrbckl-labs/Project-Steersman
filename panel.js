@@ -63,6 +63,8 @@ class ProjectSteersmanPanel {
     this._log = deps.log;
     this._extensionUri = deps.extensionUri;
     this._focusEditorGroupByColumn = deps.focusEditorGroupByColumn;
+    // Editor-tab icon shown in the tab strip for this panel.
+    this._panel.iconPath = vscode.Uri.joinPath(this._extensionUri, 'media', 'icon.png');
     // Shared, hoisted capability config (one window = one in-memory, per-instance config);
     // the extension host owns it so HTTP /capabilities reads the same instance the Settings
     // handlers below mutate. Falls back to a fresh one only if a caller omits it.
@@ -560,7 +562,8 @@ class ProjectSteersmanPanel {
       };
     });
     const scripts = this._scriptRunner ? this._scriptRunner.listScripts() : [];
-    this._post({ type: 'state', sessions, port: port == null ? null : port, scripts, version: this._version || null });
+    const coverUri = this._panel.webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'cover.png')).toString();
+    this._post({ type: 'state', sessions, port: port == null ? null : port, scripts, version: this._version || null, coverUri });
   }
 
   // Public re-push hook for external triggers (e.g. the central-scripts fs.watch in

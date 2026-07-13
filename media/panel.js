@@ -8,9 +8,13 @@
   // ── VS Code API ─────────────────────────────────────────────
   const vscode = acquireVsCodeApi();
 
+  // ── Cover image URI — baked into the HTML shell by the host as a data-
+  // attribute on #app (webview-safe asWebviewUri already applied there);
+  // read once since it's static for the life of the webview. ───────────
+
   // ── State ───────────────────────────────────────────────────
   /** @type {{sessions: Array<{id:string,state:string,url:string,activity:(Object|null)}>, port: (number|string|null), view: ('sessions'|'settings'), settings: (Object|null), scripts: Array<{name:string}>, bookmarks: (Object|null), bookmarksBarEnabled: boolean, version: string}} */
-  let model = { sessions: [], port: null, view: 'sessions', settings: null, scripts: [], bookmarks: null, bookmarksBarEnabled: true, version: '' };
+  let model = { sessions: [], port: null, view: 'sessions', settings: null, scripts: [], bookmarks: null, bookmarksBarEnabled: true, version: '', coverUri: '' };
 
   // ── Update-check UI state — module-scoped (like expandedFolders/addForm)
   // so it survives the full-rebuild render() instead of resetting each time
@@ -710,6 +714,11 @@
 
   function settingsView() {
     const wrap = h('div', { className: 'settings-body' });
+    if (model.coverUri) {
+      const hero = h('div', { className: 'settings-hero' });
+      hero.style.backgroundImage = 'url("' + model.coverUri + '")';
+      wrap.appendChild(hero);
+    }
     wrap.appendChild(updateBadge());
     const s = model.settings;
 
@@ -1155,6 +1164,7 @@
       model.port = msg.port != null ? msg.port : model.port;
       model.scripts = Array.isArray(msg.scripts) ? msg.scripts : (model.scripts || []);
       model.version = msg.version != null ? msg.version : model.version;
+      model.coverUri = msg.coverUri != null ? msg.coverUri : model.coverUri;
       render();
     } else if (msg.type === 'settings' && msg.settings) {
       // Likewise: a settings push must not touch model.sessions/view.
