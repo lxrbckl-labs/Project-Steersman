@@ -192,35 +192,9 @@ button.icon-button.btn-fleet-copy {
   padding: 6px 2px;
 }
 
-/* Cover hero — pixel-art banner at the top of Settings, sized for the
-   ~2:1 cover.png asset (1774x887). Bottom fade keeps the section below
-   readable regardless of the image's own colours. */
-.settings-hero {
-  position: relative;
-  flex: 0 0 auto;               /* never let the flex column shrink the banner to zero */
-  width: 100%;
-  height: 200px;               /* explicit height — no reliance on aspect-ratio in a flex column */
-  background-color: #241a3a;   /* visible fallback so a failed image still shows a box (diagnostic) */
-  background-size: cover;
-  background-position: center;
-  background-repeat: no-repeat;
-  border-radius: 6px;
-  margin-bottom: 6px;
-  overflow: hidden;
-}
-.settings-hero::after {
-  content: '';
-  position: absolute;
-  left: 0; right: 0; bottom: 0;
-  height: 40%;
-  background: linear-gradient(to top, rgba(0,0,0,0.15), rgba(0,0,0,0));
-  pointer-events: none;
-}
-
-/* Top bar above the cover photo — bold title on the left, the package
-   (update-check) button and the GitHub button pushed to the far right. A
-   sibling of .settings-hero inside .settings-body, so its left/right edges
-   line up with the cover photo (both share the body's horizontal padding). */
+/* Top bar — bold title on the left, the package (update-check) button and
+   the GitHub button pushed to the far right. First child of .settings-body,
+   so its left/right edges line up with the body's horizontal padding. */
 .settings-topbar {
   display: flex;
   align-items: center;
@@ -231,7 +205,7 @@ button.icon-button.btn-fleet-copy {
    to the far edge of the row. */
 .settings-title {
   margin-right: auto;
-  font-weight: 700;
+  font-weight: 600;
   font-size: 13px;
   color: var(--vscode-foreground);
   white-space: nowrap;
@@ -512,7 +486,8 @@ button.icon-button.settings-github-btn:hover:not(:disabled) {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  padding: 8px;
+  /* Bottom trimmed 1px (8px -> 7px) per request; top/left/right stay 8px. */
+  padding: 8px 8px 7px;
 }
 
 .session-table {
@@ -525,7 +500,9 @@ button.icon-button.settings-github-btn:hover:not(:disabled) {
   flex-direction: column;
   border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
   border-radius: 4px;
-  background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.06));
+  /* Confirmed swatch value; overrides the themed --vscode-editorWidget-background so the tabs
+     table reads as a dark surface. */
+  background: #191A1B;
   /* Thin themed scrollbar to match the VS Code editor. */
   scrollbar-width: thin;
   scrollbar-color: var(--vscode-scrollbarSlider-background) transparent;
@@ -1161,6 +1138,27 @@ button.icon-button.bm-confirm:hover:not(:disabled) {
   line-height: 1.4;
   color: var(--vscode-descriptionForeground, #999);
   border: 1px solid var(--vscode-descriptionForeground, #999);
+}
+
+/* Bridge row badge — amber (a "this extension has host access" attention cue). */
+.ext-bridge-badge {
+  flex: 0 0 auto;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  border-radius: 3px;
+  padding: 1px 5px;
+  line-height: 1.4;
+  color: var(--vscode-charts-yellow, #d7ba7d);
+  border: 1px solid var(--vscode-charts-yellow, #d7ba7d);
+}
+
+/* Bridge warning under the Bridge checkbox in the add/edit form — muted, small, wraps. */
+.ext-bridge-warn {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--vscode-descriptionForeground);
+  margin: 2px 0 2px 22px;
 }
 
 /* Compact control row in the add/edit form: run-at + world selects, then the hide-from-agent

@@ -31,6 +31,12 @@ fi
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 cd "$repo_root" || exit 0
 
+# ── Detached-HEAD guard: only automate on a real branch (rebase / detached HEAD skipped) ──
+# During a rebase replay or a detached checkout, HEAD is not a branch; firing a build/tag there
+# would mint a spurious release, so we bail out early.
+BRANCH="$(git symbolic-ref --short -q HEAD || true)"
+[ -z "$BRANCH" ] && exit 0
+
 # ── 1. Version-change detection (the gate) — node only, no jq dependency ──────────────────
 # Current version from the just-committed working tree.
 current="$(node -p "require('./package.json').version" 2>/dev/null)"
@@ -71,20 +77,32 @@ resolve_code() {
 
 built=0
 installed=0
+build_failed=0   # distinguishes "build attempted and FAILED" from "build not attempted"
 
 # ── 1. Build VSIX ─────────────────────────────────────────────────────────────────────────
 # npx/npm may be missing when the commit came from the VS Code Source Control GUI (its env often
-# lacks npm on PATH). In that case we skip build+install but STILL tag below (tagging only needs git).
+# lacks npm on PATH). In that case we skip build+install and (by design) STILL tag below — tagging
+# only needs git, and a GUI commit is a legitimate "no build environment here" case. But if npx IS
+# present and the build is ATTEMPTED and FAILS, we do NOT tag: a v<version> tag must never mark a
+# release whose VSIX did not actually build.
 if command -v npx >/dev/null 2>&1; then
   echo "[steersman-release] building VSIX ($vsix)…"
   if npx --yes @vscode/vsce package --out "$vsix"; then
     built=1
     echo "[steersman-release] VSIX built: $vsix"
   else
-    echo "[steersman-release] VSIX build FAILED — skipping install. Re-run in a WSL shell: npx --yes @vscode/vsce package --out $vsix"
+    build_failed=1
+    echo "[steersman-release] VSIX PACKAGE FAILED — skipping install/tag. Re-run in a WSL shell: npx --yes @vscode/vsce package --out $vsix"
   fi
 else
   echo "[steersman-release] npm/vsce not available — skipping build+install (commit from a WSL shell to get the full flow)"
+fi
+
+# ── Build-failed gate: an attempted-but-failed build must NOT be tagged ───────────────────
+# (A build that was never attempted — e.g. no npx in a GUI commit — still tags, as before.)
+if [ "$build_failed" = 1 ]; then
+  echo "[steersman-release] ✖ $tag NOT created — build failed. Fix the build, then re-commit or tag manually."
+  exit 0
 fi
 
 # ── 2. Install VSIX (only if the build succeeded) ────────────────────────────────────────

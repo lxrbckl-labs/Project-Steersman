@@ -304,6 +304,7 @@ class ProjectSteersmanPanel {
           this._postExtensionError(addErr, null, {
             name: msg.name, js: msg.js, css: msg.css, matches: msg.matches,
             runAt: msg.runAt, world: msg.world, hideFromAgent: msg.hideFromAgent,
+            bridge: msg.bridge, bridgeHosts: msg.bridgeHosts,
           });
           break;
         }
@@ -316,6 +317,8 @@ class ProjectSteersmanPanel {
             runAt: msg.runAt,
             world: msg.world,
             hideFromAgent: msg.hideFromAgent,
+            bridge: msg.bridge,
+            bridgeHosts: msg.bridgeHosts,
           })
         );
         break;
@@ -633,8 +636,7 @@ class ProjectSteersmanPanel {
       };
     });
     const scripts = this._scriptRunner ? this._scriptRunner.listScripts() : [];
-    const coverUri = this._panel.webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'cover.png')).toString();
-    this._post({ type: 'state', sessions, port: port == null ? null : port, scripts, version: this._version || null, coverUri });
+    this._post({ type: 'state', sessions, port: port == null ? null : port, scripts, version: this._version || null });
   }
 
   // Public re-push hook for external triggers (e.g. the central-scripts fs.watch in
@@ -745,6 +747,8 @@ class ProjectSteersmanPanel {
       runAt: v.runAt,
       world: v.world,
       hideFromAgent: v.hideFromAgent,
+      bridge: v.bridge,
+      bridgeHosts: v.bridgeHosts,
     });
   }
 

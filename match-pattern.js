@@ -106,4 +106,17 @@ function matchesUrl(patterns, url) {
   return false;
 }
 
-module.exports = { parseMatchPattern, matchesUrl };
+// Host-glob match for a SINGLE host pattern (Chrome `*.domain.com` semantics), case-insensitive:
+//   '*'          → any host
+//   '*.foo.com'  → 'foo.com' AND any subdomain of it
+//   'foo.com'    → exact host
+// Reused by the bridge fetch host-allowlist (cdp-tab.js) so allowlisting matches URL-pattern hosts.
+function hostMatches(pattern, host) {
+  if (typeof pattern !== 'string' || typeof host !== 'string') return false;
+  const p = pattern.trim().toLowerCase();
+  const h = host.trim().toLowerCase();
+  if (!p || !h) return false;
+  return matchHost(p, h);
+}
+
+module.exports = { parseMatchPattern, matchesUrl, hostMatches };

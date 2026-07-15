@@ -11,6 +11,7 @@ const { CapabilityConfig } = require('./capability-config');
 const { ScriptRunner } = require('./script-runner');
 const { BookmarksStore } = require('./bookmarks-store');
 const { ExtensionsStore } = require('./extensions-store');
+const { BridgeStore } = require('./bridge-store');
 const { FaviconFetcher } = require('./favicon-fetcher');
 
 let log;
@@ -28,6 +29,9 @@ let bookmarks = null;
 // globalState so it is shared across all windows. The session layer injects each active one on
 // page load; the panel's Settings UI (Phase 1) does operator-only CRUD.
 let extensions = null;
+// Bridge (B1): per-extension KV store shared across windows (globalState-backed). Threaded into the
+// SessionManager (tabs service bridge storage calls) and the panel deps like the other stores.
+let bridge = null;
 // One favicon fetcher per activation: resolves a bookmark's favicon to a data: URI (Node-side,
 // so the in-page bar's img-src CSP never sees a live cross-origin request). Shared by the panel
 // (fetch-on-add) and the activation backfill below.
@@ -72,6 +76,9 @@ function activate(context) {
   capabilityConfig = new CapabilityConfig();
   bookmarks = new BookmarksStore(context.globalState);
   extensions = new ExtensionsStore(context.globalState);
+  // Bridge (B1): per-extension KV store backed by globalState; context.secrets is passed for the
+  // (later) B3 SecretStorage tier so its construction doesn't change then.
+  bridge = new BridgeStore(context.globalState, context.secrets);
   favicons = new FaviconFetcher();
   apiToken = crypto.randomBytes(32).toString('hex');
 
@@ -85,6 +92,7 @@ function activate(context) {
     getStartUrl: () => vscode.workspace.getConfiguration('projectSteersman').get('startUrl', 'about:blank'),
     bookmarksStore: bookmarks,
     extensionsStore: extensions,
+    bridgeStore: bridge,
   });
   scriptRunner = new ScriptRunner({
     manager,
@@ -651,6 +659,7 @@ function panelDeps() {
     capabilityConfig,
     bookmarksStore: bookmarks,
     extensionsStore: extensions,
+    bridgeStore: bridge,
     // Lets the panel fetch a data-URI favicon (Node-side) when a bookmark is added.
     faviconFetcher: favicons,
     // Lets the panel re-inject the live in-page bookmarks bar after a Settings-editor edit.

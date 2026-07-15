@@ -23,6 +23,7 @@ class SessionManager {
     this.getStartUrl = ctx.getStartUrl;
     this.bookmarksStore = ctx.bookmarksStore || null;
     this.extensionsStore = ctx.extensionsStore || null;
+    this.bridgeStore = ctx.bridgeStore || null;
     this._counter = 0;
     // id -> { id, state, url, tab, viewColumn, editorTab, script } (insertion order = FIFO).
     // viewColumn/editorTab record the integrated-browser editor tab's placement so the
@@ -266,6 +267,9 @@ class SessionManager {
       // injection now against the already-loaded page.
       if (this.extensionsStore) {
         tab.getExtensions = () => this.extensionsStore.getActive();
+        // Bridge (B1): give the tab the shared per-extension KV store so bridge extensions'
+        // storage.* calls resolve host-side. injectExtensions (above/refresh) registers the worlds.
+        if (this.bridgeStore) { tab.getBridge = () => this.bridgeStore; }
         try {
           await tab.injectExtensions(this.extensionsStore.getActive());
         } catch {}

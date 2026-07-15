@@ -60,6 +60,11 @@ class ExtensionsStore {
       runAt: RUN_AT_VALUES.includes(raw.runAt) ? raw.runAt : 'document_idle',
       world: WORLD_VALUES.includes(raw.world) ? raw.world : 'main',
       hideFromAgent: !!raw.hideFromAgent,
+      // Bridge (B1): when true the extension runs in a dedicated isolated world with a host<->page
+      // bridge (steersman.storage now; steersman.fetch/secrets in B2/B3). bridgeHosts is the
+      // allow-list of hosts it may fetch — stored now for a complete record but UNUSED until B2.
+      bridge: !!raw.bridge,
+      bridgeHosts: Array.isArray(raw.bridgeHosts) ? raw.bridgeHosts.filter((h) => typeof h === 'string') : [],
       notes: typeof raw.notes === 'string' ? raw.notes : '',
     };
   }

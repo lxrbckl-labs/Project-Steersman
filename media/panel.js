@@ -14,7 +14,7 @@
 
   // ── State ───────────────────────────────────────────────────
   /** @type {{sessions: Array<{id:string,state:string,url:string,activity:(Object|null)}>, port: (number|string|null), view: ('sessions'|'settings'), settings: (Object|null), scripts: Array<{name:string}>, bookmarks: (Object|null), bookmarksBarEnabled: boolean, version: string}} */
-  let model = { sessions: [], port: null, view: 'sessions', settings: null, scripts: [], bookmarks: null, bookmarksBarEnabled: false, extensions: [], extensionsEnabled: true, version: '', coverUri: '' };
+  let model = { sessions: [], port: null, view: 'sessions', settings: null, scripts: [], bookmarks: null, bookmarksBarEnabled: false, extensions: [], extensionsEnabled: true, version: '' };
 
   // ── Update-check UI state — module-scoped (like expandedFolders/addForm)
   // so it survives the full-rebuild render() instead of resetting each time
@@ -1000,6 +1000,9 @@
     const hiddenEl = ext.hideFromAgent
       ? h('span', { className: 'ext-hidden-badge', title: 'Hidden from agent reads' }, 'hidden')
       : null;
+    const bridgeEl = ext.bridge
+      ? h('span', { className: 'ext-bridge-badge', title: 'Bridge enabled — host-backed storage/network' }, 'bridge')
+      : null;
     const summary = h(
       'span',
       { className: 'ext-summary', title: (Array.isArray(ext.matches) ? ext.matches : []).join('\n') },
@@ -1010,7 +1013,7 @@
       actionButton(ext.id, 'editExtension', 'Edit extension', editIcon(), 'bm-rowbtn'),
       actionButton(ext.id, 'deleteExtension', 'Delete extension', closeIcon(), 'danger bm-rowbtn')
     );
-    return h('div', { className: 'ext-row', dataId: ext.id }, dot, toggle, name, kindEl, hiddenEl, summary, actions);
+    return h('div', { className: 'ext-row', dataId: ext.id }, dot, toggle, name, kindEl, hiddenEl, bridgeEl, summary, actions);
   }
 
   function extFormRow() {
@@ -1070,6 +1073,25 @@
     // Compact control row: run-at + world selects, then the hide-from-agent toggle.
     const controls = h('div', { className: 'ext-form-controls' }, runAtSel, worldSel, hideLabel);
 
+    // Bridge (B1): host-backed capabilities. A checkbox + operator warning, and the (B2-reserved)
+    // host allow-list textarea so the record is complete.
+    const bridgeToggle = h('input', {
+      type: 'checkbox', className: 'capability-toggle', 'data-field': 'bridge', ariaLabel: 'Enable bridge'
+    });
+    bridgeToggle.checked = !!extForm.bridge;
+    const bridgeLabel = h('label', { className: 'ext-hide-row', title: 'Runs this extension in a dedicated isolated world with host-backed storage (and later network).' },
+      bridgeToggle, h('span', { className: 'capability-label' }, 'Bridge (host storage / network)'));
+    const bridgeWarn = h('div', { className: 'ext-bridge-warn' },
+      'Bridge lets this extension store data via the host and (later) make network requests. Only enable for extensions you trust.');
+    const hostsArea = h('textarea', {
+      className: 'capability-instruction ext-bridgehosts',
+      'data-field': 'bridgeHosts',
+      rows: '2',
+      ariaLabel: 'Bridge allowed hosts, one per line',
+      placeholder: 'Allowed hosts — one per line (used by network requests in a later phase)\napi.example.com'
+    });
+    hostsArea.value = extForm.bridgeHosts || '';
+
     const btns = h(
       'div', { className: 'ext-form-actions' },
       extForm.error ? h('span', { className: 'ext-form-error' }, extForm.error) : null,
@@ -1091,6 +1113,10 @@
     box.appendChild(h('div', { className: 'ext-form-label' }, 'CSS'));
     box.appendChild(cssArea);
     box.appendChild(controls);
+    box.appendChild(bridgeLabel);
+    box.appendChild(bridgeWarn);
+    box.appendChild(h('div', { className: 'ext-form-label' }, 'Bridge allowed hosts'));
+    box.appendChild(hostsArea);
     box.appendChild(btns);
     return box;
   }
@@ -1201,9 +1227,9 @@
   function settingsView() {
     const wrap = h('div', { className: 'settings-body' });
 
-    // Top bar above the cover photo: bold title on the left, then the package
-    // (update-check) button and the GitHub button pinned to the far right, in
-    // that order. The title's margin-right:auto pushes the two buttons right.
+    // Top bar: bold title on the left, then the package (update-check) button
+    // and the GitHub button pinned to the far right, in that order. The
+    // title's margin-right:auto pushes the two buttons right.
     const topbar = h(
       'div', { className: 'settings-topbar' },
       h('span', { className: 'settings-title' }, 'PROJECT STEERSMAN'),
@@ -1212,11 +1238,6 @@
     );
     wrap.appendChild(topbar);
 
-    if (model.coverUri) {
-      const hero = h('div', { className: 'settings-hero' });
-      hero.style.backgroundImage = 'url("' + model.coverUri + '")';
-      wrap.appendChild(hero);
-    }
     const s = model.settings;
 
     if (!s) {
@@ -1501,7 +1522,7 @@
     } else if (action === 'toggleExtension' && id) {
       post({ type: 'toggleExtension', id: id, enabled: target.checked });
     } else if (action === 'addExtension') {
-      extForm = { id: null, name: '', js: '', css: '', matches: '', runAt: 'document_idle', world: 'main', hideFromAgent: false };
+      extForm = { id: null, name: '', js: '', css: '', matches: '', runAt: 'document_idle', world: 'main', hideFromAgent: false, bridge: false, bridgeHosts: '' };
       render();
       focusFirst('.ext-form input[data-field="name"]');
     } else if (action === 'editExtension' && id) {
@@ -1514,7 +1535,9 @@
         matches: ex && Array.isArray(ex.matches) ? ex.matches.join('\n') : '',
         runAt: ex && ex.runAt ? ex.runAt : 'document_idle',
         world: ex && ex.world === 'isolated' ? 'isolated' : 'main',
-        hideFromAgent: !!(ex && ex.hideFromAgent)
+        hideFromAgent: !!(ex && ex.hideFromAgent),
+        bridge: !!(ex && ex.bridge),
+        bridgeHosts: ex && Array.isArray(ex.bridgeHosts) ? ex.bridgeHosts.join('\n') : ''
       };
       render();
       focusFirst('.ext-form input[data-field="name"]');
@@ -1578,6 +1601,8 @@
     const runAtEl = app.querySelector('.ext-form select[data-field="runAt"]');
     const worldEl = app.querySelector('.ext-form select[data-field="world"]');
     const hideEl = app.querySelector('.ext-form input[data-field="hideFromAgent"]');
+    const bridgeEl = app.querySelector('.ext-form input[data-field="bridge"]');
+    const hostsEl = app.querySelector('.ext-form textarea[data-field="bridgeHosts"]');
     const name = nameEl ? nameEl.value.trim() : '';
     const js = jsEl ? jsEl.value : '';
     const css = cssEl ? cssEl.value : '';
@@ -1585,12 +1610,17 @@
     const runAt = runAtEl && runAtEl.value === 'document_start' ? 'document_start' : 'document_idle';
     const world = worldEl && worldEl.value === 'isolated' ? 'isolated' : 'main';
     const hideFromAgent = !!(hideEl && hideEl.checked);
+    const bridge = !!(bridgeEl && bridgeEl.checked);
+    const rawHosts = hostsEl ? hostsEl.value : '';
+    const bridgeHosts = rawHosts.split('\n').map(function (s) { return s.trim(); }).filter(function (s) { return s.length; });
+    // Preserve every typed field (raw match/hosts text) across an error re-render.
+    const keep = { id: extForm.id, name: name, js: js, css: css, matches: rawMatches, runAt: runAt, world: world, hideFromAgent: hideFromAgent, bridge: bridge, bridgeHosts: rawHosts };
     // One pattern per line; trim and drop blanks. Validate each; a malformed one blocks the save
     // with an inline error (and we preserve the user's typed values across the re-render).
     const lines = rawMatches.split('\n').map(function (s) { return s.trim(); }).filter(function (s) { return s.length; });
     const bad = lines.filter(function (p) { return !isValidMatchPattern(p); });
     if (bad.length) {
-      extForm = { id: extForm.id, name: name, js: js, css: css, matches: rawMatches, runAt: runAt, world: world, hideFromAgent: hideFromAgent, error: 'Invalid match pattern: ' + bad[0] };
+      extForm = Object.assign({}, keep, { error: 'Invalid match pattern: ' + bad[0] });
       render();
       return;
     }
@@ -1611,16 +1641,16 @@
         if (e instanceof SyntaxError) { jsSyntaxError = e.message || 'invalid JavaScript'; }
       }
       if (jsSyntaxError) {
-        extForm = { id: extForm.id, name: name, js: js, css: css, matches: rawMatches, runAt: runAt, world: world, hideFromAgent: hideFromAgent, error: 'JS syntax error: ' + jsSyntaxError };
+        extForm = Object.assign({}, keep, { error: 'JS syntax error: ' + jsSyntaxError });
         render();
         return;
       }
     }
-    const fields = { name: name, js: js, css: css, matches: lines, runAt: runAt, world: world, hideFromAgent: hideFromAgent };
+    const fields = { name: name, js: js, css: css, matches: lines, runAt: runAt, world: world, hideFromAgent: hideFromAgent, bridge: bridge, bridgeHosts: bridgeHosts };
     if (extForm.id) {
       post({ type: 'updateExtension', id: extForm.id, fields: fields });
     } else {
-      post({ type: 'addExtension', name: name, js: js, css: css, matches: lines, runAt: runAt, world: world, hideFromAgent: hideFromAgent });
+      post({ type: 'addExtension', name: name, js: js, css: css, matches: lines, runAt: runAt, world: world, hideFromAgent: hideFromAgent, bridge: bridge, bridgeHosts: bridgeHosts });
     }
     extForm = null;
     render();
@@ -1636,7 +1666,7 @@
       debounce('setInstruction', function () {
         post({ type: 'setInstruction', value: value });
       });
-    } else if (target.matches('textarea.ext-js') || target.matches('textarea.ext-css') || target.matches('textarea.ext-matches')) {
+    } else if (target.matches('textarea.ext-js') || target.matches('textarea.ext-css') || target.matches('textarea.ext-matches') || target.matches('textarea.ext-bridgehosts')) {
       // Extensions JS/CSS/match-patterns editors: auto-grow only (form is submit-based, nothing posted).
       autoSizeInstruction(target);
     } else if (target.matches('textarea[data-action="setCapabilityInstruction"]')) {
@@ -1796,7 +1826,6 @@
       model.port = msg.port != null ? msg.port : model.port;
       model.scripts = Array.isArray(msg.scripts) ? msg.scripts : (model.scripts || []);
       model.version = msg.version != null ? msg.version : model.version;
-      model.coverUri = msg.coverUri != null ? msg.coverUri : model.coverUri;
       render();
     } else if (msg.type === 'settings' && msg.settings) {
       // Likewise: a settings push must not touch model.sessions/view.
@@ -1829,6 +1858,8 @@
         runAt: msg.runAt === 'document_start' ? 'document_start' : 'document_idle',
         world: msg.world === 'isolated' ? 'isolated' : 'main',
         hideFromAgent: !!msg.hideFromAgent,
+        bridge: !!msg.bridge,
+        bridgeHosts: Array.isArray(msg.bridgeHosts) ? msg.bridgeHosts.join('\n') : (msg.bridgeHosts || ''),
         error: msg.error || 'Save failed'
       };
       render();

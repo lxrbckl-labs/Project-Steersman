@@ -8,6 +8,8 @@
 // buffers, title prefixes, child-session capture, or reconnect yet.
 
 const vscode = require('vscode');
+const dns = require('dns');
+const { hostMatches } = require('./match-pattern');
 let WebSocket = null;
 try {
   WebSocket = require('ws');
@@ -16,6 +18,18 @@ try {
 }
 
 const BROWSER_SESSION_TYPES = ['pwa-editor-browser', 'editor-browser', 'pwa-chrome', 'chrome'];
+
+// Host<->page BRIDGE (B1). A `bridge:true` extension runs in a dedicated isolated world named
+// BRIDGE_WORLD_PREFIX + <extId>, where a single named binding (BRIDGE_BINDING) is exposed. The
+// page-side runtime calls that binding; the host derives the extension id from the TRUSTED
+// contextId->extId map (never the page payload) and services the call (B1: steersman.storage.*).
+const BRIDGE_BINDING = '__steersman_bridge';
+const BRIDGE_WORLD_PREFIX = 'steersman_ext_';
+
+// Bridge fetch (B2) caps. Timeout is the host ceiling (a smaller options.timeoutMs is honoured);
+// size cap aborts an oversized response body.
+const FETCH_TIMEOUT_CAP = 30000;
+const FETCH_SIZE_CAP = 5 * 1024 * 1024; // 5 MB
 
 // Cap for the rolling console/network ring buffers (entries beyond this are shifted off the front).
 const BUFFER_CAP = 200;
@@ -57,6 +71,14 @@ class CDPTab {
     // worldName) carries only the isolated-world JS bodies. null when nothing is registered.
     this._extScriptId = null;
     this._extScriptIdIsolated = null;
+    // Bridge (B1) — host<->page bridge transport state for THIS tab (reset per CDPTab instance).
+    // getBridge returns the shared BridgeStore (set by the SessionManager, like getExtensions). The
+    // maps/set track per-extension isolated-world registrations and the TRUSTED contextId->extId
+    // attribution built from Runtime.executionContextCreated.
+    this.getBridge = null;
+    this._bridgeScriptIds = new Map(); // extId -> Page.addScriptToEvaluateOnNewDocument identifier
+    this._bridgeBindings = new Set();  // extIds we've Runtime.addBinding'd (once per tab)
+    this._bridgeCtxToExt = new Map();  // executionContextId -> extId (trusted attribution)
     // Whether we've currently forced Page.setBypassCSP(true) on THIS tab (Phase 3). We only turn it
     // on when at least one active extension carries CSS (an injected <style> element can be blocked
     // by a page's style-src CSP), and turn it back off when the last CSS-bearing extension is gone,
@@ -178,6 +200,7 @@ class CDPTab {
     this._reinjectBookmarks();
     // Same idea for extensions: run the active set against the already-loaded page. No-ops until
     // the SessionManager wires getExtensions (it triggers the real first injection after that).
+    // The bridge world registrations (B1) ride along inside injectExtensions/_reinjectExtensions.
     this._reinjectExtensions();
   }
 
@@ -223,6 +246,8 @@ class CDPTab {
 
   handleMessage(msg) {
     if (!msg) return;
+    // Bridge (B1): maintain the contextId->extId map + service bindingCalled from bridge worlds.
+    if (msg.method) { this._onBridgeEvent(msg); }
     if (msg.id !== undefined) {
       const p = this.pending.get(msg.id);
       if (p) {
@@ -590,12 +615,16 @@ class CDPTab {
     const hasJs = (e) => e && typeof e.js === 'string' && e.js.trim();
     const hasCss = (e) => e && typeof e.css === 'string' && e.css.trim();
     const worldOf = (e) => (e && e.world === 'isolated' ? 'isolated' : 'main');
-    // Main bootstrap: anything with CSS (any world) OR a main-world JS body. Isolated bootstrap:
-    // only isolated-world JS bodies.
+    // Bridge (B1): a bridge extension's JS runs in its OWN per-ext isolated world (see
+    // _syncBridgeWorlds), never in these shared main/isolated bootstraps — so exclude its body here.
+    // Its CSS is still carried by the main bootstrap (CSS is world-independent, centralised there).
+    const isBridge = (e) => !!(e && e.bridge);
+    // Main bootstrap: anything with CSS (any world) OR a non-bridge main-world JS body. Isolated
+    // bootstrap: only non-bridge isolated-world JS bodies.
     const applicable =
       world === 'main'
-        ? items.filter((e) => hasCss(e) || (hasJs(e) && worldOf(e) === 'main'))
-        : items.filter((e) => hasJs(e) && worldOf(e) === 'isolated');
+        ? items.filter((e) => hasCss(e) || (hasJs(e) && worldOf(e) === 'main' && !isBridge(e)))
+        : items.filter((e) => hasJs(e) && worldOf(e) === 'isolated' && !isBridge(e));
     if (!applicable.length && !opts.reconcile) return null;
     const meta = JSON.stringify(
       applicable.map((e) => ({
@@ -611,29 +640,9 @@ class CDPTab {
     // world (so the main bootstrap gets null for isolated extensions' bodies, and vice-versa, while
     // still carrying their CSS via META above when this is the main bootstrap).
     const bodies = applicable
-      .map((e) => (hasJs(e) && worldOf(e) === world ? '(function(steersman){\n' + e.js + '\n})' : 'null'))
+      .map((e) => (hasJs(e) && worldOf(e) === world && !isBridge(e) ? '(function(steersman){\n' + e.js + '\n})' : 'null'))
       .join(',');
-    // Embedded, self-contained port of match-pattern.js's matchesUrl (kept in sync with that file).
-    const matcher =
-      'function __sm_glob(g){var r="^";for(var i=0;i<g.length;i++){var c=g[i];' +
-      'r+=(c==="*")?".*":c.replace(/[.*+?^${}()|[\\]\\\\]/g,"\\\\$&");}return new RegExp(r+"$");}' +
-      'function __sm_host(ph,uh){if(ph==="*")return true;' +
-      'if(ph.indexOf("*.")===0){var b=ph.slice(2);return uh===b||uh.slice(-(b.length+1))==="."+b;}return uh===ph;}' +
-      'function __sm_parse(p){if(typeof p!=="string")return null;p=p.trim();if(!p)return null;' +
-      'if(p==="<all_urls>")return{allUrls:true};var s=p.indexOf("://");if(s===-1)return null;' +
-      'var sc=p.slice(0,s);if(!/^(\\*|https?|file|ftp)$/.test(sc))return null;var rest=p.slice(s+3);' +
-      'var sl=rest.indexOf("/");if(sl===-1)return null;var h=rest.slice(0,sl),pa=rest.slice(sl);' +
-      'if(pa[0]!=="/")return null;if(sc==="file"){if(h!=="")return null;}else{if(h==="")return null;' +
-      'if(h!=="*"){if(h.indexOf("*.")===0){var bb=h.slice(2);if(!bb||bb.indexOf("*")!==-1)return null;}' +
-      'else if(h.indexOf("*")!==-1)return null;}}return{allUrls:false,scheme:sc,host:h,path:pa};}' +
-      'function __sm_single(pr,u){if(!pr)return false;var sc=u.protocol.replace(/:$/,"");' +
-      'if(pr.allUrls)return["http","https","file","ftp"].indexOf(sc)!==-1;' +
-      'if(pr.scheme==="*"){if(sc!=="http"&&sc!=="https")return false;}else if(pr.scheme!==sc)return false;' +
-      'if(sc!=="file"&&!__sm_host(pr.host,u.hostname))return false;' +
-      'return __sm_glob(pr.path).test(u.pathname+u.search);}' +
-      'function __sm_matches(pats,url){if(!Array.isArray(pats)||!pats.length)return false;var u;' +
-      'try{u=new URL(url);}catch(e){return false;}for(var i=0;i<pats.length;i++){' +
-      'var pr=__sm_parse(pats[i]);if(pr&&__sm_single(pr,u))return true;}return false;}';
+    const matcher = this._extMatcherJs();
     // Idempotent CSS injection: stable per-ext id, replace-in-place. Falls back to documentElement
     // when <head> doesn't exist yet (document-start), so CSS lands as early as possible.
     const cssHelper =
@@ -736,6 +745,9 @@ class CDPTab {
         await this.evaluate(liveExpr);
       } catch {}
     }
+    // 4. Bridge (B1): (re)register a dedicated isolated world + binding for each bridge extension.
+    //    Their JS runs there (not in the shared bootstraps above), on the NEXT navigation.
+    await this._syncBridgeWorlds(items);
   }
 
   // Fire-and-forget (re)registration of the active extensions, called from bootstrap() after
@@ -751,6 +763,462 @@ class CDPTab {
     }
     if (!items) return;
     this.injectExtensions(items).catch(() => {});
+  }
+
+  // ── Host<->page BRIDGE (B1) ───────────────────────────────────────────────────────────
+  // Supersedes the B0 spike. Transport: a `bridge:true` extension runs in its own isolated world
+  // (BRIDGE_WORLD_PREFIX + extId) where BRIDGE_BINDING is exposed; the page-side runtime posts
+  // {rid,op,args} through the binding, the host services it (B1: steersman.storage.*) and delivers
+  // the reply back into the same world via __steersman_bridge_resolve. Trusted attribution: the
+  // extId comes from the contextId->extId map, never the page payload.
+
+  // Self-contained port of match-pattern.js's matchesUrl, as an in-page JS string. Shared by the
+  // shared extension bootstrap AND the per-ext bridge bootstrap (keep in sync with match-pattern.js).
+  _extMatcherJs() {
+    return (
+      'function __sm_glob(g){var r="^";for(var i=0;i<g.length;i++){var c=g[i];' +
+      'r+=(c==="*")?".*":c.replace(/[.*+?^${}()|[\\]\\\\]/g,"\\\\$&");}return new RegExp(r+"$");}' +
+      'function __sm_host(ph,uh){if(ph==="*")return true;' +
+      'if(ph.indexOf("*.")===0){var b=ph.slice(2);return uh===b||uh.slice(-(b.length+1))==="."+b;}return uh===ph;}' +
+      'function __sm_parse(p){if(typeof p!=="string")return null;p=p.trim();if(!p)return null;' +
+      'if(p==="<all_urls>")return{allUrls:true};var s=p.indexOf("://");if(s===-1)return null;' +
+      'var sc=p.slice(0,s);if(!/^(\\*|https?|file|ftp)$/.test(sc))return null;var rest=p.slice(s+3);' +
+      'var sl=rest.indexOf("/");if(sl===-1)return null;var h=rest.slice(0,sl),pa=rest.slice(sl);' +
+      'if(pa[0]!=="/")return null;if(sc==="file"){if(h!=="")return null;}else{if(h==="")return null;' +
+      'if(h!=="*"){if(h.indexOf("*.")===0){var bb=h.slice(2);if(!bb||bb.indexOf("*")!==-1)return null;}' +
+      'else if(h.indexOf("*")!==-1)return null;}}return{allUrls:false,scheme:sc,host:h,path:pa};}' +
+      'function __sm_single(pr,u){if(!pr)return false;var sc=u.protocol.replace(/:$/,"");' +
+      'if(pr.allUrls)return["http","https","file","ftp"].indexOf(sc)!==-1;' +
+      'if(pr.scheme==="*"){if(sc!=="http"&&sc!=="https")return false;}else if(pr.scheme!==sc)return false;' +
+      'if(sc!=="file"&&!__sm_host(pr.host,u.hostname))return false;' +
+      'return __sm_glob(pr.path).test(u.pathname+u.search);}' +
+      'function __sm_matches(pats,url){if(!Array.isArray(pats)||!pats.length)return false;var u;' +
+      'try{u=new URL(url);}catch(e){return false;}for(var i=0;i<pats.length;i++){' +
+      'var pr=__sm_parse(pats[i]);if(pr&&__sm_single(pr,u))return true;}return false;}'
+    );
+  }
+
+  // Build the document-start source for ONE bridge extension's isolated world: the page-side bridge
+  // runtime (__sm_call/__steersman_bridge_resolve), the `steersman` object (mark + storage now;
+  // fetch/secrets stubbed to reject until B2/B3), then the extension's own JS body (URL-filtered,
+  // respecting runAt). The body is inlined raw (same CSP-bypass + syntax caveat as other extensions;
+  // the host-side syntax guard in panel.js already blocks unparseable saves).
+  _buildBridgeBootstrap(ext) {
+    const idJson = JSON.stringify(String(ext.id || '?'));
+    const matchesJson = JSON.stringify(Array.isArray(ext.matches) ? ext.matches : []);
+    const runAtJson = JSON.stringify(ext.runAt === 'document_start' ? 'document_start' : 'document_idle');
+    const body = typeof ext.js === 'string' ? ext.js : '';
+    return (
+      '(function(){try{' +
+      // Page-side bridge runtime.
+      'var __sm_seq=0;var __sm_pending={};' +
+      'function __sm_call(op,args,timeout){return new Promise(function(resolve,reject){' +
+      'var rid=++__sm_seq;var t=setTimeout(function(){if(__sm_pending[rid]){delete __sm_pending[rid];' +
+      'reject({type:"timeout",message:"bridge call timed out"});}},timeout||10000);' +
+      '__sm_pending[rid]={resolve:resolve,reject:reject,timer:t};' +
+      'try{window.' + BRIDGE_BINDING + '(JSON.stringify({rid:rid,op:op,args:args}));}' +
+      'catch(e){clearTimeout(t);delete __sm_pending[rid];reject({type:"host",message:"bridge unavailable: "+(e&&e.message)});}});}' +
+      'window.__steersman_bridge_resolve=function(rid,reply){var p=__sm_pending[rid];if(!p)return;' +
+      'clearTimeout(p.timer);delete __sm_pending[rid];' +
+      'if(reply&&reply.ok){p.resolve(reply.value);}else{p.reject((reply&&reply.error)||{type:"host",message:"bridge error"});}};' +
+      // The `steersman` object handed to the bridge body.
+      'var steersman={id:' + idJson + ',' +
+      'mark:function(n){try{if(n&&n.setAttribute)n.setAttribute("data-steersman-ext",' + idJson + ');}catch(e){}return n;},' +
+      'storage:{' +
+      'get:function(key){return __sm_call("storage.get",{key:String(key)});},' +
+      'set:function(key,value){return __sm_call("storage.set",{key:String(key),value:value});},' +
+      'remove:function(key){return __sm_call("storage.remove",{key:String(key)});},' +
+      'keys:function(){return __sm_call("storage.keys",{});}' +
+      '},' +
+      // Bridge fetch (B2): proxied cross-origin fetch. Resolves to a Response-like object; res.ok is
+      // computed page-side (a 404 resolves with ok:false, like real fetch). Rejects only on typed
+      // transport/guard errors (blocked/timeout/toobig/host/network). Page-side call timeout is set
+      // a little beyond the host cap so the host's own timeout error wins.
+      'fetch:function(url,options){options=options||{};' +
+      'var __to=((typeof options.timeoutMs==="number"&&options.timeoutMs>0)?options.timeoutMs:30000)+3000;' +
+      'return __sm_call("fetch",{url:String(url),options:options},__to).then(function(v){var st=v.status;' +
+      'return {ok:(st>=200&&st<300),status:st,statusText:v.statusText||"",headers:v.headers||{},body:v.body,' +
+      'json:function(){return Promise.resolve(v.body?JSON.parse(v.body):null);},' +
+      'text:function(){return Promise.resolve(v.body||"");}};});},' +
+      // Secrets (B3): OS-keychain-backed via SecretStorage host-side; values never touch page JS
+      // beyond what the module itself set/get. Prefer options.auth (below) so tokens never enter JS.
+      'secrets:{' +
+      'get:function(key){return __sm_call("secrets.get",{key:String(key)});},' +
+      'set:function(key,value){return __sm_call("secrets.set",{key:String(key),value:String(value)});},' +
+      'remove:function(key){return __sm_call("secrets.remove",{key:String(key)});}' +
+      '}' +
+      '};' +
+      // URL filter + run the body per runAt.
+      this._extMatcherJs() +
+      'var __sm_matchesList=' + matchesJson + ';var __sm_runAt=' + runAtJson + ';' +
+      'function __sm_runbody(){try{(function(steersman){\n' + body + '\n})(steersman);}' +
+      'catch(e){try{console.error("[Steersman bridge ext "+' + idJson + '+"]",e);}catch(_){}}}' +
+      'if(__sm_matches(__sm_matchesList,location.href)){' +
+      'if(__sm_runAt==="document_start"){__sm_runbody();}' +
+      'else if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",__sm_runbody);}' +
+      'else{__sm_runbody();}}' +
+      '}catch(e){}})()'
+    );
+  }
+
+  // Reconcile the per-extension bridge worlds for THIS tab against the active set. For each
+  // enabled+active `bridge:true` extension with a JS body: ensure its binding is registered (once
+  // per tab) and (re)register its per-ext-world document-start script. Extensions that are no longer
+  // bridge/active have their world registration removed (the leftover binding is harmless — its
+  // world is no longer created, so the binding is never exposed). Runs from injectExtensions, so it
+  // rides every refresh. LIMITATION: like isolated-world JS, a bridge body takes effect on the NEXT
+  // navigation (its world only exists from document-start onward), not live on the current page; its
+  // CSS still applies live via the main bootstrap. Swallows CDP errors; never throws.
+  async _syncBridgeWorlds(items) {
+    const list = Array.isArray(items) ? items : [];
+    const hasJs = (e) => e && typeof e.js === 'string' && e.js.trim();
+    const bridgeList = list.filter((e) => e && e.bridge && e.id && hasJs(e));
+    const wanted = new Set(bridgeList.map((e) => e.id));
+
+    // Drop world registrations for extensions no longer bridge/active.
+    for (const [extId, identifier] of Array.from(this._bridgeScriptIds.entries())) {
+      if (!wanted.has(extId)) {
+        try { await this.send('Page.removeScriptToEvaluateOnNewDocument', { identifier }); } catch {}
+        this._bridgeScriptIds.delete(extId);
+      }
+    }
+
+    // (Re)register each wanted bridge extension's world.
+    for (const ext of bridgeList) {
+      const world = BRIDGE_WORLD_PREFIX + ext.id;
+      // Bind once per tab per world name. FALLBACK SIGNAL: if the proxy rejects executionContextName
+      // bindings, this logs — that's the "named-world bridge unsupported" outcome (B1 = transport proof).
+      if (!this._bridgeBindings.has(ext.id)) {
+        try {
+          await this.send('Runtime.addBinding', { name: BRIDGE_BINDING, executionContextName: world });
+          this._bridgeBindings.add(ext.id);
+        } catch (e) {
+          this.log.appendLine('[Bridge] FALLBACK SIGNAL: addBinding(executionContextName="' + world + '") REJECTED by proxy: ' + (e && e.message ? e.message : e) + ' — named-world bridge unsupported on this transport.');
+        }
+      }
+      // Replace the per-ext-world document-start script (body/matches/runAt may have changed).
+      const prev = this._bridgeScriptIds.get(ext.id);
+      if (prev) {
+        try { await this.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: prev }); } catch {}
+        this._bridgeScriptIds.delete(ext.id);
+      }
+      try {
+        const r = await this.send('Page.addScriptToEvaluateOnNewDocument', {
+          source: this._buildBridgeBootstrap(ext),
+          worldName: world,
+        });
+        if (r && r.identifier) this._bridgeScriptIds.set(ext.id, r.identifier);
+      } catch (e) {
+        this.log.appendLine('[Bridge] register world failed for ' + world + ': ' + (e && e.message ? e.message : e));
+      }
+    }
+  }
+
+  // Maintain the TRUSTED contextId->extId map from execution-context lifecycle events, and route a
+  // bridge binding call. Called from handleMessage for every event (guarded on msg.method).
+  _onBridgeEvent(msg) {
+    try {
+      const p = msg.params || {};
+      if (msg.method === 'Runtime.executionContextCreated') {
+        const ctx = p.context || {};
+        if (typeof ctx.name === 'string' && ctx.name.indexOf(BRIDGE_WORLD_PREFIX) === 0) {
+          this._bridgeCtxToExt.set(ctx.id, ctx.name.slice(BRIDGE_WORLD_PREFIX.length));
+        }
+      } else if (msg.method === 'Runtime.executionContextDestroyed') {
+        if (p.executionContextId != null) this._bridgeCtxToExt.delete(p.executionContextId);
+      } else if (msg.method === 'Runtime.executionContextsCleared') {
+        this._bridgeCtxToExt.clear();
+      } else if (msg.method === 'Runtime.bindingCalled') {
+        if (p.name === BRIDGE_BINDING) this._onBridgeCall(p.executionContextId, p.payload);
+      }
+    } catch (e) {
+      try { this.log.appendLine('[Bridge] event error: ' + (e && e.message ? e.message : e)); } catch (_) {}
+    }
+  }
+
+  // Service one page->host bridge call. extId is TRUSTED (from the contextId map, not the payload).
+  _onBridgeCall(ctxId, payload) {
+    const extId = this._bridgeCtxToExt.get(ctxId);
+    let parsed = null;
+    try { parsed = JSON.parse(payload); } catch { parsed = null; }
+    const rid = parsed ? parsed.rid : undefined;
+    if (!extId) {
+      if (rid != null) this._resolveInContext(ctxId, rid, { ok: false, error: { type: 'host', message: 'unknown bridge context' } });
+      return;
+    }
+    if (!parsed || rid == null || typeof parsed.op !== 'string') {
+      if (rid != null) this._resolveInContext(ctxId, rid, { ok: false, error: { type: 'host', message: 'malformed bridge call' } });
+      return;
+    }
+    // _handleBridgeCall may return a value (storage) or a Promise (fetch); Promise.resolve unwraps
+    // both, and a thrown/rejected error becomes a clean host error rather than a hang.
+    Promise.resolve()
+      .then(() => this._handleBridgeCall(extId, parsed.op, parsed.args || {}))
+      .then((reply) => this._resolveInContext(ctxId, rid, reply))
+      .catch((e) => this._resolveInContext(ctxId, rid, { ok: false, error: { type: 'host', message: (e && e.message) ? e.message : 'bridge failed' } }));
+  }
+
+  // Op router: storage.* (B1, sync) + fetch (B2, async Promise). Anything else -> clean host error.
+  _handleBridgeCall(extId, op, args) {
+    if (op === 'fetch') return this._bridgeFetch(extId, args || {});
+    const store = this.getBridge ? this.getBridge() : null;
+    if (!store) return { ok: false, error: { type: 'host', message: 'bridge storage unavailable' } };
+    try {
+      if (op === 'storage.get') return { ok: true, value: store.get(extId, args.key) };
+      if (op === 'storage.set') { store.set(extId, args.key, args.value); return { ok: true, value: true }; }
+      if (op === 'storage.remove') { store.remove(extId, args.key); return { ok: true, value: true }; }
+      if (op === 'storage.keys') return { ok: true, value: store.keys(extId) };
+      // Secrets (B3) — async (SecretStorage); the extId is trusted. NEVER log a secret value.
+      if (op === 'secrets.get') return store.getSecret(extId, args.key).then((v) => ({ ok: true, value: v }));
+      if (op === 'secrets.set') return store.setSecret(extId, args.key, args.value).then(() => ({ ok: true, value: true }));
+      if (op === 'secrets.remove') return store.removeSecret(extId, args.key).then(() => ({ ok: true, value: true }));
+      return { ok: false, error: { type: 'host', message: 'unsupported op' } };
+    } catch (e) {
+      return { ok: false, error: { type: 'host', message: (e && e.message) ? e.message : 'bridge op failed' } };
+    }
+  }
+
+  // ── Bridge fetch (B2) — a cross-origin fetch proxied by the trusted host. Guards run BEFORE the
+  // request: http(s)-only scheme, per-extension host allowlist (bridgeHosts), and an SSRF check that
+  // rejects loopback/link-local/private resolved IPs (blocks Steersman's own localhost:3788 control
+  // API). Redirects are NOT auto-followed (see _bridgeFetch). NEVER-LOG: this path logs at most
+  // {extId, method, host, status} — never options.headers/body or the response body (they can carry
+  // Authorization tokens). Returns { ok:true, value:{status,statusText,headers,body} } or a typed
+  // error { ok:false, error:{type,message} }.
+  async _bridgeFetch(extId, args) {
+    const rawUrl = args && typeof args.url === 'string' ? args.url : '';
+    const options = (args && args.options && typeof args.options === 'object') ? args.options : {};
+
+    // Guard 1 — parse + scheme allowlist (http/https only).
+    let u;
+    try { u = new URL(rawUrl); } catch { return { ok: false, error: { type: 'blocked', message: 'invalid url' } }; }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+      return { ok: false, error: { type: 'blocked', message: 'scheme not allowed: ' + u.protocol } };
+    }
+
+    // Guard 2 — per-extension host allowlist (bridgeHosts from the TRUSTED extId's record). Empty ⇒
+    // fail-safe block. Host-glob (*.domain.com) reused from match-pattern.js for consistency.
+    const rec = this._bridgeExtRecord(extId);
+    const hosts = rec && Array.isArray(rec.bridgeHosts) ? rec.bridgeHosts : [];
+    if (!hosts.length || !hosts.some((hp) => hostMatches(hp, u.hostname))) {
+      return { ok: false, error: { type: 'blocked', message: 'host not in bridgeHosts: ' + u.hostname } };
+    }
+
+    // Guard 3 — SSRF: resolve the host and reject loopback/link-local/private ranges (blocks
+    // localhost:3788 and other internal services) even if the allowlist names them.
+    // RESIDUAL (B3 accepted): global fetch re-resolves the host itself, so a DNS-rebinding attacker
+    // could serve a public IP here and a private IP to the connection. Fully closing it needs an
+    // IP-pinning undici dispatcher (connect.lookup) with SNI=hostname — but undici is not require-able
+    // in this runtime (not a dependency; `Agent` isn't global) and an untested TLS pin is riskier than
+    // this small window, so we keep resolve-and-reject-private and document the residual (see report).
+    const ssrf = await this._ssrfCheck(u.hostname);
+    if (!ssrf.ok) {
+      return { ok: false, error: { type: 'blocked', message: 'blocked non-public address: ' + (ssrf.ip || u.hostname) } };
+    }
+
+    // Host-side auth attachment (B3): when options.auth is present the HOST reads the secret and
+    // builds the Authorization header, so the token never enters page JS. Host-side auth WINS — any
+    // caller-supplied Authorization in options.headers is dropped when options.auth is set.
+    // NEVER-LOG: the secret and the built header are never logged.
+    let authHeader = null;
+    if (options.auth && typeof options.auth === 'object') {
+      if (options.auth.type === 'basic') {
+        const store = this.getBridge ? this.getBridge() : null;
+        if (!store) return { ok: false, error: { type: 'host', message: 'secret storage unavailable' } };
+        let secret;
+        try { secret = await store.getSecret(extId, options.auth.secretRef); } catch (_) { secret = undefined; }
+        if (secret == null) {
+          return { ok: false, error: { type: 'host', message: 'secret not found: ' + String(options.auth.secretRef) } };
+        }
+        const user = options.auth.username != null ? String(options.auth.username) : '';
+        authHeader = 'Basic ' + Buffer.from(user + ':' + secret).toString('base64');
+      } else {
+        return { ok: false, error: { type: 'host', message: 'unsupported auth type: ' + String(options.auth.type) } };
+      }
+    }
+    const outHeaders = this._buildFetchHeaders(options.headers, authHeader);
+
+    const method = (options.method != null ? String(options.method) : 'GET') || 'GET';
+    const timeoutMs = Math.min(
+      FETCH_TIMEOUT_CAP,
+      typeof options.timeoutMs === 'number' && options.timeoutMs > 0 ? options.timeoutMs : FETCH_TIMEOUT_CAP
+    );
+    const controller = new AbortController();
+    const timer = setTimeout(() => { try { controller.abort(); } catch (_) {} }, timeoutMs);
+
+    let res;
+    try {
+      res = await fetch(u.href, {
+        method,
+        headers: Object.keys(outHeaders).length ? outHeaders : undefined,
+        body: options.body != null ? options.body : undefined,
+        // Redirects are NOT auto-followed: undici would re-request without re-applying our
+        // allowlist/SSRF guards (a redirect-based SSRF bypass). 'manual' yields an opaqueredirect
+        // (status 0), surfaced below as a typed 'blocked' error. (Following-with-revalidation is a
+        // future enhancement; global fetch's manual mode hides Location, so it can't be done here.)
+        redirect: 'manual',
+        signal: controller.signal,
+      });
+    } catch (e) {
+      clearTimeout(timer);
+      if (e && e.name === 'AbortError') return { ok: false, error: { type: 'timeout', message: 'request timed out' } };
+      this.log.appendLine('[Bridge] fetch network error ext=' + extId + ' host=' + u.hostname);
+      return { ok: false, error: { type: 'network', message: (e && e.message) ? e.message : 'network error' } };
+    }
+
+    if (res.status === 0 || res.type === 'opaqueredirect') {
+      clearTimeout(timer);
+      this.log.appendLine('[Bridge] fetch ext=' + extId + ' ' + method + ' host=' + u.hostname + ' -> redirect (not followed)');
+      return { ok: false, error: { type: 'blocked', message: 'redirect not followed (B2 does not auto-follow redirects; request the final URL)' } };
+    }
+
+    // Early size reject via Content-Length (the streaming cap below is the real guard).
+    const clen = parseInt(res.headers.get('content-length') || '', 10);
+    if (Number.isFinite(clen) && clen > FETCH_SIZE_CAP) {
+      clearTimeout(timer);
+      try { controller.abort(); } catch (_) {}
+      return { ok: false, error: { type: 'toobig', message: 'response exceeds size cap' } };
+    }
+
+    let body;
+    try {
+      body = await this._readCappedText(res, controller);
+    } catch (e) {
+      clearTimeout(timer);
+      if (e && e.__toobig) return { ok: false, error: { type: 'toobig', message: 'response exceeds size cap' } };
+      if (e && e.name === 'AbortError') return { ok: false, error: { type: 'timeout', message: 'request timed out' } };
+      return { ok: false, error: { type: 'network', message: (e && e.message) ? e.message : 'body read error' } };
+    }
+    clearTimeout(timer);
+
+    const headers = this._safelistHeaders(res.headers);
+    // NEVER-LOG: host only (not the full URL/query), no headers/body.
+    this.log.appendLine('[Bridge] fetch ext=' + extId + ' ' + method + ' host=' + u.hostname + ' -> ' + res.status);
+    return { ok: true, value: { status: res.status, statusText: res.statusText || '', headers, body } };
+  }
+
+  // Look up the TRUSTED extId's active extension record (for bridgeHosts). Reads the active set the
+  // SessionManager exposes via getExtensions (already master+enabled gated).
+  _bridgeExtRecord(extId) {
+    try {
+      const list = this.getExtensions ? this.getExtensions() : null;
+      if (Array.isArray(list)) return list.find((e) => e && e.id === extId) || null;
+    } catch (_) {}
+    return null;
+  }
+
+  // Merge caller headers with a host-built Authorization (B3). When authHeader is set, any
+  // caller-supplied Authorization (case-insensitive) is dropped so host-side auth always wins.
+  _buildFetchHeaders(callerHeaders, authHeader) {
+    const out = {};
+    if (callerHeaders && typeof callerHeaders === 'object') {
+      for (const k of Object.keys(callerHeaders)) {
+        if (authHeader && k.toLowerCase() === 'authorization') continue;
+        out[k] = callerHeaders[k];
+      }
+    }
+    if (authHeader) out['Authorization'] = authHeader;
+    return out;
+  }
+
+  // Only a tiny response-header safelist crosses back to the page — NEVER set-cookie.
+  _safelistHeaders(headers) {
+    const allow = ['content-type', 'content-length', 'etag', 'last-modified', 'link'];
+    const out = {};
+    try {
+      for (const name of allow) {
+        const v = headers.get(name);
+        if (v != null) out[name] = v;
+      }
+    } catch (_) {}
+    return out;
+  }
+
+  // Read the response body as UTF-8 text with a hard size cap, aborting if exceeded.
+  async _readCappedText(res, controller) {
+    const cap = FETCH_SIZE_CAP;
+    if (res.body && typeof res.body.getReader === 'function') {
+      const reader = res.body.getReader();
+      const chunks = [];
+      let total = 0;
+      for (;;) {
+        const step = await reader.read();
+        if (step.done) break;
+        if (step.value) {
+          total += step.value.length;
+          if (total > cap) {
+            try { controller.abort(); } catch (_) {}
+            try { reader.cancel(); } catch (_) {}
+            const err = new Error('too big'); err.__toobig = true; throw err;
+          }
+          chunks.push(Buffer.from(step.value));
+        }
+      }
+      return Buffer.concat(chunks).toString('utf8');
+    }
+    const txt = await res.text();
+    if (txt.length > cap) { const err = new Error('too big'); err.__toobig = true; throw err; }
+    return txt;
+  }
+
+  // SSRF check: resolve the host to all IPs and reject if ANY is loopback/link-local/private (a
+  // DNS-rebinding-conservative stance). A DNS failure fails safe (blocked). NOTE: because global
+  // fetch re-resolves the host itself, there is a small residual DNS-rebinding window between this
+  // check and the connection — acceptable for B2; a future pin-to-IP would close it.
+  async _ssrfCheck(hostname) {
+    let addrs;
+    try {
+      addrs = await dns.promises.lookup(hostname, { all: true });
+    } catch (_) {
+      return { ok: false, ip: hostname };
+    }
+    for (const a of addrs) {
+      if (this._isPrivateIp(a.address, a.family)) return { ok: false, ip: a.address };
+    }
+    return { ok: true };
+  }
+
+  _isPrivateIp(ip, family) {
+    if (!ip) return true; // fail-safe
+    const s = String(ip).toLowerCase();
+    if (family === 6 || s.indexOf(':') !== -1) {
+      if (s === '::1' || s === '::') return true;                 // loopback / unspecified
+      const m = s.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/);          // IPv4-mapped
+      if (m) return this._isPrivateIp4(m[1]);
+      if (s.startsWith('fe8') || s.startsWith('fe9') || s.startsWith('fea') || s.startsWith('feb')) return true; // link-local fe80::/10
+      if (s.startsWith('fc') || s.startsWith('fd')) return true;  // unique-local fc00::/7
+      return false;
+    }
+    return this._isPrivateIp4(s);
+  }
+
+  _isPrivateIp4(ip) {
+    const p = String(ip).split('.').map((n) => parseInt(n, 10));
+    if (p.length !== 4 || p.some((n) => !(n >= 0 && n <= 255))) return true; // malformed -> fail-safe
+    const a = p[0], b = p[1];
+    if (a === 0) return true;                       // 0.0.0.0/8 "this host"
+    if (a === 127) return true;                     // loopback
+    if (a === 10) return true;                      // private
+    if (a === 172 && b >= 16 && b <= 31) return true; // private
+    if (a === 192 && b === 168) return true;        // private
+    if (a === 169 && b === 254) return true;        // link-local
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT 100.64/10
+    if (a >= 224) return true;                      // multicast/reserved
+    return false;
+  }
+
+  // Deliver a reply back into the EXACT isolated world that made the call (resolves its pending
+  // promise). rid + reply are JSON-embedded; contextId targets the bridge world.
+  async _resolveInContext(ctxId, rid, reply) {
+    try {
+      await this.send('Runtime.evaluate', {
+        expression: '__steersman_bridge_resolve(' + JSON.stringify(rid) + ',' + JSON.stringify(reply) + ')',
+        contextId: ctxId,
+        returnByValue: true,
+      });
+    } catch (e) {
+      try { this.log.appendLine('[Bridge] resolve failed (ctx=' + ctxId + ', rid=' + rid + '): ' + (e && e.message ? e.message : e)); } catch (_) {}
+    }
   }
 
   // Ids of the currently-active extensions marked hideFromAgent (Phase 4). Read from the

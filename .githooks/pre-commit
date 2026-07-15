@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Project Steersman — pre-commit lockfile-version safety net.
+#
+# package.json is the SOLE source of truth for the version (there is NO VERSION file). This hook
+# does ONE thing: keep package-lock.json's top-level version from drifting behind package.json's.
+# Before each commit, if package-lock.json's version differs from package.json's, rewrite the
+# lockfile to match and stage it. It NEVER touches package.json — that is the source of truth and
+# is edited only by a human (or `npm version`).
+#
+# No-op when they already match. Never blocks a commit: every failure path exits 0 and leaves the
+# lockfile as-is.
+#
+# Skip a single run with:   STEERSMAN_SKIP_HOOK=1 git commit ...
+# Note: `git commit --no-verify` also skips this hook (unlike post-commit).
+set -u
+
+[ -n "${STEERSMAN_SKIP_HOOK:-}" ] && exit 0
+
+# Run from the repo root regardless of where git invoked us.
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+cd "$repo_root" || exit 0
+
+[ -f package.json ] || exit 0
+[ -f package-lock.json ] || exit 0
+command -v node >/dev/null 2>&1 || exit 0
+
+# Version from package.json (the source of truth).
+ver="$(node -p "require('./package.json').version" 2>/dev/null)"
+[ -n "${ver:-}" ] || exit 0
+
+# Current top-level version recorded in the lockfile.
+lockver="$(node -pe 'JSON.parse(require("fs").readFileSync("package-lock.json","utf8")).version||""' 2>/dev/null)"
+
+# Already in sync → silent no-op.
+[ "$lockver" = "$ver" ] && exit 0
+
+# Rewrite ONLY the first two "version": "..." strings — the root version and packages[""].version;
+# dependency versions come after and are left untouched. Node exit 2 == nothing changed (already in
+# sync or no match), which we treat as a clean no-op.
+node -e '
+  const fs = require("fs");
+  const ver = process.argv[1];
+  const p = fs.readFileSync("package-lock.json", "utf8");
+  let n = 0;
+  const out = p.replace(/("version"\s*:\s*")[^"]*(")/g, (m, a, b) => (n++ < 2) ? a + ver + b : m);
+  if (out === p) process.exit(2);   // nothing changed
+  fs.writeFileSync("package-lock.json", out);
+' "$ver" 2>/dev/null
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  git add package-lock.json 2>/dev/null || true
+  echo "[steersman-release] pre-commit: synced package-lock.json version -> $ver"
+elif [ "$rc" -eq 2 ]; then
+  :   # already in sync — silent no-op
+else
+  echo "[steersman-release] pre-commit: could not sync package-lock.json version (left unchanged)."
+fi
+
+exit 0
