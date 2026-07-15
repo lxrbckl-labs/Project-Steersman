@@ -321,6 +321,49 @@
     );
   }
 
+  function keyIcon() {
+    // Outline key glyph for the "set GitHub token" button — stroke-based like
+    // packageIcon(), so it bypasses svgIcon's fill paths and is built directly.
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('width', '13');
+    svg.setAttribute('height', '13');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('fill', 'none');
+    svg.setAttribute('stroke', 'currentColor');
+    svg.setAttribute('stroke-width', '1.9');
+    svg.setAttribute('stroke-linecap', 'round');
+    svg.setAttribute('stroke-linejoin', 'round');
+    svg.setAttribute('aria-hidden', 'true');
+    [
+      'M15.5 8.5a4 4 0 1 0-4.9 3.9L4 19v2h2l1-1h2v-2h2v-2l1.6-1.6a4 4 0 0 0 2.9-3.9z',
+      'M17 6.5h.01'
+    ].forEach(function (d) {
+      const p = document.createElementNS(NS, 'path');
+      p.setAttribute('d', d);
+      svg.appendChild(p);
+    });
+    return svg;
+  }
+
+  // Set/clear the GitHub token the host uses to authenticate the update check against
+  // the private release repo. The host collects the value via a native masked input box
+  // (setUpdateToken handler) and stores it in SecretStorage — the token never touches the
+  // webview. Reuses the framed square style of the GitHub button.
+  function tokenButton() {
+    return h(
+      'button',
+      {
+        className: 'icon-button settings-github-btn',
+        type: 'button',
+        dataAction: 'setUpdateToken',
+        title: 'Set / clear the GitHub token for the update check (private repo)',
+        ariaLabel: 'Set GitHub token for update check'
+      },
+      keyIcon()
+    );
+  }
+
   function chevronIcon() {
     // Drawn (not text-glyph) right-pointing triangle, kept roughly square in
     // its bounding box (8 wide x 10 tall here) instead of the old '▸' text
@@ -1196,7 +1239,9 @@
       stateClass = 'update-uptodate';
       title = 'Up to date';
     } else if (updateState.status === 'error') {
-      label = 'check failed';
+      // Show the host's actual reason ('no releases found' / 'offline' / 'check
+      // failed') rather than a blanket "check failed" that hides what went wrong.
+      label = updateState.error || 'check failed';
       stateClass = 'update-error';
       title = updateState.error || 'Check failed — click to retry';
     } else {
@@ -1234,6 +1279,7 @@
       'div', { className: 'settings-topbar' },
       h('span', { className: 'settings-title' }, 'PROJECT STEERSMAN'),
       updateBadge(),
+      tokenButton(),
       githubButton()
     );
     wrap.appendChild(topbar);
@@ -1511,6 +1557,10 @@
       render();
     } else if (action === 'openReleases') {
       if (updateState.releasesUrl) { post({ type: 'openExternal', url: updateState.releasesUrl }); }
+    } else if (action === 'setUpdateToken') {
+      // Host opens a native masked input box and stores the value in SecretStorage;
+      // no token value passes through the webview.
+      post({ type: 'setUpdateToken' });
     } else if (action === 'openGithub') {
       post({ type: 'openExternal', url: GITHUB_URL });
     } else if (action === 'toggleSection') {

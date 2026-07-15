@@ -12,59 +12,31 @@ const VIEW_TYPE = 'projectSteersmanPanel';
 // GitHub repo backing the Settings "check for updates" badge; the webview can't fetch
 // external URLs under CSP, so the host does the GitHub release lookup on its behalf.
 const REPO = 'lxRbckl/Project-Steersman';
+// SecretStorage key for the optional GitHub token used to authenticate the update-check
+// against a private repo. Flat string->string keychain namespaced like the bridge tier
+// (bridge-store.js `steersman.bridge.secret.*`); the value is host-side only and NEVER logged.
+const GITHUB_TOKEN_SECRET_KEY = 'steersman.updateCheck.githubToken';
+// Pinned GitHub REST API version (recommended header alongside the vnd.github+json Accept).
+const GITHUB_API_VERSION = '2022-11-28';
 
-class ProjectSteersmanPanel {
+// Host-agnostic controller: owns the webview HTML shell + the full host<->webview
+// message protocol + every state push. It operates on a plain `webview` object, whose
+// API is identical between a WebviewPanel (.webview) and a WebviewView (.webview):
+// .html, .options, .asWebviewUri, .cspSource, .onDidReceiveMessage, .postMessage.
+// The host-specific lifecycle (panel reveal/viewColumn/iconPath + serializer, or the
+// sidebar view's visibility) lives in ProjectSteersmanPanel / ProjectSteersmanViewProvider
+// below; each constructs one controller, calls wire() once, and dispose() on teardown.
+class SteersmanWebviewController {
   // deps: { manager, scriptRunner, getPort: () => number|null, log, extensionUri,
-  //         focusEditorGroupByColumn: async (viewColumn) => void }
-  // Open the panel, revealing the existing singleton if one is already open.
-  static createOrShow(deps) {
-    const column = (vscode.window.activeTextEditor && vscode.window.activeTextEditor.viewColumn) || vscode.ViewColumn.Active;
-    if (ProjectSteersmanPanel.current) {
-      ProjectSteersmanPanel.current._panel.reveal(column);
-      return ProjectSteersmanPanel.current;
-    }
-    const panel = vscode.window.createWebviewPanel(
-      VIEW_TYPE,
-      'Project Steersman',
-      column,
-      ProjectSteersmanPanel._webviewOptions(deps.extensionUri)
-    );
-    ProjectSteersmanPanel.current = new ProjectSteersmanPanel(panel, deps);
-    return ProjectSteersmanPanel.current;
-  }
-
-  // Rehydrate a panel restored by the serializer after a window reload, reusing the
-  // same singleton/wiring as a fresh open. Dedups if one is already live.
-  static revive(panel, deps) {
-    if (ProjectSteersmanPanel.current) {
-      panel.dispose();
-      ProjectSteersmanPanel.current._panel.reveal();
-      return ProjectSteersmanPanel.current;
-    }
-    panel.webview.options = ProjectSteersmanPanel._webviewOptions(deps.extensionUri);
-    ProjectSteersmanPanel.current = new ProjectSteersmanPanel(panel, deps);
-    return ProjectSteersmanPanel.current;
-  }
-
-  // Shared webview options; retainContextWhenHidden keeps the DOM/JS alive while backgrounded.
-  static _webviewOptions(extensionUri) {
-    return {
-      enableScripts: true,
-      retainContextWhenHidden: true,
-      localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'media')],
-    };
-  }
-
-  constructor(panel, deps) {
-    this._panel = panel;
+  //         focusEditorGroupByColumn: async (viewColumn) => void, ...stores/token/secrets }
+  constructor(webview, deps) {
+    this._webview = webview;
     this._manager = deps.manager;
     this._scriptRunner = deps.scriptRunner;
     this._getPort = deps.getPort;
     this._log = deps.log;
     this._extensionUri = deps.extensionUri;
     this._focusEditorGroupByColumn = deps.focusEditorGroupByColumn;
-    // Editor-tab icon shown in the tab strip for this panel.
-    this._panel.iconPath = vscode.Uri.joinPath(this._extensionUri, 'media', 'icon.png');
     // Shared, hoisted capability config (one window = one in-memory, per-instance config);
     // the extension host owns it so HTTP /capabilities reads the same instance the Settings
     // handlers below mutate. Falls back to a fresh one only if a caller omits it.
@@ -82,35 +54,40 @@ class ProjectSteersmanPanel {
     // Loopback auth token the HTTP API now requires; included in the copy-prompt so manual/
     // direct HTTP driving still works. Local/ephemeral only — never written to a log line.
     this._token = deps.token || null;
+    // VS Code SecretStorage (optional) — backs the update-check GitHub token. Never logged.
+    this._secrets = deps.secrets || null;
     // Current extension version (package.json), pushed into state so the Settings badge
     // can render it and the checkForUpdate handler has a local version to compare against.
     this._version = deps.version || null;
     this._disposed = false;
     this._disposables = [];
+  }
 
-    this._panel.webview.html = this._getHtml(this._panel.webview);
+  // Bucket the host passes to its own VS Code event registrations (view-state/visibility,
+  // dispose) so those subscriptions tear down together with the controller.
+  get disposables() {
+    return this._disposables;
+  }
 
-    this._panel.webview.onDidReceiveMessage(
+  // Install the HTML shell, attach the webview->host message listener, and start pushing
+  // fresh state on every session-set change. Called once by each host after construction.
+  wire() {
+    this._webview.html = this._getHtml(this._webview);
+    this._webview.onDidReceiveMessage(
       (msg) => this._handleMessage(msg),
       undefined,
       this._disposables
     );
-
-    // Repaint when the tab becomes visible again (retained context can miss updates).
-    this._panel.onDidChangeViewState(
-      () => {
-        if (this._panel.visible) this._postState();
-      },
-      undefined,
-      this._disposables
-    );
-
-    // Push fresh state on every session-set change while the panel is alive.
+    // Push fresh state on every session-set change while the controller is alive.
     this._disposables.push(
       this._manager.onDidChangeSessions(() => this._postState())
     );
+  }
 
-    this._panel.onDidDispose(() => this._dispose(), undefined, this._disposables);
+  // Public repaint hook for a host that just became visible again (retained context can miss
+  // updates while backgrounded); mirrors the old panel onDidChangeViewState repaint.
+  pushState() {
+    this._postState();
   }
 
   // ---- Message handling (webview -> host) ----
@@ -353,6 +330,9 @@ class ProjectSteersmanPanel {
       case 'checkForUpdate':
         await this._checkForUpdate();
         break;
+      case 'setUpdateToken':
+        await this._setUpdateToken();
+        break;
       default:
         this._log.appendLine('[Panel] unhandled message: ' + type);
         break;
@@ -363,34 +343,70 @@ class ProjectSteersmanPanel {
   // webview. Host-side only (the webview can't reach api.github.com under its CSP). Bounded
   // by a 6s AbortController timeout; every failure mode (network error, timeout, non-2xx,
   // no releases yet, malformed body) is caught and reported as a short error string instead
-  // of throwing, so a flaky connection never breaks the Settings panel.
+  // of throwing, so a flaky connection never breaks the Settings panel. When a GitHub token
+  // is stored (SecretStorage, via _setUpdateToken) it authenticates the request so a private
+  // repo resolves; without one the check stays anonymous.
   async _checkForUpdate() {
     const current = this._version || '0.0.0';
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 6000);
+    const headers = {
+      'Accept': 'application/vnd.github+json',
+      'User-Agent': 'project-steersman',
+      'X-GitHub-Api-Version': GITHUB_API_VERSION,
+    };
+    // Authenticate when the operator has stored a token (needed for a private repo). The
+    // value is attached to the header here and never logged; absent, the check is anonymous
+    // and degrades to an honest 'no releases found' rather than a false success.
+    const token = await this._getUpdateToken();
+    if (token) { headers['Authorization'] = 'Bearer ' + token; }
     try {
+      let latest = null;
+      let releasesUrl = `https://github.com/${REPO}/releases`;
       const res = await fetch(`https://api.github.com/repos/${REPO}/releases/latest`, {
-        headers: { 'Accept': 'application/vnd.github+json', 'User-Agent': 'project-steersman' },
+        headers,
         signal: controller.signal,
       });
-      if (res.status === 404) {
-        this._post({ type: 'updateStatus', current, error: 'no releases found' });
+      if (res.ok) {
+        // Parsing/shape failures here (bad JSON, missing tag_name) are a bad API response,
+        // not a network problem — report 'check failed', not 'offline'.
+        try {
+          const data = await res.json();
+          const tag = typeof data.tag_name === 'string' ? data.tag_name : '';
+          latest = tag.replace(/^v/, '').trim();
+          if (data.html_url) { releasesUrl = data.html_url; }
+        } catch (e) {
+          this._log.appendLine('[Panel] checkForUpdate: malformed response body: ' + (e && e.message ? e.message : e));
+          this._post({ type: 'updateStatus', current, error: 'check failed' });
+          return;
+        }
+      } else if (res.status === 404) {
+        // No published GitHub *Release* — but this project ships versions as git *tags*
+        // (see the vX.Y.Z tags), so fall back to the newest tag before giving up; a
+        // tag-only repo is the normal case here, not a failure.
+        this._log.appendLine('[Panel] checkForUpdate: releases/latest returned 404 — falling back to tags');
+        latest = await this._fetchLatestTag(headers, controller.signal);
+        if (latest == null) {
+          this._log.appendLine('[Panel] checkForUpdate: no releases or tags visible for ' + REPO + ' (private repo or no tags?)');
+          this._post({ type: 'updateStatus', current, error: 'no releases found' });
+          return;
+        }
+      } else if (res.status === 401 || res.status === 403) {
+        // Distinguish a bad/insufficient/expired token (auth) from an exhausted rate
+        // limit: GitHub sends x-ratelimit-remaining: 0 on rate-limit 403s. Never report
+        // "check failed" for these — the operator needs to know which knob to turn. The
+        // token value is never logged, only whether one was present.
+        const remaining = res.headers.get('x-ratelimit-remaining');
+        const rateLimited = res.status === 403 && remaining === '0';
+        const err = rateLimited ? 'rate limited — try later' : 'auth failed — check token';
+        this._log.appendLine('[Panel] checkForUpdate: GitHub ' + res.status +
+          (rateLimited ? ' rate-limit exhausted' : ' auth/forbidden') +
+          ' (x-ratelimit-remaining=' + (remaining == null ? 'n/a' : remaining) +
+          ', token ' + (token ? 'present' : 'absent') + ')');
+        this._post({ type: 'updateStatus', current, error: err });
         return;
-      }
-      if (!res.ok) {
+      } else {
         this._log.appendLine('[Panel] checkForUpdate: GitHub returned ' + res.status);
-        this._post({ type: 'updateStatus', current, error: 'check failed' });
-        return;
-      }
-      // Parsing/shape failures here (bad JSON, missing tag_name) are a bad API response,
-      // not a network problem — report 'check failed', not 'offline'.
-      let data, latest;
-      try {
-        data = await res.json();
-        const tag = typeof data.tag_name === 'string' ? data.tag_name : '';
-        latest = tag.replace(/^v/, '').trim();
-      } catch (e) {
-        this._log.appendLine('[Panel] checkForUpdate: malformed response body: ' + (e && e.message ? e.message : e));
         this._post({ type: 'updateStatus', current, error: 'check failed' });
         return;
       }
@@ -400,7 +416,6 @@ class ProjectSteersmanPanel {
         this._post({ type: 'updateStatus', current, error: 'check failed' });
         return;
       }
-      const releasesUrl = data.html_url || `https://github.com/${REPO}/releases`;
       const cmp = this._compareSemver(latest, current);
       this._post({
         type: 'updateStatus',
@@ -416,6 +431,75 @@ class ProjectSteersmanPanel {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  // Fallback for repos that publish versions as git tags without cutting GitHub
+  // Releases: fetch the tag list and return the highest plain dotted-numeric tag
+  // (leading "v" stripped), or null if the list is unreachable/empty. A network
+  // error throws and bubbles to the caller's catch, which reports 'offline'.
+  async _fetchLatestTag(headers, signal) {
+    const res = await fetch(`https://api.github.com/repos/${REPO}/tags`, { headers, signal });
+    if (!res.ok) {
+      this._log.appendLine('[Panel] checkForUpdate: tags lookup returned ' + res.status);
+      return null;
+    }
+    const tags = await res.json();
+    if (!Array.isArray(tags)) { return null; }
+    let best = null;
+    for (const t of tags) {
+      const name = t && typeof t.name === 'string' ? t.name.replace(/^v/, '').trim() : '';
+      if (!/^\d+(\.\d+)*$/.test(name)) { continue; }
+      if (best == null || this._compareSemver(name, best) > 0) { best = name; }
+    }
+    return best;
+  }
+
+  // Read the stored GitHub token from SecretStorage. Returns null when none is set, when
+  // SecretStorage is unavailable, or on any read error — never throws, never logs the value.
+  async _getUpdateToken() {
+    if (!this._secrets) { return null; }
+    try {
+      const v = await this._secrets.get(GITHUB_TOKEN_SECRET_KEY);
+      return v || null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Prompt (native masked input box) for the GitHub token used to authenticate the update
+  // check, then store it in SecretStorage. Submitting an empty value clears the saved token.
+  // The value is collected by VS Code directly (never enters the webview DOM or postMessage)
+  // and is never logged — only the fact that a token was saved/cleared.
+  async _setUpdateToken() {
+    if (!this._secrets) {
+      vscode.window.showWarningMessage('Project Steersman: secure storage is unavailable — cannot save an update-check token.');
+      return;
+    }
+    const existing = await this._getUpdateToken();
+    const entered = await vscode.window.showInputBox({
+      title: 'Project Steersman — GitHub token for update check',
+      prompt: 'Paste a GitHub personal-access token with read access to ' + REPO + '. Submit an empty value to clear the saved token.',
+      password: true,
+      ignoreFocusOut: true,
+      placeHolder: existing ? 'A token is already saved — type to replace, or submit empty to clear' : 'ghp_… or github_pat_…',
+    });
+    if (entered === undefined) { return; } // dismissed — leave the current token untouched
+    const trimmed = entered.trim();
+    if (!trimmed) {
+      try { await this._secrets.delete(GITHUB_TOKEN_SECRET_KEY); } catch { /* ignore */ }
+      this._log.appendLine('[Panel] update-check GitHub token cleared');
+      vscode.window.showInformationMessage('Project Steersman: update-check token cleared (checks are now anonymous).');
+      return;
+    }
+    try {
+      await this._secrets.store(GITHUB_TOKEN_SECRET_KEY, trimmed);
+    } catch (e) {
+      this._log.appendLine('[Panel] update-check token save failed: ' + (e && e.message ? e.message : e));
+      vscode.window.showErrorMessage('Project Steersman: failed to save the update-check token.');
+      return;
+    }
+    this._log.appendLine('[Panel] update-check GitHub token saved');
+    vscode.window.showInformationMessage('Project Steersman: update-check token saved. Click the update badge to check now.');
   }
 
   // Numeric, part-by-part semver compare (missing trailing parts treated as 0). Returns a
@@ -626,7 +710,7 @@ class ProjectSteersmanPanel {
   // dot orange while an agent is actively driving that tab) so the webview can render the
   // per-row dropdown + status.
   _postState() {
-    if (!this._panel) return;
+    if (this._disposed) return;
     const port = this._getPort ? this._getPort() : null;
     const sessions = this._manager.list().map((s) => {
       const full = this._manager.get(s.id);
@@ -636,7 +720,7 @@ class ProjectSteersmanPanel {
       };
     });
     const scripts = this._scriptRunner ? this._scriptRunner.listScripts() : [];
-    const coverUri = this._panel.webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'cover.png')).toString();
+    const coverUri = this._webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'cover.png')).toString();
     this._post({ type: 'state', sessions, port: port == null ? null : port, scripts, version: this._version || null, coverUri });
   }
 
@@ -788,12 +872,13 @@ class ProjectSteersmanPanel {
 
   _post(message) {
     if (this._disposed) return;
-    this._panel.webview.postMessage(message);
+    this._webview.postMessage(message);
   }
 
-  _dispose() {
+  // Tear down every tracked subscription (message listener, session-change push, and the
+  // host's own view-state/dispose registrations). Idempotent; the host clears any singleton.
+  dispose() {
     this._disposed = true;
-    ProjectSteersmanPanel.current = undefined;
     while (this._disposables.length) {
       const d = this._disposables.pop();
       if (d) d.dispose();
@@ -827,7 +912,128 @@ class ProjectSteersmanPanel {
   }
 }
 
+// WebviewPanel host: the editor-area "Open Panel" experience. Owns the panel-specific
+// lifecycle (singleton reveal, serializer revive, tab iconPath, view-state repaint) and
+// delegates all UI + messaging to a shared SteersmanWebviewController. Behavior here is
+// unchanged from before the sidebar existed.
+class ProjectSteersmanPanel {
+  // deps: { manager, scriptRunner, getPort: () => number|null, log, extensionUri,
+  //         focusEditorGroupByColumn: async (viewColumn) => void, ...stores/token/secrets }
+  // Open the panel, revealing the existing singleton if one is already open.
+  static createOrShow(deps) {
+    const column = (vscode.window.activeTextEditor && vscode.window.activeTextEditor.viewColumn) || vscode.ViewColumn.Active;
+    if (ProjectSteersmanPanel.current) {
+      ProjectSteersmanPanel.current._panel.reveal(column);
+      return ProjectSteersmanPanel.current;
+    }
+    const panel = vscode.window.createWebviewPanel(
+      VIEW_TYPE,
+      'Project Steersman',
+      column,
+      ProjectSteersmanPanel._webviewOptions(deps.extensionUri)
+    );
+    ProjectSteersmanPanel.current = new ProjectSteersmanPanel(panel, deps);
+    return ProjectSteersmanPanel.current;
+  }
+
+  // Rehydrate a panel restored by the serializer after a window reload, reusing the
+  // same singleton/wiring as a fresh open. Dedups if one is already live.
+  static revive(panel, deps) {
+    if (ProjectSteersmanPanel.current) {
+      panel.dispose();
+      ProjectSteersmanPanel.current._panel.reveal();
+      return ProjectSteersmanPanel.current;
+    }
+    panel.webview.options = ProjectSteersmanPanel._webviewOptions(deps.extensionUri);
+    ProjectSteersmanPanel.current = new ProjectSteersmanPanel(panel, deps);
+    return ProjectSteersmanPanel.current;
+  }
+
+  // Panel webview options; retainContextWhenHidden keeps the DOM/JS alive while backgrounded.
+  static _webviewOptions(extensionUri) {
+    return {
+      enableScripts: true,
+      retainContextWhenHidden: true,
+      localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'media')],
+    };
+  }
+
+  constructor(panel, deps) {
+    this._panel = panel;
+    // Editor-tab icon shown in the tab strip for this panel (panel-only; the sidebar view
+    // gets its icon from the package.json viewsContainers contribution instead).
+    this._panel.iconPath = vscode.Uri.joinPath(deps.extensionUri, 'media', 'icon.png');
+    this._controller = new SteersmanWebviewController(panel.webview, deps);
+    this._controller.wire();
+
+    // Repaint when the tab becomes visible again (retained context can miss updates).
+    this._panel.onDidChangeViewState(
+      () => { if (this._panel.visible) this._controller.pushState(); },
+      undefined,
+      this._controller.disposables
+    );
+    this._panel.onDidDispose(() => this._dispose(), undefined, this._controller.disposables);
+  }
+
+  // Public re-push hook for external triggers (e.g. the central-scripts fs.watch in
+  // extension.js): re-scan and post fresh state. Guarded no-op once disposed.
+  refresh() {
+    this._controller.refresh();
+  }
+
+  _dispose() {
+    ProjectSteersmanPanel.current = undefined;
+    this._controller.dispose();
+  }
+}
+
 ProjectSteersmanPanel.viewType = VIEW_TYPE;
 ProjectSteersmanPanel.current = undefined;
 
-module.exports = { ProjectSteersmanPanel };
+// WebviewView host: the activity-bar sidebar. COEXISTS with the editor panel — a separate,
+// independent controller instance drives the SAME UI + message protocol against the same
+// shared deps. VS Code creates the view lazily (first time the container is revealed) and
+// restores its own state, so there is no serializer here. retainContextWhenHidden is a
+// PROVIDER option (passed to registerWebviewViewProvider in extension.js), not a webview
+// option, so it is not set on webview.options below.
+class ProjectSteersmanViewProvider {
+  constructor(deps) {
+    this._deps = deps;
+    this._controller = null;
+  }
+
+  resolveWebviewView(webviewView) {
+    webviewView.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [vscode.Uri.joinPath(this._deps.extensionUri, 'media')],
+    };
+    const controller = new SteersmanWebviewController(webviewView.webview, this._deps);
+    this._controller = controller;
+    controller.wire();
+
+    // Repaint when the view becomes visible again (parity with the panel's view-state repaint).
+    webviewView.onDidChangeVisibility(
+      () => { if (webviewView.visible) controller.pushState(); },
+      undefined,
+      controller.disposables
+    );
+    webviewView.onDidDispose(
+      () => {
+        controller.dispose();
+        if (this._controller === controller) this._controller = null;
+      },
+      undefined,
+      controller.disposables
+    );
+  }
+
+  // Re-push hook mirroring ProjectSteersmanPanel.refresh() so extension.js's fs.watch reaches
+  // the sidebar too. No-op until the view has been resolved / after it is disposed.
+  refresh() {
+    if (this._controller) this._controller.refresh();
+  }
+}
+
+ProjectSteersmanViewProvider.viewType = 'projectSteersman.sidebar';
+
+module.exports = { ProjectSteersmanPanel, ProjectSteersmanViewProvider };

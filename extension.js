@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const { CDPTab, BROWSER_SESSION_TYPES } = require('./cdp-tab');
 const { startHttpServer } = require('./http-server');
 const { SessionManager } = require('./session-manager');
-const { ProjectSteersmanPanel } = require('./panel');
+const { ProjectSteersmanPanel, ProjectSteersmanViewProvider } = require('./panel');
 const { CapabilityConfig } = require('./capability-config');
 const { ScriptRunner } = require('./script-runner');
 const { BookmarksStore } = require('./bookmarks-store');
@@ -32,6 +32,9 @@ let extensions = null;
 // Bridge (B1): per-extension KV store shared across windows (globalState-backed). Threaded into the
 // SessionManager (tabs service bridge storage calls) and the panel deps like the other stores.
 let bridge = null;
+// VS Code SecretStorage (OS-keychain-backed); handed to the panel so its update-check
+// can read an optional GitHub token for authenticated API calls against a private repo.
+let secrets = null;
 // One favicon fetcher per activation: resolves a bookmark's favicon to a data: URI (Node-side,
 // so the in-page bar's img-src CSP never sees a live cross-origin request). Shared by the panel
 // (fetch-on-add) and the activation backfill below.
@@ -40,6 +43,10 @@ let favicons = null;
 // state so the Settings "check for updates" badge can render the current version.
 let version = null;
 let extensionUri = null;
+// The activity-bar sidebar's WebviewView provider (COEXISTS with the editor WebviewPanel).
+// Held at module scope so the central-scripts fs.watch can re-push its state alongside the
+// panel's; it drives the SAME UI + message protocol via a shared controller.
+let sidebarProvider = null;
 let httpServer = null;
 let statusBarItem = null;
 let actualPort = null;
@@ -79,6 +86,7 @@ function activate(context) {
   // Bridge (B1): per-extension KV store backed by globalState; context.secrets is passed for the
   // (later) B3 SecretStorage tier so its construction doesn't change then.
   bridge = new BridgeStore(context.globalState, context.secrets);
+  secrets = context.secrets;
   favicons = new FaviconFetcher();
   apiToken = crypto.randomBytes(32).toString('hex');
 
@@ -199,6 +207,13 @@ function activate(context) {
     );
   }
 
+  // Activity-bar sidebar view (coexists with the editor panel). The provider builds a fresh
+  // controller in resolveWebviewView using the SAME panelDeps() the editor panel uses, so both
+  // hosts share the manager/stores/token. retainContextWhenHidden keeps the view's DOM/JS (scroll,
+  // open forms) alive while it is hidden — a UI nicety only, since the CDP sessions + HTTP server
+  // are owned by the extension host, not the view.
+  sidebarProvider = new ProjectSteersmanViewProvider(panelDeps());
+
   context.subscriptions.push(
     log,
     statusBarItem,
@@ -211,7 +226,12 @@ function activate(context) {
       async deserializeWebviewPanel(panel) {
         ProjectSteersmanPanel.revive(panel, panelDeps());
       },
-    })
+    }),
+    vscode.window.registerWebviewViewProvider(
+      ProjectSteersmanViewProvider.viewType,
+      sidebarProvider,
+      { webviewOptions: { retainContextWhenHidden: true } }
+    )
   );
 
   const cfg = vscode.workspace.getConfiguration('projectSteersman');
@@ -632,8 +652,12 @@ function watchScriptsDir(context) {
       timer = setTimeout(() => {
         timer = null;
         try {
+          // Re-push to BOTH hosts that may be showing the UI: the editor panel (singleton)
+          // and the activity-bar sidebar view. Each refresh() is a guarded no-op when its host
+          // isn't currently live, so calling both is safe.
           if (ProjectSteersmanPanel.current) ProjectSteersmanPanel.current.refresh();
-        } catch { /* panel gone / mid-dispose — ignore */ }
+          if (sidebarProvider) sidebarProvider.refresh();
+        } catch { /* host gone / mid-dispose — ignore */ }
       }, 200);
     });
     context.subscriptions.push({
@@ -667,6 +691,9 @@ function panelDeps() {
     // Lets the panel re-apply the live in-page extensions after a Settings-editor edit.
     refreshExtensions: () => manager.refreshExtensions(),
     token: apiToken,
+    // SecretStorage handle — lets the panel read/store the optional GitHub token the
+    // update-check uses to authenticate against the (private) release repo.
+    secrets,
     // Current package.json version; the panel pushes it into state for the update-check badge.
     version,
   };

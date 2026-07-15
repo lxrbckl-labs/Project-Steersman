@@ -1290,3 +1290,23 @@ select.ext-runat:focus-visible {
   justify-content: flex-end;
 }
 
+/* ─── Narrow-column polish (activity-bar sidebar) ─────────────────────────────
+   The whole UI is already a single vertical column, so a sidebar host mostly just
+   needs its gutters trimmed: at the ~narrow widths a docked sidebar sits (VS Code
+   allows well under 260px) the 12–16px horizontal padding eats too much of the row.
+   This only tightens horizontal breathing room; the roomy editor panel is far wider
+   than the breakpoint and is unaffected. The rail keeps flex + nowrap, so the two
+   worded tabs still fit. */
+@media (max-width: 260px) {
+  .rail,
+  .rail-item {
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+
+  .settings-body {
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+}
+
