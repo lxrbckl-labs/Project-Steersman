@@ -14,7 +14,7 @@
 
   // ── State ───────────────────────────────────────────────────
   /** @type {{sessions: Array<{id:string,state:string,url:string,activity:(Object|null)}>, port: (number|string|null), view: ('sessions'|'settings'), settings: (Object|null), scripts: Array<{name:string}>, bookmarks: (Object|null), bookmarksBarEnabled: boolean, version: string}} */
-  let model = { sessions: [], port: null, view: 'sessions', settings: null, scripts: [], bookmarks: null, bookmarksBarEnabled: false, extensions: [], extensionsEnabled: true, version: '' };
+  let model = { sessions: [], port: null, view: 'sessions', settings: null, scripts: [], bookmarks: null, bookmarksBarEnabled: false, extensions: [], extensionsEnabled: true, version: '', coverUri: '' };
 
   // ── Update-check UI state — module-scoped (like expandedFolders/addForm)
   // so it survives the full-rebuild render() instead of resetting each time
@@ -1238,6 +1238,14 @@
     );
     wrap.appendChild(topbar);
 
+    // Cover photo — sits directly below the top bar (i.e. below the title and
+    // the version/update badge), styled by .settings-hero.
+    if (model.coverUri) {
+      const hero = h('div', { className: 'settings-hero' });
+      hero.style.backgroundImage = 'url("' + model.coverUri + '")';
+      wrap.appendChild(hero);
+    }
+
     const s = model.settings;
 
     if (!s) {
@@ -1826,6 +1834,7 @@
       model.port = msg.port != null ? msg.port : model.port;
       model.scripts = Array.isArray(msg.scripts) ? msg.scripts : (model.scripts || []);
       model.version = msg.version != null ? msg.version : model.version;
+      model.coverUri = msg.coverUri != null ? msg.coverUri : model.coverUri;
       render();
     } else if (msg.type === 'settings' && msg.settings) {
       // Likewise: a settings push must not touch model.sessions/view.

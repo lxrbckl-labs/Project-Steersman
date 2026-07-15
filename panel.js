@@ -636,7 +636,8 @@ class ProjectSteersmanPanel {
       };
     });
     const scripts = this._scriptRunner ? this._scriptRunner.listScripts() : [];
-    this._post({ type: 'state', sessions, port: port == null ? null : port, scripts, version: this._version || null });
+    const coverUri = this._panel.webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'cover.png')).toString();
+    this._post({ type: 'state', sessions, port: port == null ? null : port, scripts, version: this._version || null, coverUri });
   }
 
   // Public re-push hook for external triggers (e.g. the central-scripts fs.watch in
