@@ -2,7 +2,7 @@
   "name": "project-steersman",
   "displayName": "Project Steersman",
   "description": "Expose VS Code's integrated browser to Claude Code via a local HTTP API and MCP server.",
-  "version": "0.5.8",
+  "version": "0.5.9",
   "publisher": "aarbuckle",
   "icon": "media/icon.png",
   "engines": {
@@ -33,7 +33,7 @@
         {
           "type": "webview",
           "id": "projectSteersman.sidebar",
-          "name": "Steersman"
+          "name": "Project Steersman"
         }
       ]
     },
