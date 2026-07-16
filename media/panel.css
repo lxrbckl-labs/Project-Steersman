@@ -501,7 +501,7 @@ button.icon-button.settings-github-btn:hover:not(:disabled) {
   border-radius: 4px;
   /* Confirmed swatch value; overrides the themed --vscode-editorWidget-background so the tabs
      table reads as a dark surface. */
-  background: #191A1B;
+  background: #202122;
   /* Thin themed scrollbar to match the VS Code editor. */
   scrollbar-width: thin;
   scrollbar-color: var(--vscode-scrollbarSlider-background) transparent;
