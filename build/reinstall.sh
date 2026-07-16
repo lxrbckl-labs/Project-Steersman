@@ -37,14 +37,14 @@ echo "[reinstall] repo root: $ROOT"
 # (nvm/PATH setup lives in .bashrc/.profile, not picked up by non-login shells).
 # If `code` (or `npm`/`npx`) isn't found, try re-running this script via:
 #   bash -lc "$ROOT/build/reinstall.sh"
-for tool in node npm npx code unzip; do
+for tool in node npm npx code; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "[reinstall] ERROR: required tool '$tool' not found on PATH." >&2
     echo "[reinstall]        try: bash -lc \"$ROOT/build/reinstall.sh\" (login shell may pick up nvm/PATH)" >&2
     exit 1
   fi
 done
-echo "[reinstall] preflight OK: node, npm, npx, code, unzip all found"
+echo "[reinstall] preflight OK: node, npm, npx, code all found"
 
 # --- Update from git (skipped entirely with --local) --------------------------
 # Bring the clone up to its upstream ONLY when it is actually behind, then let the
@@ -156,11 +156,16 @@ echo "[reinstall] built: $VSIX"
 # "extension/" prefix inside the vsix, so the packaged path is extension/extension.js.
 # If that's missing, something is badly wrong with .vscodeignore/packaging -
 # never install a vsix that can't even load its own entry point.
-if ! unzip -l "$VSIX" | grep -q "extension/extension.js"; then
-  echo "[reinstall] ERROR: packaged vsix is missing the entry point — aborting install" >&2
-  exit 1
+# If unzip is not available, skip the check (non-fatal).
+if command -v unzip >/dev/null 2>&1; then
+  if ! unzip -l "$VSIX" | grep -q "extension/extension.js"; then
+    echo "[reinstall] ERROR: packaged vsix is missing the entry point — aborting install" >&2
+    exit 1
+  fi
+  echo "[reinstall] entry-point check OK: extension/extension.js present in $VSIX"
+else
+  echo "[reinstall] unzip not found — skipping .vsix entry-point sanity check"
 fi
-echo "[reinstall] entry-point check OK: extension/extension.js present in $VSIX"
 
 # --- Install -------------------------------------------------------------
 echo "[reinstall] installing into VS Code (--force overwrites any prior install)..."
