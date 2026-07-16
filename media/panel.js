@@ -263,8 +263,8 @@
     // and builds the <svg> directly.
     const NS = 'http://www.w3.org/2000/svg';
     const svg = document.createElementNS(NS, 'svg');
-    svg.setAttribute('width', '13');
-    svg.setAttribute('height', '13');
+    svg.setAttribute('width', '15');
+    svg.setAttribute('height', '15');
     svg.setAttribute('viewBox', '0 0 24 24');
     svg.setAttribute('fill', 'none');
     svg.setAttribute('stroke', 'currentColor');
