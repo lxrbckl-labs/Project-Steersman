@@ -317,49 +317,6 @@
     );
   }
 
-  function keyIcon() {
-    // Outline key glyph for the "set GitHub token" button — stroke-based like
-    // packageIcon(), so it bypasses svgIcon's fill paths and is built directly.
-    const NS = 'http://www.w3.org/2000/svg';
-    const svg = document.createElementNS(NS, 'svg');
-    svg.setAttribute('width', '13');
-    svg.setAttribute('height', '13');
-    svg.setAttribute('viewBox', '0 0 24 24');
-    svg.setAttribute('fill', 'none');
-    svg.setAttribute('stroke', 'currentColor');
-    svg.setAttribute('stroke-width', '1.9');
-    svg.setAttribute('stroke-linecap', 'round');
-    svg.setAttribute('stroke-linejoin', 'round');
-    svg.setAttribute('aria-hidden', 'true');
-    [
-      'M15.5 8.5a4 4 0 1 0-4.9 3.9L4 19v2h2l1-1h2v-2h2v-2l1.6-1.6a4 4 0 0 0 2.9-3.9z',
-      'M17 6.5h.01'
-    ].forEach(function (d) {
-      const p = document.createElementNS(NS, 'path');
-      p.setAttribute('d', d);
-      svg.appendChild(p);
-    });
-    return svg;
-  }
-
-  // Set/clear the GitHub token the host uses to authenticate the update check against
-  // the private release repo. The host collects the value via a native masked input box
-  // (setUpdateToken handler) and stores it in SecretStorage — the token never touches the
-  // webview. Reuses the framed square style of the GitHub button.
-  function tokenButton() {
-    return h(
-      'button',
-      {
-        className: 'icon-button settings-github-btn',
-        type: 'button',
-        dataAction: 'setUpdateToken',
-        title: 'Set / clear the GitHub token for the update check (private repo)',
-        ariaLabel: 'Set GitHub token for update check'
-      },
-      keyIcon()
-    );
-  }
-
   function chevronIcon() {
     // Drawn (not text-glyph) right-pointing triangle, kept roughly square in
     // its bounding box (8 wide x 10 tall here) instead of the old '▸' text
@@ -1216,50 +1173,44 @@
   // model.version (host-pushed) and updateState (module-scoped, see above)
   // so a check-in-flight or a persisted "update available" survives re-render.
   function updateBadge() {
-    const version = model.version || '';
-    let label;
+    const version = model.version || '?';
+    const versionTag = 'Project Steersman v' + version;
     let stateClass = '';
     // Clicking the badge now runs the LOCAL git-based reinstall (git pull --ff-only
     // when behind, then npm install + vsce package + code --install-extension) rather
     // than opening the releases web page — hence the update-oriented default title.
-    let title = 'Update Project Steersman (git pull + reinstall from your local clone)';
+    // Icon-only button (no visible version label — see .update-badge in panel.css),
+    // so the version string that used to sit beside the icon now lives entirely in
+    // this hover title.
+    let title = versionTag + ' — click to update';
     let disabled = false;
     if (updateState.status === 'updating') {
-      label = 'updating…';
       stateClass = 'update-checking';
-      title = 'Updating — pulling, packaging and reinstalling…';
+      title = versionTag + ' — updating (pulling, packaging and reinstalling…)';
       disabled = true;
     } else if (updateState.status === 'updated') {
-      label = 'v' + (updateState.latest || version || '?') + ' installed';
       stateClass = 'update-uptodate';
-      title = 'Updated — reload the window to activate';
+      title = 'Project Steersman v' + (updateState.latest || version) + ' — updated, reload the window to activate';
     } else if (updateState.status === 'checking') {
       // Dormant pre-signal path (kept for the version-check message contract).
-      label = 'checking…';
       stateClass = 'update-checking';
-      title = 'Checking for updates…';
+      title = versionTag + ' — checking for updates…';
       disabled = true;
     } else if (updateState.status === 'updateAvailable') {
-      label = 'v' + (updateState.latest || '?') + ' available';
       stateClass = 'update-available';
-      title = 'Update available — click to pull and reinstall';
+      title = 'Project Steersman v' + (updateState.latest || '?') + ' available — click to pull and reinstall';
     } else if (updateState.status === 'upToDate') {
-      label = (version || '?') + ' — up to date';
       stateClass = 'update-uptodate';
-      title = 'Up to date';
+      title = versionTag + ' — up to date';
     } else if (updateState.status === 'error') {
       // Show the host's actual reason rather than a blanket message that hides
       // what went wrong.
-      label = updateState.error || 'update failed';
       stateClass = 'update-error';
-      title = (updateState.error || 'Update failed') + ' — click to retry';
-    } else {
-      label = version || '?';
+      title = versionTag + ' — ' + (updateState.error || 'update failed') + ' — click to retry';
     }
 
-    // Icon + version label sit side by side unconditionally in every state —
-    // matching Project Nomeda's update-extension button, which always shows
-    // its package glyph beside the version text rather than swapping it out.
+    // Icon-only, matching githubButton()'s compact footprint — the state classes
+    // below still re-tint the icon (via currentColor) instead of a text label.
     const btn = h(
       'button',
       {
@@ -1269,8 +1220,7 @@
         title: title,
         ariaLabel: title
       },
-      packageIcon(),
-      h('span', { className: 'update-badge-label' }, label)
+      packageIcon()
     );
     if (disabled) { btn.disabled = true; }
     // Returns just the button now — it lives inside the Settings top bar
@@ -1288,7 +1238,6 @@
       'div', { className: 'settings-topbar' },
       h('span', { className: 'settings-title' }, 'PROJECT STEERSMAN'),
       updateBadge(),
-      tokenButton(),
       githubButton()
     );
     wrap.appendChild(topbar);
@@ -1565,10 +1514,6 @@
       render();
     } else if (action === 'openReleases') {
       if (updateState.releasesUrl) { post({ type: 'openExternal', url: updateState.releasesUrl }); }
-    } else if (action === 'setUpdateToken') {
-      // Host opens a native masked input box and stores the value in SecretStorage;
-      // no token value passes through the webview.
-      post({ type: 'setUpdateToken' });
     } else if (action === 'openGithub') {
       post({ type: 'openExternal', url: GITHUB_URL });
     } else if (action === 'toggleSection') {

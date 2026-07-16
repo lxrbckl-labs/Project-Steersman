@@ -233,15 +233,17 @@ button.icon-button.settings-github-btn:hover:not(:disabled) {
 /* Idle chrome matches Project Nomeda's update-extension button (input-material
    framed look: input-background fill, input-border, 3px corners) rather than
    a pill, so both extensions' update controls read the same. State classes
-   below re-tint the border/text for checking/up-to-date/update-available/
-   error without changing that shape. */
+   below re-tint the border/icon for checking/up-to-date/update-available/
+   error without changing that shape. Icon-only now (the version text moved
+   to the button's title tooltip — see updateBadge() in panel.js), so the
+   footprint matches .settings-github-btn's compact 26px square exactly. */
 .update-badge {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  font-size: 11px;
-  line-height: 1.4;
-  padding: 3px 7px;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
   border-radius: 3px;
   border: 1px solid var(--vscode-input-border, transparent);
   background: var(--vscode-input-background);
@@ -267,13 +269,6 @@ button.icon-button.settings-github-btn:hover:not(:disabled) {
 .update-badge svg {
   display: block;
   vertical-align: middle;
-}
-
-/* Version/status text beside the icon — small and muted, matching Nomeda's
-   .update-btn-version (caption-style text distinct from the icon's color). */
-.update-badge-label {
-  white-space: nowrap;
-  color: var(--vscode-descriptionForeground);
 }
 
 /* Checking — same neutral tint as idle, just non-interactive while in flight. */

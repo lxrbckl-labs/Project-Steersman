@@ -749,8 +749,8 @@ function updateStatus() {
   if (!statusBarItem) return;
   const sessions = manager ? manager.list() : [];
   const connected = sessions.filter((s) => s.state === 'connected').length;
-  const server = httpServer ? ':' + actualPort : 'off';
-  statusBarItem.text = `$(browser) Project Steersman ${server}${sessions.length ? ' ' + connected + '/' + sessions.length : ''}`;
+  const server = httpServer ? actualPort : 'off';
+  statusBarItem.text = `$(browser) Steersman: ${server}${sessions.length ? ' ' + connected + '/' + sessions.length : ''}`;
   statusBarItem.tooltip = 'Project Steersman — click to open the browser panel';
 }
 
