@@ -533,11 +533,15 @@ class SteersmanWebviewController {
 
   // Resolve the Project-Steersman git checkout the self-update pipeline runs from.
   // Order: (a) an explicit projectSteersman.repoPath setting if the operator has
-  // pointed one at their clone; else (b) this extension's own install path when it
-  // is itself a source checkout (Steersman has no bundler, so the sentinel is
-  // `.git` + `extension.js` present at the root — no esbuild.config.js to key on).
-  // Returns an absolute path or null when neither resolves. Reading an undeclared
-  // config key is fine — getConfiguration just returns the default ('') for it.
+  // pointed one at their clone; else (b) an open workspace folder that IS the
+  // Project-Steersman clone — auto-detected so a vsix install needs no setting when
+  // the repo is the open workspace (a folder qualifies only if it has `.git` AND its
+  // package.json `name` is 'project-steersman', so we never pull+reinstall from an
+  // unrelated git workspace); else (c) this extension's own install path when it is
+  // itself a source checkout (Steersman has no bundler, so the sentinel is `.git` +
+  // `extension.js` present at the root — no esbuild.config.js to key on). Returns an
+  // absolute path or null when none resolves. Reading an undeclared config key is
+  // fine — getConfiguration just returns the default ('') for it.
   _resolveRepoRoot() {
     let configured = '';
     try {
@@ -545,6 +549,19 @@ class SteersmanWebviewController {
     } catch { configured = ''; }
     if (configured && fs.existsSync(path.join(configured, '.git'))) {
       return configured;
+    }
+    const folders = vscode.workspace.workspaceFolders;
+    if (folders && folders.length) {
+      for (const folder of folders) {
+        const folderPath = folder && folder.uri && folder.uri.fsPath;
+        if (!folderPath || !fs.existsSync(path.join(folderPath, '.git'))) { continue; }
+        try {
+          const pkg = JSON.parse(fs.readFileSync(path.join(folderPath, 'package.json'), 'utf8'));
+          if (pkg && pkg.name === 'project-steersman') {
+            return folderPath;
+          }
+        } catch { /* malformed/missing package.json — skip this folder */ }
+      }
     }
     const extPath = this._extensionUri && this._extensionUri.fsPath;
     if (extPath &&
