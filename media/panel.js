@@ -8,13 +8,9 @@
   // ── VS Code API ─────────────────────────────────────────────
   const vscode = acquireVsCodeApi();
 
-  // ── Cover image URI — baked into the HTML shell by the host as a data-
-  // attribute on #app (webview-safe asWebviewUri already applied there);
-  // read once since it's static for the life of the webview. ───────────
-
   // ── State ───────────────────────────────────────────────────
   /** @type {{sessions: Array<{id:string,state:string,url:string,activity:(Object|null)}>, port: (number|string|null), view: ('sessions'|'settings'), settings: (Object|null), scripts: Array<{name:string}>, bookmarks: (Object|null), bookmarksBarEnabled: boolean, version: string}} */
-  let model = { sessions: [], port: null, view: 'sessions', settings: null, scripts: [], bookmarks: null, bookmarksBarEnabled: false, extensions: [], extensionsEnabled: true, version: '', coverUri: '' };
+  let model = { sessions: [], port: null, view: 'sessions', settings: null, scripts: [], bookmarks: null, bookmarksBarEnabled: false, extensions: [], extensionsEnabled: true, version: '' };
 
   // ── Update-check UI state — module-scoped (like expandedFolders/addForm)
   // so it survives the full-rebuild render() instead of resetting each time
@@ -1223,9 +1219,22 @@
     const version = model.version || '';
     let label;
     let stateClass = '';
-    let title = 'Check for updates';
+    // Clicking the badge now runs the LOCAL git-based reinstall (git pull --ff-only
+    // when behind, then npm install + vsce package + code --install-extension) rather
+    // than opening the releases web page — hence the update-oriented default title.
+    let title = 'Update Project Steersman (git pull + reinstall from your local clone)';
     let disabled = false;
-    if (updateState.status === 'checking') {
+    if (updateState.status === 'updating') {
+      label = 'updating…';
+      stateClass = 'update-checking';
+      title = 'Updating — pulling, packaging and reinstalling…';
+      disabled = true;
+    } else if (updateState.status === 'updated') {
+      label = 'v' + (updateState.latest || version || '?') + ' installed';
+      stateClass = 'update-uptodate';
+      title = 'Updated — reload the window to activate';
+    } else if (updateState.status === 'checking') {
+      // Dormant pre-signal path (kept for the version-check message contract).
       label = 'checking…';
       stateClass = 'update-checking';
       title = 'Checking for updates…';
@@ -1233,17 +1242,17 @@
     } else if (updateState.status === 'updateAvailable') {
       label = 'v' + (updateState.latest || '?') + ' available';
       stateClass = 'update-available';
-      title = 'Update available — click to open the releases page';
+      title = 'Update available — click to pull and reinstall';
     } else if (updateState.status === 'upToDate') {
       label = (version || '?') + ' — up to date';
       stateClass = 'update-uptodate';
       title = 'Up to date';
     } else if (updateState.status === 'error') {
-      // Show the host's actual reason ('no releases found' / 'offline' / 'check
-      // failed') rather than a blanket "check failed" that hides what went wrong.
-      label = updateState.error || 'check failed';
+      // Show the host's actual reason rather than a blanket message that hides
+      // what went wrong.
+      label = updateState.error || 'update failed';
       stateClass = 'update-error';
-      title = updateState.error || 'Check failed — click to retry';
+      title = (updateState.error || 'Update failed') + ' — click to retry';
     } else {
       label = version || '?';
     }
@@ -1256,7 +1265,7 @@
       {
         className: 'update-badge' + (stateClass ? ' ' + stateClass : ''),
         type: 'button',
-        dataAction: updateState.status === 'updateAvailable' ? 'openReleases' : 'checkForUpdate',
+        dataAction: 'selfUpdate',
         title: title,
         ariaLabel: title
       },
@@ -1283,14 +1292,6 @@
       githubButton()
     );
     wrap.appendChild(topbar);
-
-    // Cover photo — sits directly below the top bar (i.e. below the title and
-    // the version/update badge), styled by .settings-hero.
-    if (model.coverUri) {
-      const hero = h('div', { className: 'settings-hero' });
-      hero.style.backgroundImage = 'url("' + model.coverUri + '")';
-      wrap.appendChild(hero);
-    }
 
     const s = model.settings;
 
@@ -1550,6 +1551,13 @@
       post({ type: 'removeBookmark', id: id });
     } else if (action === 'deleteScript' && id) {
       post({ type: 'deleteScript', name: id });
+    } else if (action === 'selfUpdate') {
+      // Primary update action: trigger the host's local git-based reinstall
+      // pipeline. Guard against double-clicks while an install is in flight.
+      if (updateState.status === 'updating') { return; }
+      updateState = { status: 'updating' };
+      post({ type: 'selfUpdate' });
+      render();
     } else if (action === 'checkForUpdate') {
       if (updateState.status === 'checking') { return; } // already in flight
       updateState = { status: 'checking' };
@@ -1884,7 +1892,6 @@
       model.port = msg.port != null ? msg.port : model.port;
       model.scripts = Array.isArray(msg.scripts) ? msg.scripts : (model.scripts || []);
       model.version = msg.version != null ? msg.version : model.version;
-      model.coverUri = msg.coverUri != null ? msg.coverUri : model.coverUri;
       render();
     } else if (msg.type === 'settings' && msg.settings) {
       // Likewise: a settings push must not touch model.sessions/view.
@@ -1946,6 +1953,32 @@
       } else {
         updateState = { status: 'idle' };
         render();
+      }
+    } else if (msg.type === 'selfUpdateStatus') {
+      // Host progress for the local git-based reinstall. 'running' keeps the badge
+      // in its spinner state; 'installed'/'upToDate'/'error' are terminal and fall
+      // back to the idle version badge after a beat so the control never sticks.
+      if (msg.status === 'running') {
+        updateState = { status: 'updating' };
+        render();
+      } else if (msg.status === 'installed') {
+        updateState = { status: 'updated', latest: msg.version };
+        render();
+        setTimeout(function () {
+          if (updateState.status === 'updated') { updateState = { status: 'idle' }; render(); }
+        }, 6000);
+      } else if (msg.status === 'upToDate') {
+        updateState = { status: 'upToDate', current: msg.current };
+        render();
+        setTimeout(function () {
+          if (updateState.status === 'upToDate') { updateState = { status: 'idle' }; render(); }
+        }, 4000);
+      } else if (msg.status === 'error') {
+        updateState = { status: 'error', error: msg.error };
+        render();
+        setTimeout(function () {
+          if (updateState.status === 'error') { updateState = { status: 'idle' }; render(); }
+        }, 5000);
       }
     } else if (msg.type === 'copied') {
       // The fleet copy and the extensions-briefing copy reuse this same postback but have no real

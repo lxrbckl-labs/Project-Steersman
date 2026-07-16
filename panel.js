@@ -6,6 +6,9 @@
 
 const vscode = require('vscode');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
 const { CapabilityConfig } = require('./capability-config');
 
 const VIEW_TYPE = 'projectSteersmanPanel';
@@ -18,6 +21,26 @@ const REPO = 'lxRbckl/Project-Steersman';
 const GITHUB_TOKEN_SECRET_KEY = 'steersman.updateCheck.githubToken';
 // Pinned GitHub REST API version (recommended header alongside the vnd.github+json Accept).
 const GITHUB_API_VERSION = '2022-11-28';
+
+// Module-level self-update state. The guard is deliberately module-scoped (not
+// per-controller) so the editor panel and the sidebar view — two controllers over
+// the same extension host — can never launch two concurrent reinstalls. The output
+// channel is created lazily once and reused so repeated updates don't leak channels.
+let selfUpdateInProgress = false;
+let selfUpdateChannel = null;
+function getSelfUpdateChannel() {
+  if (!selfUpdateChannel) {
+    selfUpdateChannel = vscode.window.createOutputChannel('Project Steersman Update');
+  }
+  return selfUpdateChannel;
+}
+
+// POSIX single-quote a shell argument so a path with spaces/metacharacters survives
+// the `bash -lc "..."` wrapper intact. Bare word when it's already shell-safe.
+function shellQuote(arg) {
+  if (/^[A-Za-z0-9_/.,:=@%+-]+$/.test(arg)) { return arg; }
+  return `'${arg.replace(/'/g, `'\\''`)}'`;
+}
 
 // Host-agnostic controller: owns the webview HTML shell + the full host<->webview
 // message protocol + every state push. It operates on a plain `webview` object, whose
@@ -330,6 +353,12 @@ class SteersmanWebviewController {
       case 'checkForUpdate':
         await this._checkForUpdate();
         break;
+      case 'selfUpdate':
+        // Local git-based reinstall pipeline (build/reinstall.sh) — the update
+        // badge's primary action. Distinct from 'updateExtension' above, which
+        // mutates a browser-extension record in the extensions store.
+        await this._runSelfUpdate();
+        break;
       case 'setUpdateToken':
         await this._setUpdateToken();
         break;
@@ -500,6 +529,123 @@ class SteersmanWebviewController {
     }
     this._log.appendLine('[Panel] update-check GitHub token saved');
     vscode.window.showInformationMessage('Project Steersman: update-check token saved. Click the update badge to check now.');
+  }
+
+  // Resolve the Project-Steersman git checkout the self-update pipeline runs from.
+  // Order: (a) an explicit projectSteersman.repoPath setting if the operator has
+  // pointed one at their clone; else (b) this extension's own install path when it
+  // is itself a source checkout (Steersman has no bundler, so the sentinel is
+  // `.git` + `extension.js` present at the root — no esbuild.config.js to key on).
+  // Returns an absolute path or null when neither resolves. Reading an undeclared
+  // config key is fine — getConfiguration just returns the default ('') for it.
+  _resolveRepoRoot() {
+    let configured = '';
+    try {
+      configured = (vscode.workspace.getConfiguration('projectSteersman').get('repoPath', '') || '').trim();
+    } catch { configured = ''; }
+    if (configured && fs.existsSync(path.join(configured, '.git'))) {
+      return configured;
+    }
+    const extPath = this._extensionUri && this._extensionUri.fsPath;
+    if (extPath &&
+        fs.existsSync(path.join(extPath, '.git')) &&
+        fs.existsSync(path.join(extPath, 'extension.js'))) {
+      return extPath;
+    }
+    return null;
+  }
+
+  // Run the local git-based reinstall pipeline (build/reinstall.sh) on the operator's
+  // machine: git fetch -> git pull --ff-only (only when the clone is behind) -> npm
+  // install -> vsce package -> code --install-extension --force. The script is spawned
+  // under a `bash -lc` LOGIN shell so the operator's interactive PATH (nvm node/npm,
+  // vsce, the `code` CLI) is on PATH — the extension-host PATH is not. Output streams to
+  // a dedicated OutputChannel; the ALREADY_UP_TO_DATE / "Installed:" markers are parsed
+  // to drive the final prompt. A module-level guard blocks concurrent runs. Auth is the
+  // operator's ambient git credentials — no token flows through here.
+  async _runSelfUpdate() {
+    if (selfUpdateInProgress) {
+      vscode.window.showInformationMessage('Project Steersman: an update is already in progress.');
+      return;
+    }
+    const repoRoot = this._resolveRepoRoot();
+    const channel = getSelfUpdateChannel();
+    if (!repoRoot) {
+      channel.appendLine('[Panel] selfUpdate: could not locate a Project-Steersman git checkout.');
+      channel.appendLine('[Panel] Set "projectSteersman.repoPath" to the absolute path of your clone, then try again.');
+      channel.show(true);
+      this._post({ type: 'selfUpdateStatus', status: 'error', error: 'no repo checkout' });
+      vscode.window.showErrorMessage(
+        'Project Steersman: could not locate a git checkout to update from. Set "projectSteersman.repoPath" to the absolute path of your clone.'
+      );
+      return;
+    }
+    const scriptPath = path.join(repoRoot, 'build', 'reinstall.sh');
+    if (!fs.existsSync(scriptPath)) {
+      channel.appendLine('[Panel] selfUpdate: update script not found at ' + scriptPath);
+      channel.show(true);
+      this._post({ type: 'selfUpdateStatus', status: 'error', error: 'script missing' });
+      vscode.window.showErrorMessage('Project Steersman: update script not found at ' + scriptPath + '.');
+      return;
+    }
+
+    selfUpdateInProgress = true;
+    channel.clear();
+    channel.show(true);
+    this._post({ type: 'selfUpdateStatus', status: 'running' });
+    try {
+      let buffer = '';
+      const exitCode = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'Updating Project Steersman…', cancellable: false },
+        () => new Promise((resolve, reject) => {
+          // `bash -lc` gives the operator's login PATH; the inner `bash <script>`
+          // runs the pipeline. STEERSMAN_INSTALLED_VERSION lets the script decide
+          // whether the currently-installed build already matches upstream.
+          const child = spawn('bash', ['-lc', `bash ${shellQuote(scriptPath)}`], {
+            cwd: repoRoot,
+            env: { ...process.env, STEERSMAN_INSTALLED_VERSION: this._version || '' },
+          });
+          child.stdout.on('data', (chunk) => { const t = chunk.toString(); buffer += t; channel.append(t); });
+          child.stderr.on('data', (chunk) => { const t = chunk.toString(); buffer += t; channel.append(t); });
+          child.on('error', (err) => reject(err));
+          child.on('close', (code) => resolve(code == null ? 0 : code));
+        })
+      );
+
+      if (/\bALREADY_UP_TO_DATE\b/.test(buffer)) {
+        this._post({ type: 'selfUpdateStatus', status: 'upToDate', current: this._version || null });
+        vscode.window.showInformationMessage('Project Steersman is already up to date.');
+        return;
+      }
+      if (exitCode === 0) {
+        const m = buffer.match(/\[steersman\]\s+Installed:\s+project-steersman v(\S+)/i);
+        const installedVersion = m ? m[1] : 'latest';
+        this._post({ type: 'selfUpdateStatus', status: 'installed', version: installedVersion });
+        const choice = await vscode.window.showInformationMessage(
+          `Project Steersman updated to v${installedVersion}. Reload window to activate?`,
+          'Reload Window', 'Later'
+        );
+        if (choice === 'Reload Window') {
+          void vscode.commands.executeCommand('workbench.action.reloadWindow');
+        }
+        return;
+      }
+      this._post({ type: 'selfUpdateStatus', status: 'error', error: 'exit ' + exitCode });
+      const choice = await vscode.window.showErrorMessage(
+        `Project Steersman update failed (exit ${exitCode}).`, 'Show Log'
+      );
+      if (choice === 'Show Log') { channel.show(); }
+    } catch (e) {
+      const reason = (e && e.message) ? e.message : String(e);
+      channel.appendLine('[Panel] selfUpdate: spawn failed: ' + reason);
+      this._post({ type: 'selfUpdateStatus', status: 'error', error: reason });
+      const choice = await vscode.window.showErrorMessage(
+        'Project Steersman update failed — ' + reason, 'Show Log'
+      );
+      if (choice === 'Show Log') { channel.show(); }
+    } finally {
+      selfUpdateInProgress = false;
+    }
   }
 
   // Numeric, part-by-part semver compare (missing trailing parts treated as 0). Returns a
@@ -720,8 +866,7 @@ class SteersmanWebviewController {
       };
     });
     const scripts = this._scriptRunner ? this._scriptRunner.listScripts() : [];
-    const coverUri = this._webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'cover.png')).toString();
-    this._post({ type: 'state', sessions, port: port == null ? null : port, scripts, version: this._version || null, coverUri });
+    this._post({ type: 'state', sessions, port: port == null ? null : port, scripts, version: this._version || null });
   }
 
   // Public re-push hook for external triggers (e.g. the central-scripts fs.watch in
