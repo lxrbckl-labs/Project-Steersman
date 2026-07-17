@@ -75,9 +75,11 @@ function activate(context) {
   extensionUri = context.extensionUri;
   version = context.extension.packageJSON.version;
 
-  // Status bar opens the webview editor tab (the sessions UI now lives there, not the Activity Bar).
+  // Status bar reveals the Activity Bar sidebar view (the sole UI surface). VS Code
+  // auto-registers a `<viewId>.focus` command for every contributed view, so this both
+  // opens the container and focuses our view without a bespoke command.
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
-  statusBarItem.command = 'projectSteersman.openPanel';
+  statusBarItem.command = 'projectSteersman.sidebar.focus';
   statusBarItem.show();
 
   capabilityConfig = new CapabilityConfig();
@@ -217,16 +219,9 @@ function activate(context) {
   context.subscriptions.push(
     log,
     statusBarItem,
-    vscode.commands.registerCommand('projectSteersman.openPanel', () => openPanel()),
     vscode.commands.registerCommand('projectSteersman.startServer', () => startServer()),
     vscode.commands.registerCommand('projectSteersman.stopServer', () => stopServer()),
     vscode.commands.registerCommand('projectSteersman.status', showStatus),
-    // Restore an open Project Steersman panel (and rewire it) after a window reload.
-    vscode.window.registerWebviewPanelSerializer(ProjectSteersmanPanel.viewType, {
-      async deserializeWebviewPanel(panel) {
-        ProjectSteersmanPanel.revive(panel, panelDeps());
-      },
-    }),
     vscode.window.registerWebviewViewProvider(
       ProjectSteersmanViewProvider.viewType,
       sidebarProvider,
@@ -240,12 +235,9 @@ function activate(context) {
     startServer().catch((e) => log.appendLine('[Bridge] autostart failed: ' + e.message));
   }
 
-  // Opt-in auto-open/auto-launch (both default false): reuse the same openPanel command
-  // path and the same manager.create() the panel's "+" triggers — no duplicated logic.
-  // Both are best-effort so a headless/no-workspace activation never throws out of activate().
-  if (cfg.get('autoOpenPanel', false)) {
-    openPanel().catch((e) => log.appendLine('[Bridge] autoOpenPanel failed: ' + (e && e.message ? e.message : e)));
-  }
+  // Opt-in auto-launch (default false): reuse the same manager.create() the sidebar's "+"
+  // triggers — no duplicated logic. Best-effort so a headless/no-workspace activation never
+  // throws out of activate().
   if (cfg.get('autoLaunchWindow', false)) {
     manager.create().catch((e) => log.appendLine('[Bridge] autoLaunchWindow failed: ' + (e && e.message ? e.message : e)));
   }
@@ -697,18 +689,6 @@ function panelDeps() {
     // Current package.json version; the panel pushes it into state for the update-check badge.
     version,
   };
-}
-
-// Open (or reveal) the webview editor tab that drives sessions. Ensure the HTTP server
-// is up first so buildPrompt() reports a real port; the panel still opens if that fails.
-async function openPanel() {
-  try {
-    await startServer();
-  } catch (e) {
-    log.appendLine('[Bridge] openPanel: server start failed: ' + e.message);
-    vscode.window.showErrorMessage('Project Steersman: could not start HTTP server: ' + e.message);
-  }
-  ProjectSteersmanPanel.createOrShow(panelDeps());
 }
 
 // Guarded so autostart and a fast "+" click can't both pass the check and bind

@@ -15,7 +15,8 @@ API (and, later, MCP). One integrated browser tab; the extension holds its CDP s
 1. `npm install` in this folder.
 2. Open the folder in VS Code, press **F5** ("Run Project Steersman"). A second
    VS Code window (Extension Development Host) opens with the extension loaded.
-3. In that window: `Ctrl+Shift+P` → **Project Steersman: Open Panel**.
+3. In that window: open the **Project Steersman** view in the sidebar.
+   Use `Ctrl+Shift+P` → `projectSteersman.sidebar.focus` or click the status-bar icon.
    The integrated browser tab should appear and load `startUrl`.
 
 ## Testing the HTTP API (Phase 2)

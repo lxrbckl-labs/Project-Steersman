@@ -1152,8 +1152,8 @@ class ProjectSteersmanPanel {
 ProjectSteersmanPanel.viewType = VIEW_TYPE;
 ProjectSteersmanPanel.current = undefined;
 
-// WebviewView host: the activity-bar sidebar. COEXISTS with the editor panel — a separate,
-// independent controller instance drives the SAME UI + message protocol against the same
+// WebviewView host: the activity-bar sidebar, the sole control-panel UI surface.
+// An independent controller instance drives the same UI + message protocol against the same
 // shared deps. VS Code creates the view lazily (first time the container is revealed) and
 // restores its own state, so there is no serializer here. retainContextWhenHidden is a
 // PROVIDER option (passed to registerWebviewViewProvider in extension.js), not a webview
@@ -1169,6 +1169,10 @@ class ProjectSteersmanViewProvider {
       enableScripts: true,
       localResourceRoots: [vscode.Uri.joinPath(this._deps.extensionUri, 'media')],
     };
+    // Dimmed version suffix trailing the view title (VS Code renders WebviewView.description
+    // greyed, immediately after the name) — e.g. "PROJECT STEERSMAN  v0.6.0". Sourced from the
+    // same package.json version threaded through panelDeps() as the Settings update badge.
+    if (this._deps.version) { webviewView.description = 'v' + this._deps.version; }
     const controller = new SteersmanWebviewController(webviewView.webview, this._deps);
     this._controller = controller;
     controller.wire();
