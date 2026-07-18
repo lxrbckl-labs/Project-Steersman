@@ -231,7 +231,23 @@ class SessionManager {
 
     const startUrl = this.getStartUrl ? this.getStartUrl() : 'about:blank';
     try {
-      const tab = await this.createTab(startUrl);
+      // Wire + register extensions BEFORE createTab navigates to startUrl. The prepare hook runs
+      // after connect but BEFORE the initial Page.navigate, so registering the document-start
+      // bootstrap + CSP bypass first means the very first startUrl document paints already-decluttered
+      // instead of flashing native style then flipping once injection ran post-load. Routed through
+      // _injectables() so the synthetic EnhanceJira CSS-hide record rides along with the real
+      // extensions here (and on every page-load reinject via getExtensions/loadEventFired). Bridge
+      // (B1): the shared per-extension KV store is wired here too so bridge storage.* resolves
+      // host-side. Feature-flagged: only when an extensions store was provided.
+      const tab = await this.createTab(startUrl, async (t) => {
+        if (this.extensionsStore) {
+          t.getExtensions = () => this._injectables();
+          if (this.bridgeStore) { t.getBridge = () => this.bridgeStore; }
+          try {
+            await t.injectExtensions(this._injectables());
+          } catch {}
+        }
+      });
       // Closed mid-connect: dispose the freshly-connected tab and stay out.
       if (!this._sessions.has(id)) {
         try { await tab.disconnect(); } catch {}
@@ -263,20 +279,10 @@ class SessionManager {
           }
         } catch {}
       }
-      // Wire extensions the same way (feature-flag: only when a store was provided). The tab
-      // re-injects the active set on every page load via getExtensions; we also run the initial
-      // injection now against the already-loaded page.
-      if (this.extensionsStore) {
-        // Route through _injectables() so the synthetic EnhanceJira CSS-hide record rides along
-        // with the real extensions on every page-load reinject as well as the initial injection.
-        tab.getExtensions = () => this._injectables();
-        // Bridge (B1): give the tab the shared per-extension KV store so bridge extensions'
-        // storage.* calls resolve host-side. injectExtensions (above/refresh) registers the worlds.
-        if (this.bridgeStore) { tab.getBridge = () => this.bridgeStore; }
-        try {
-          await tab.injectExtensions(this._injectables());
-        } catch {}
-      }
+      // Extensions wiring + initial injection now happens in createTab's prepare hook above, BEFORE
+      // the initial navigate, so the first document gets the extension CSS at document-start (fixes
+      // the load flash). The loadEventFired reinject in cdp-tab still re-applies the active set on
+      // every subsequent load (v1.0.1 on-load fix), which the getExtensions callback wired above feeds.
       this._fire();
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);

@@ -261,15 +261,12 @@ class CDPTab {
     } else if (msg.method === 'Page.loadEventFired') {
       // A load replaces the document and drops our host node — re-inject the bar.
       this._reinjectBookmarks();
-      // Re-apply extensions live on every load too. The document-start registration alone is NOT
-      // enough for the INITIAL page: createTab navigates to startUrl BEFORE the SessionManager wires
-      // getExtensions + calls injectExtensions, so that first load runs with no bootstrap registered,
-      // and create()'s one-shot live-apply can race a still-loading/not-yet-URL-matched document —
-      // leaving EnhanceJira (and any extension) un-applied until a manual settings toggle re-injects.
-      // Running the same _reinjectExtensions() (live-apply) path that refreshEnhanceJira/refresh
-      // Extensions use guarantees the fully-loaded document gets the active set with no toggle. It is
-      // idempotent (CSS replace-in-place, main-world JS designed to re-run cleanly) so re-applying on
-      // loads the document-start bootstrap already handled is harmless.
+      // Belt-and-suspenders: the document-start bootstrap (registered before the initial navigate)
+      // is now the primary injection path, so this re-apply is a safety net that re-runs the same
+      // _reinjectExtensions() (live-apply) path that refreshEnhanceJira/refreshExtensions use on
+      // every completed load, re-asserting the active extension/EnhanceJira set. It is idempotent
+      // (CSS replace-in-place, main-world JS designed to re-run cleanly) so re-applying on loads
+      // the document-start bootstrap already handled is harmless.
       this._reinjectExtensions();
     } else if (msg.method === 'Runtime.consoleAPICalled') {
       try {

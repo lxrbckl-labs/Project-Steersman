@@ -184,6 +184,12 @@ class EnhanceJiraStore {
     const selectors = SELECTOR_KEYS.filter((key) => components[key]).map((key) => SELECTORS[key]);
     let css = selectors.length ? `${selectors.join(',')}{display:none !important;}` : '';
     if (components[GAP_KEY]) css += GAP_RULE;
+    // Board-avatars ON: hide Jira's native (capped) assignee filter at document-start so it never
+    // flashes before composeJs()'s custom strip renders. composeJs still injects __ejHideNativeAssignee
+    // live (a harmless duplicate of this rule) and, crucially, REMOVES it when the feature is off — so
+    // this rule is gated on the same flag: when showBoardAvatars is off neither hide is present and the
+    // native filter shows. A brief empty gap before the strip resolves is accepted; a native flash is not.
+    if (components[SHOW_AVATARS_KEY]) css += `${AVATAR_FILTER_SELECTOR}{display:none !important;}`;
     return css;
   }
 

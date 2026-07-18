@@ -401,9 +401,13 @@ function collectMissingFavicons(node, out = []) {
   return out;
 }
 
-// Factory used by the session manager: open one integrated-browser tab, CDP-connect
-// it, and apply the initial navigation. Returns a connected CDPTab.
-async function createTab(startUrl) {
+// Factory used by the session manager: open one integrated-browser tab (at about:blank on BOTH
+// transports), CDP-connect it, run the optional async `prepare(tab)` hook, THEN apply the initial
+// navigation to startUrl. The session manager uses `prepare` to register the extensions
+// document-start bootstrap (Page.setBypassCSP + Page.addScriptToEvaluateOnNewDocument) BEFORE this
+// navigate, so the first startUrl document paints with the extension CSS already in <head> instead
+// of flashing native style then flipping once injection ran post-load. Returns a connected CDPTab.
+async function createTab(startUrl, prepare) {
   // Watch for the browser's editor tab to open BEFORE launching it, so we catch the
   // onDidChangeTabs 'opened' event reliably instead of racing an activeTabGroup snapshot.
   const capture = beginBrowserTabCapture();
@@ -431,6 +435,18 @@ async function createTab(startUrl) {
   } catch (e) {
     log.appendLine('[Logins] cookie injection failed: ' + (e && e.message ? e.message : e));
   }
+  // Register the extensions/bootstrap (CSP bypass + addScriptToEvaluateOnNewDocument) BEFORE the
+  // initial navigate, so the startUrl document runs the document-start CSS in <head> as React first
+  // renders — no native-style flash then flip. The tab is still at about:blank here (both transports
+  // open about:blank; see connectProposedOrDebug), so this registration carries to the upcoming
+  // startUrl load. Errors are swallowed so a bad hook can never block tab creation.
+  if (typeof prepare === 'function') {
+    try {
+      await prepare(t);
+    } catch (e) {
+      log.appendLine('[Bridge] prepare hook failed: ' + (e && e.message ? e.message : e));
+    }
+  }
   if (startUrl && startUrl !== 'about:blank') {
     try {
       await t.navigate(startUrl);
@@ -453,7 +469,11 @@ async function connectProposedOrDebug(startUrl) {
       log.appendLine('[Bridge] proposed path failed (' + e.message + '); falling back to debug session');
     }
   }
-  return launchViaDebug(startUrl);
+  // Launch the debug-fallback browser at about:blank (not startUrl) so it mirrors the proposed path:
+  // createTab registers the extensions bootstrap via the prepare hook, then navigates to startUrl,
+  // giving the first real document the document-start CSS. Launching straight at startUrl would paint
+  // the native page before we could register anything — an unavoidable flash on that transport.
+  return launchViaDebug('about:blank');
 }
 
 // Ordinal "focus Nth editor group" commands, indexed by (viewColumn - 1). VS Code
