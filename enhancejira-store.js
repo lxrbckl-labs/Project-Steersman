@@ -379,8 +379,7 @@ class EnhanceJiraStore {
               el.style.cursor = 'pointer';
               var active = [];
               try {
-                var ap = (new URL(location.href)).searchParams.get('assignee') || '';
-                active = ap ? ap.split(',') : [];
+                active = (new URL(location.href)).searchParams.getAll('assignee');
               } catch (e) {}
               if (active.indexOf(accountId) >= 0) {
                 el.style.boxShadow = '0 0 0 2px #4c9aff';
@@ -389,10 +388,11 @@ class EnhanceJiraStore {
               el.addEventListener('click', function () {
                 try {
                   var u = new URL(location.href);
-                  var cur = (u.searchParams.get('assignee') || '').split(',').filter(Boolean);
+                  var cur = u.searchParams.getAll('assignee').filter(Boolean);
                   var i = cur.indexOf(accountId);
                   if (i >= 0) cur.splice(i, 1); else cur.push(accountId);
-                  if (cur.length) u.searchParams.set('assignee', cur.join(',')); else u.searchParams.delete('assignee');
+                  u.searchParams.delete('assignee');
+                  for (var k = 0; k < cur.length; k++) u.searchParams.append('assignee', cur[k]);
                   location.assign(u.toString());
                 } catch (e) {}
               });
@@ -444,7 +444,7 @@ class EnhanceJiraStore {
                 return x.localeCompare(y);
               });
               var activeParam = '';
-              try { activeParam = (new URL(location.href)).searchParams.get('assignee') || ''; } catch (e) {}
+              try { activeParam = (new URL(location.href)).searchParams.getAll('assignee').slice().sort().join(','); } catch (e) {}
               var sig = activeParam + '||' + names.map(function (n) {
                 var r = roster.get(n) || {};
                 return n + '|' + (r.id || '') + '|' + (r.avatar || '');
