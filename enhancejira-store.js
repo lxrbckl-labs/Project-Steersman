@@ -218,7 +218,7 @@ class EnhanceJiraStore {
         if (exAv) {
           exAv.desired = SHOW_AVATARS;
           if (SHOW_AVATARS && (!exAv.roster || exAv.roster.size === 0)) {
-            exAv.scrapeRoster().then(function (map) { exAv.roster = map; exAv.render(); });
+            exAv.fetchRoster().then(function (map) { exAv.roster = map; exAv.render(); });
           } else { exAv.render(); }
           return;
         }
@@ -277,6 +277,66 @@ class EnhanceJiraStore {
               }
             });
           },
+          rosterFromCards: function () {
+            var map = new Map();
+            try {
+              var cards = document.querySelectorAll(AV_CARD_SEL);
+              for (var i = 0; i < cards.length; i++) {
+                var el = cards[i];
+                var label = el.querySelector('[data-testid$="avatar--label"]');
+                var name = label ? (label.textContent || '').trim().replace(/^Assignee:\\s*/, '') : '';
+                if (!name || name === 'Unassigned') continue;
+                var img = el.querySelector('img');
+                if (!map.has(name) || (img && img.src)) map.set(name, { id: null, avatar: img ? img.src : null });
+              }
+            } catch (e) {}
+            return map;
+          },
+          fetchRoster: function () {
+            var self = this;
+            return new Promise(function (resolve) {
+              try {
+                var mm = location.pathname.match(/\\/boards\\/(\\d+)/);
+                var boardId = mm && mm[1];
+                if (!boardId) { resolve(self.rosterFromCards()); return; }
+                var base = '/rest/agile/1.0/board/' + boardId + '/issue';
+                var withJql = base + '?fields=assignee&jql=' + encodeURIComponent('sprint in openSprints()') + '&maxResults=300';
+                var noJql = base + '?fields=assignee&maxResults=100';
+                var opts = { credentials: 'include', headers: { 'Accept': 'application/json' } };
+                function parse(json) {
+                  var map = new Map();
+                  var sawNull = false;
+                  var issues = (json && json.issues) || [];
+                  for (var i = 0; i < issues.length; i++) {
+                    var as = issues[i] && issues[i].fields && issues[i].fields.assignee;
+                    if (!as) { sawNull = true; continue; }
+                    var nm = as.displayName;
+                    if (!nm) continue;
+                    if (!map.has(nm)) map.set(nm, { id: as.accountId || null, avatar: (as.avatarUrls && as.avatarUrls['48x48']) || null });
+                  }
+                  if (sawNull) map.set('Unassigned', { id: 'unassigned', avatar: null });
+                  return map;
+                }
+                function getJson(url) {
+                  return fetch(url, opts).then(function (r) {
+                    if (!r.ok) throw new Error('bad status ' + r.status);
+                    return r.json();
+                  });
+                }
+                getJson(withJql).then(function (j) {
+                  resolve(parse(j));
+                }).catch(function () {
+                  getJson(noJql).then(function (j) {
+                    resolve(parse(j));
+                  }).catch(function () {
+                    resolve(self.rosterFromCards());
+                  });
+                });
+              } catch (e) {
+                resolve(self.rosterFromCards());
+              }
+            });
+          },
           mergeCards: function () {
             try {
               if (!this.roster) return;
@@ -287,15 +347,17 @@ class EnhanceJiraStore {
                 var name = label ? (label.textContent || '').trim().replace(/^Assignee:\\s*/, '') : '';
                 if (!name || name === 'Unassigned') continue;
                 var img = el.querySelector('img');
-                if (!this.roster.has(name) || (img && img.src)) this.roster.set(name, img ? img.src : null);
+                var cur = this.roster.get(name);
+                if (!cur) this.roster.set(name, { id: null, avatar: img ? img.src : null });
+                else if (img && img.src && !cur.avatar) cur.avatar = img.src;
               }
             } catch (e) {}
           },
-          buildAvatar: function (name, src) {
+          buildAvatar: function (name, avatar, accountId) {
             var el;
-            if (src) {
+            if (avatar) {
               el = document.createElement('img');
-              el.src = src;
+              el.src = avatar;
               el.style.objectFit = 'cover';
             } else {
               el = document.createElement('div');
@@ -313,6 +375,30 @@ class EnhanceJiraStore {
             el.style.objectFit = 'cover';
             el.style.border = '1px solid rgba(255,255,255,.25)';
             el.style.flex = '0 0 auto';
+            if (accountId) {
+              el.style.cursor = 'pointer';
+              var active = [];
+              try {
+                var ap = (new URL(location.href)).searchParams.get('assignee') || '';
+                active = ap ? ap.split(',') : [];
+              } catch (e) {}
+              if (active.indexOf(accountId) >= 0) {
+                el.style.boxShadow = '0 0 0 2px #4c9aff';
+                el.style.border = '1px solid #4c9aff';
+              }
+              el.addEventListener('click', function () {
+                try {
+                  var u = new URL(location.href);
+                  var cur = (u.searchParams.get('assignee') || '').split(',').filter(Boolean);
+                  var i = cur.indexOf(accountId);
+                  if (i >= 0) cur.splice(i, 1); else cur.push(accountId);
+                  if (cur.length) u.searchParams.set('assignee', cur.join(',')); else u.searchParams.delete('assignee');
+                  location.assign(u.toString());
+                } catch (e) {}
+              });
+            } else {
+              el.style.cursor = 'default';
+            }
             return el;
           },
           titleAnchor: function (row) {
@@ -357,7 +443,12 @@ class EnhanceJiraStore {
                 if (y === 'Unassigned') return -1;
                 return x.localeCompare(y);
               });
-              var sig = names.map(function (n) { return n + '|' + (roster.get(n) || ''); }).join(',');
+              var activeParam = '';
+              try { activeParam = (new URL(location.href)).searchParams.get('assignee') || ''; } catch (e) {}
+              var sig = activeParam + '||' + names.map(function (n) {
+                var r = roster.get(n) || {};
+                return n + '|' + (r.id || '') + '|' + (r.avatar || '');
+              }).join(',');
               var strip = document.getElementById('__ej_avatar_strip');
               var placed = !!(strip && strip.parentNode === row);
               if (strip && placed && strip.getAttribute('data-sig') === sig) return;
@@ -374,7 +465,10 @@ class EnhanceJiraStore {
               }
               strip.setAttribute('data-sig', sig);
               strip.innerHTML = '';
-              for (var i = 0; i < names.length; i++) strip.appendChild(this.buildAvatar(names[i], roster.get(names[i])));
+              for (var i = 0; i < names.length; i++) {
+                var r = roster.get(names[i]) || {};
+                strip.appendChild(this.buildAvatar(names[i], r.avatar, r.id));
+              }
               if (!placed) row.appendChild(strip);
             } catch (e) {}
           }
@@ -388,7 +482,7 @@ class EnhanceJiraStore {
             raf(function () { a._scheduled = false; a.mergeCards(); a.render(); });
           });
           a.observer.observe(document.body, { childList: true, subtree: true });
-          if (a.desired) a.scrapeRoster().then(function (map) { a.roster = map; a.render(); });
+          if (a.desired) a.fetchRoster().then(function (map) { a.roster = map; a.render(); });
           else a.render();
         }
         window.__ejAvatars = a;
