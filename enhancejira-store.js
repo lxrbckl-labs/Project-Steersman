@@ -395,10 +395,9 @@ class EnhanceJiraStore {
                 try {
                   var u = new URL(location.href);
                   var cur = u.searchParams.getAll('assignee').filter(Boolean);
-                  var i = cur.indexOf(accountId);
-                  if (i >= 0) cur.splice(i, 1); else cur.push(accountId);
+                  var isOnlyThis = cur.length === 1 && cur[0] === accountId;
                   u.searchParams.delete('assignee');
-                  for (var k = 0; k < cur.length; k++) u.searchParams.append('assignee', cur[k]);
+                  if (!isOnlyThis) u.searchParams.append('assignee', accountId);  // single-select: just this person, unless it was already the only one -> clear
                   location.assign(u.toString());
                 } catch (e) {}
               });
