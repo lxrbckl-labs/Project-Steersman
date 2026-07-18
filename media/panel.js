@@ -10,7 +10,7 @@
 
   // ── State ───────────────────────────────────────────────────
   /** @type {{sessions: Array<{id:string,state:string,url:string,activity:(Object|null)}>, port: (number|string|null), view: ('sessions'|'settings'), settings: (Object|null), scripts: Array<{name:string}>, bookmarks: (Object|null), bookmarksBarEnabled: boolean, version: string}} */
-  let model = { sessions: [], port: null, view: 'sessions', settings: null, scripts: [], bookmarks: null, bookmarksBarEnabled: false, extensions: [], extensionsEnabled: true, version: '' };
+  let model = { sessions: [], port: null, view: 'sessions', settings: null, scripts: [], bookmarks: null, bookmarksBarEnabled: false, extensions: [], extensionsEnabled: true, logins: [], loginsAuto: true, version: '' };
 
   // ── Update-check UI state — module-scoped (like expandedFolders/addForm)
   // so it survives the full-rebuild render() instead of resetting each time
@@ -1152,6 +1152,58 @@
     return section;
   }
 
+  // ── Persistent logins section — operator-only. Snapshot a signed-in tab's cookies (window-wide
+  // jar, filtered to the origin's host, host-side) and re-inject them into any window later. The
+  // model carries METADATA ONLY (origin, cookieCount, savedAt, autoReinject) — never cookie
+  // names/values — so nothing sensitive is ever rendered here.
+
+  // Hands-off master switch — "auto for ALL sites". Reuses the .bm-bar-toggle-row / .capability-toggle
+  // affordance the Extensions master toggle and bookmarks-bar toggle use, so it reads as the same
+  // control. Flipping it posts setAutoAll; the host (SWE-1 backend) does the background capture +
+  // auto-restore sweeps.
+  function loginsMasterToggle() {
+    const toggle = h('input', {
+      type: 'checkbox',
+      className: 'capability-toggle',
+      dataAction: 'toggleLoginsAuto',
+      ariaLabel: 'Automatically keep me logged in on all sites'
+    });
+    toggle.checked = !!model.loginsAuto;
+    return h(
+      'label',
+      { className: 'bm-bar-toggle-row' },
+      toggle,
+      h('span', { className: 'capability-label' }, 'Automatically keep me logged in (all sites)')
+    );
+  }
+
+  function loginsSection() {
+    const section = h('div', { className: 'ext-section' });
+    section.appendChild(bmSectionHeader('logins', 'Persistent logins'));
+    if (isSectionCollapsed('logins')) { return section; }
+
+    // Master toggle + caption at the TOP: the hands-off "auto for ALL sites" switch, then a short
+    // caption clarifying what ON means (background saves + auto sign-in for new windows; you still
+    // log in the first time; capture happens on the next sweep, not instantly).
+    section.appendChild(loginsMasterToggle());
+    section.appendChild(h('div', { className: 'ext-form-label' },
+      model.loginsAuto
+        ? 'On: Steersman periodically saves your logins in the background and signs new windows in automatically. You still log in the first time yourself; a freshly signed-in site is captured on the next background pass.'
+        : 'Off: turn this on to have Steersman save your logins in the background and sign new windows in automatically. You still log in the first time yourself.'));
+
+    // Full-logout control: a single prominent "Clear all cookies" button (posts clearAllLogins, which
+    // the host now handles as a true sign-out — wipes the live browser jar AND the saved store) plus a
+    // description line spelling out the scope. Immediate action (no reliable confirm in a webview).
+    section.appendChild(h('button', {
+      className: 'btn-primary danger logins-clear-btn', type: 'button',
+      dataAction: 'clearAllLogins',
+      title: 'Clear all cookies', ariaLabel: 'Clear all cookies'
+    }, 'Clear'));
+    section.appendChild(h('div', { className: 'ext-form-label' },
+      'Signs you out of every site — clears all live browser cookies and deletes every saved login from your keychain. You\'ll need to log in again.'));
+    return section;
+  }
+
   function bookmarksSection() {
     const section = h('div', { className: 'bm-section' });
     const actions = h('div', { className: 'bm-root-actions' }, addBtn('root', 'bookmark'), addBtn('root', 'folder'));
@@ -1275,6 +1327,8 @@
     wrap.appendChild(scriptsSection());
 
     wrap.appendChild(extensionsSection());
+
+    wrap.appendChild(loginsSection());
 
     wrap.appendChild(bookmarksSection());
 
@@ -1466,6 +1520,7 @@
       post({ type: 'getSettings' });
       post({ type: 'getBookmarks' });
       post({ type: 'getExtensions' });
+      post({ type: 'getLogins' });
     } else if (action === 'toggleCapability' && id) {
       post({ type: 'setCapabilityEnabled', id: id, enabled: target.checked });
     } else if (action === 'toggleBookmarksBarEnabled') {
@@ -1559,6 +1614,21 @@
       render();
     } else if (action === 'deleteExtension' && id) {
       post({ type: 'removeExtension', id: id });
+    } else if (action === 'restoreLogins') {
+      const origin = target.getAttribute('data-origin');
+      if (origin) { post({ type: 'restoreLogins', origin: origin }); }
+    } else if (action === 'removeLogins') {
+      const origin = target.getAttribute('data-origin');
+      if (origin) { post({ type: 'removeLogins', origin: origin }); }
+    } else if (action === 'toggleLoginAuto') {
+      const origin = target.getAttribute('data-origin');
+      if (origin) { post({ type: 'setLoginAutoReinject', origin: origin, value: target.checked }); }
+    } else if (action === 'toggleLoginsAuto') {
+      // Hands-off master switch — background auto-capture + auto-restore across ALL sites.
+      post({ type: 'setAutoAll', value: target.checked });
+    } else if (action === 'clearAllLogins') {
+      // Full logout — the host wipes live browser cookies + every saved login, then reposts the (now-empty) list.
+      post({ type: 'clearAllLogins' });
     }
   });
 
@@ -1855,6 +1925,13 @@
       model.extensions = Array.isArray(msg.items) ? msg.items : [];
       model.extensionsEnabled = msg.extensionsEnabled !== undefined ? !!msg.extensionsEnabled : true;
       render();
+    } else if (msg.type === 'logins') {
+      // Additive: store the host's saved-login METADATA list (origin, cookieCount, savedAt,
+      // autoReinject) — never cookie values — plus the hands-off "auto for ALL sites" master
+      // flag, without touching sessions/settings/view.
+      model.logins = Array.isArray(msg.items) ? msg.items : [];
+      model.loginsAuto = !!msg.autoAll;
+      render();
     } else if (msg.type === 'extensionError') {
       // The host refused an add/update (authoritative JS syntax guard — see panel.js). Re-open the
       // add/edit form with the operator's values + the inline error, reconciling the optimistic
@@ -1943,4 +2020,5 @@
   post({ type: 'getSettings' });
   post({ type: 'getBookmarks' });
   post({ type: 'getExtensions' });
+  post({ type: 'getLogins' });
 })();

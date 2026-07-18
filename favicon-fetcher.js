@@ -39,19 +39,39 @@ class FaviconFetcher {
     }
   }
 
-  // Fetch + base64-encode the favicon for one host. Wrapped so every failure mode (network,
-  // non-2xx, timeout, oversized body) resolves to null rather than throwing.
+  // Fetch + base64-encode the favicon for one host, trying multiple sources in order and
+  // returning the first that yields real image bytes. Wrapped so every failure mode (network,
+  // non-2xx, timeout, oversized body, non-image response) resolves to null rather than throwing.
   async _fetchForHost(host) {
+    // Ordered fallback chain: DuckDuckGo, then the site's own /favicon.ico, then Google as a
+    // last resort (Google 404s for a large fraction of domains).
+    const sources = [
+      `https://icons.duckduckgo.com/ip3/${encodeURIComponent(host)}.ico`,
+      `https://${host}/favicon.ico`,
+      `${FAVICON_SERVICE}?domain=${encodeURIComponent(host)}&sz=32`,
+    ];
+    for (const url of sources) {
+      const result = await this._tryFetchIcon(url);
+      if (result) return result;
+    }
+    return null;
+  }
+
+  // Fetch one candidate icon url and return its data: URI, or null on any miss. Each attempt
+  // gets its own FETCH_TIMEOUT_MS/abort so a slow source can't hang the whole chain. A response
+  // counts as a hit only when it is 2xx, has an image/* content-type, and carries a non-empty
+  // body - guarding against e.g. DuckDuckGo's 200 + 0-byte text/plain "no icon" response.
+  async _tryFetchIcon(url) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
     try {
-      const res = await fetch(`${FAVICON_SERVICE}?domain=${encodeURIComponent(host)}&sz=32`, {
-        signal: controller.signal,
-      });
+      const res = await fetch(url, { signal: controller.signal });
       if (!res.ok) return null;
+      const contentType = (res.headers && res.headers.get('content-type')) || '';
+      if (!contentType.toLowerCase().startsWith('image/')) return null;
       const buf = await res.arrayBuffer();
+      if (buf.byteLength === 0) return null;
       if (buf.byteLength > MAX_BYTES) return null;
-      const contentType = (res.headers && res.headers.get('content-type')) || DEFAULT_CONTENT_TYPE;
       const b64 = Buffer.from(buf).toString('base64');
       return `data:${contentType};base64,${b64}`;
     } catch {

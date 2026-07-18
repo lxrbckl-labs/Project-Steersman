@@ -423,6 +423,27 @@ class CDPTab {
     return this.evaluate(expr);
   }
 
+  // Read every cookie the browser holds via CDP (Network domain already enabled in
+  // enableDomains). Returns the raw cookie array (empty on a missing/odd response).
+  async getCookies() {
+    const r = await this.send('Network.getAllCookies');
+    return (r && r.cookies) || [];
+  }
+
+  // Write cookies into the browser via CDP (Network domain already enabled). This is
+  // browser-context-wide (whole window's jar), not scoped to this tab. No-ops on an empty
+  // batch; lets the caller catch (a bad entry can reject the batch). Never log cookie data.
+  async setCookies(cookieParams) {
+    if (!Array.isArray(cookieParams) || !cookieParams.length) return;
+    await this.send('Network.setCookies', { cookies: cookieParams });
+  }
+
+  // Wipe every cookie the browser holds via CDP (Network domain already enabled). This is
+  // browser-context-wide (whole window's jar) — a true sign-out of every site. Never log cookie data.
+  async clearBrowserCookies() {
+    await this.send('Network.clearBrowserCookies');
+  }
+
   // ---- bookmarks bar (injected UI, kept out of agent reads) ----
 
   // Inject (idempotently) a Chrome-style bookmarks strip into the page. The whole bar lives

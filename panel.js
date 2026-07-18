@@ -72,6 +72,10 @@ class SteersmanWebviewController {
     // Settings-editor mutation; both optional so the panel still works feature-off.
     this._extensions = deps.extensionsStore || null;
     this._refreshExtensions = deps.refreshExtensions || null;
+    // Persistent-logins store (Stage 2/3) — safe metadata + injection-ready cookies live here,
+    // window-scoped SAVE/RESTORE run through it. Optional so the panel still works feature-off;
+    // the webview only ever receives metadata (origin, count, savedAt), never cookie values.
+    this._cookieStore = deps.cookieStore || null;
     // Best-effort favicon fetcher (Phase 3); optional so bookmarks still work without it.
     this._favicons = deps.faviconFetcher || null;
     // Loopback auth token the HTTP API now requires; included in the copy-prompt so manual/
@@ -82,6 +86,11 @@ class SteersmanWebviewController {
     // Current extension version (package.json), pushed into state so the Settings badge
     // can render it and the checkForUpdate handler has a local version to compare against.
     this._version = deps.version || null;
+    // Shared host-level self-update core (update-service.js). Both the manual Settings badge
+    // (_checkForUpdate/_runSelfUpdate delegate to it) and the extension-host's background timer
+    // use this ONE instance, so they share its single `updating` guard and one implementation of
+    // the GitHub check + reinstall pipeline. Optional so the panel still works if it's absent.
+    this._updateService = deps.updateService || null;
     this._disposed = false;
     this._disposables = [];
   }
@@ -188,6 +197,73 @@ class SteersmanWebviewController {
       case 'focusSession':
         await this._focusSession(msg.id);
         break;
+      case 'getLogins':
+        this._postLogins();
+        break;
+      case 'saveLogins':
+        await this._saveLogins(msg.id);
+        break;
+      case 'restoreLogins':
+        await this._restoreLogins(msg.origin);
+        break;
+      case 'removeLogins':
+        if (this._cookieStore) {
+          try {
+            await this._cookieStore.remove(msg.origin);
+          } catch (e) {
+            this._log.appendLine('[Logins] remove failed: ' + (e && e.message ? e.message : e));
+          }
+          this._postLogins();
+        }
+        break;
+      case 'setLoginAutoReinject':
+        if (this._cookieStore) {
+          try {
+            await this._cookieStore.setAutoReinject(msg.origin, !!msg.value);
+          } catch (e) {
+            this._log.appendLine('[Logins] setAutoReinject failed: ' + (e && e.message ? e.message : e));
+          }
+          this._postLogins();
+        }
+        break;
+      case 'setAutoAll':
+        // Hands-off master switch: flip the store's "auto for ALL sites" flag (SWE-1's backend
+        // does the background capture + auto-restore sweeps), then repost so the toggle reflects
+        // the new state. Only the on/off state is logged — never any cookie data.
+        if (this._cookieStore) {
+          try {
+            await this._cookieStore.setAutoAllEnabled(!!msg.value);
+            this._log.appendLine('[Logins] auto-all ' + (msg.value ? 'on' : 'off'));
+          } catch (e) {
+            this._log.appendLine('[Logins] setAutoAll failed: ' + (e && e.message ? e.message : e));
+          }
+          this._postLogins();
+        }
+        break;
+      case 'clearAllLogins': {
+        // Full logout: wipe the LIVE browser jar (browser-context-wide, so this signs the operator
+        // out of every site) across every connected session, then delete every saved login, then
+        // repost the (now-empty) list. Each live clear is isolated so one failure doesn't abort the rest.
+        for (const row of this._manager.list()) {
+          const s = this._manager.get(row.id);
+          if (!(s && s.tab && s.state === 'connected')) continue;
+          try {
+            await s.tab.clearBrowserCookies();
+          } catch (e) {
+            this._log.appendLine('[Logins] clear browser cookies failed for session ' + row.id + ': ' + (e && e.message ? e.message : e));
+          }
+        }
+        if (this._cookieStore) {
+          try {
+            await this._cookieStore.clearAll();
+          } catch (e) {
+            this._log.appendLine('[Logins] clearAll failed: ' + (e && e.message ? e.message : e));
+          }
+        }
+        this._log.appendLine('[Logins] cleared browser cookies + saved logins');
+        this._postLogins();
+        break;
+      }
       case 'closeSession':
         await this._manager.close(msg.id);
         break;
@@ -376,90 +452,18 @@ class SteersmanWebviewController {
   // is stored (SecretStorage, via _setUpdateToken) it authenticates the request so a private
   // repo resolves; without one the check stays anonymous.
   async _checkForUpdate() {
-    const current = this._version || '0.0.0';
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 6000);
-    const headers = {
-      'Accept': 'application/vnd.github+json',
-      'User-Agent': 'project-steersman',
-      'X-GitHub-Api-Version': GITHUB_API_VERSION,
-    };
-    // Authenticate when the operator has stored a token (needed for a private repo). The
-    // value is attached to the header here and never logged; absent, the check is anonymous
-    // and degrades to an honest 'no releases found' rather than a false success.
-    const token = await this._getUpdateToken();
-    if (token) { headers['Authorization'] = 'Bearer ' + token; }
-    try {
-      let latest = null;
-      let releasesUrl = `https://github.com/${REPO}/releases`;
-      const res = await fetch(`https://api.github.com/repos/${REPO}/releases/latest`, {
-        headers,
-        signal: controller.signal,
-      });
-      if (res.ok) {
-        // Parsing/shape failures here (bad JSON, missing tag_name) are a bad API response,
-        // not a network problem — report 'check failed', not 'offline'.
-        try {
-          const data = await res.json();
-          const tag = typeof data.tag_name === 'string' ? data.tag_name : '';
-          latest = tag.replace(/^v/, '').trim();
-          if (data.html_url) { releasesUrl = data.html_url; }
-        } catch (e) {
-          this._log.appendLine('[Panel] checkForUpdate: malformed response body: ' + (e && e.message ? e.message : e));
-          this._post({ type: 'updateStatus', current, error: 'check failed' });
-          return;
-        }
-      } else if (res.status === 404) {
-        // No published GitHub *Release* — but this project ships versions as git *tags*
-        // (see the vX.Y.Z tags), so fall back to the newest tag before giving up; a
-        // tag-only repo is the normal case here, not a failure.
-        this._log.appendLine('[Panel] checkForUpdate: releases/latest returned 404 — falling back to tags');
-        latest = await this._fetchLatestTag(headers, controller.signal);
-        if (latest == null) {
-          this._log.appendLine('[Panel] checkForUpdate: no releases or tags visible for ' + REPO + ' (private repo or no tags?)');
-          this._post({ type: 'updateStatus', current, error: 'no releases found' });
-          return;
-        }
-      } else if (res.status === 401 || res.status === 403) {
-        // Distinguish a bad/insufficient/expired token (auth) from an exhausted rate
-        // limit: GitHub sends x-ratelimit-remaining: 0 on rate-limit 403s. Never report
-        // "check failed" for these — the operator needs to know which knob to turn. The
-        // token value is never logged, only whether one was present.
-        const remaining = res.headers.get('x-ratelimit-remaining');
-        const rateLimited = res.status === 403 && remaining === '0';
-        const err = rateLimited ? 'rate limited — try later' : 'auth failed — check token';
-        this._log.appendLine('[Panel] checkForUpdate: GitHub ' + res.status +
-          (rateLimited ? ' rate-limit exhausted' : ' auth/forbidden') +
-          ' (x-ratelimit-remaining=' + (remaining == null ? 'n/a' : remaining) +
-          ', token ' + (token ? 'present' : 'absent') + ')');
-        this._post({ type: 'updateStatus', current, error: err });
-        return;
-      } else {
-        this._log.appendLine('[Panel] checkForUpdate: GitHub returned ' + res.status);
-        this._post({ type: 'updateStatus', current, error: 'check failed' });
-        return;
-      }
-      // Reject anything that isn't a plain dotted-numeric version (e.g. 'nightly',
-      // 'release-1') before comparing, so a bad tag never renders a garbage verdict.
-      if (!/^\d+(\.\d+)*$/.test(latest)) {
-        this._post({ type: 'updateStatus', current, error: 'check failed' });
-        return;
-      }
-      const cmp = this._compareSemver(latest, current);
-      this._post({
-        type: 'updateStatus',
-        current,
-        latest,
-        upToDate: cmp <= 0,
-        updateAvailable: cmp > 0,
-        releasesUrl,
-      });
-    } catch (e) {
-      this._log.appendLine('[Panel] checkForUpdate failed: ' + (e && e.message ? e.message : e));
-      this._post({ type: 'updateStatus', current, error: 'offline' });
-    } finally {
-      clearTimeout(timer);
+    // Delegate the GitHub lookup to the shared AutoUpdateService (single source of truth,
+    // reused by the background auto-check) and post its verdict verbatim to the webview badge.
+    // The service returns exactly the fields the old inline check posted — success carries
+    // { current, latest, upToDate, updateAvailable, releasesUrl }; any failure carries a short
+    // { current, error } — so the badge renders identically. Defensive fallback keeps the badge
+    // working (as 'check failed') if the service was somehow not threaded in.
+    if (!this._updateService) {
+      this._post({ type: 'updateStatus', current: this._version || '0.0.0', error: 'check failed' });
+      return;
     }
+    const result = await this._updateService.checkLatest();
+    this._post({ type: 'updateStatus', ...result });
   }
 
   // Fallback for repos that publish versions as git tags without cutting GitHub
@@ -543,33 +547,10 @@ class SteersmanWebviewController {
   // absolute path or null when none resolves. Reading an undeclared config key is
   // fine — getConfiguration just returns the default ('') for it.
   _resolveRepoRoot() {
-    let configured = '';
-    try {
-      configured = (vscode.workspace.getConfiguration('projectSteersman').get('repoPath', '') || '').trim();
-    } catch { configured = ''; }
-    if (configured && fs.existsSync(path.join(configured, '.git'))) {
-      return configured;
-    }
-    const folders = vscode.workspace.workspaceFolders;
-    if (folders && folders.length) {
-      for (const folder of folders) {
-        const folderPath = folder && folder.uri && folder.uri.fsPath;
-        if (!folderPath || !fs.existsSync(path.join(folderPath, '.git'))) { continue; }
-        try {
-          const pkg = JSON.parse(fs.readFileSync(path.join(folderPath, 'package.json'), 'utf8'));
-          if (pkg && pkg.name === 'project-steersman') {
-            return folderPath;
-          }
-        } catch { /* malformed/missing package.json — skip this folder */ }
-      }
-    }
-    const extPath = this._extensionUri && this._extensionUri.fsPath;
-    if (extPath &&
-        fs.existsSync(path.join(extPath, '.git')) &&
-        fs.existsSync(path.join(extPath, 'extension.js'))) {
-      return extPath;
-    }
-    return null;
+    // Delegate to the shared AutoUpdateService's resolver (single source of truth). Defensive
+    // null when the service wasn't threaded in — the caller (_runSelfUpdate) also delegates, so
+    // this thin shim exists only for parity/back-compat.
+    return this._updateService ? this._updateService.resolveRepoRoot() : null;
   }
 
   // Run the local git-based reinstall pipeline (build/reinstall.sh) on the operator's
@@ -581,65 +562,49 @@ class SteersmanWebviewController {
   // to drive the final prompt. A module-level guard blocks concurrent runs. Auth is the
   // operator's ambient git credentials — no token flows through here.
   async _runSelfUpdate() {
-    if (selfUpdateInProgress) {
-      vscode.window.showInformationMessage('Project Steersman: an update is already in progress.');
-      return;
-    }
-    const repoRoot = this._resolveRepoRoot();
-    const channel = getSelfUpdateChannel();
-    if (!repoRoot) {
-      channel.appendLine('[Panel] selfUpdate: could not locate a Project-Steersman git checkout.');
-      channel.appendLine('[Panel] Set "projectSteersman.repoPath" to the absolute path of your clone, then try again.');
-      channel.show(true);
+    // Delegate the reinstall heavy lifting (repo resolve, reinstall.sh spawn, marker parse) and
+    // the shared `updating` guard to the AutoUpdateService, and keep ONLY the webview status
+    // posts + the badge's actionable toasts here. The service returns a structured status; each
+    // branch below reproduces the EXACT posts + notifications the old inline pipeline showed, so
+    // the manual badge behaves identically — while now sharing one guard with the background
+    // timer (a manual click during an auto-apply, or vice versa, yields the 'already in progress'
+    // path instead of a racing second reinstall). Defensive no-op if the service is absent.
+    if (!this._updateService) {
       this._post({ type: 'selfUpdateStatus', status: 'error', error: 'no repo checkout' });
       vscode.window.showErrorMessage(
         'Project Steersman: could not locate a git checkout to update from. Set "projectSteersman.repoPath" to the absolute path of your clone.'
       );
       return;
     }
-    const scriptPath = path.join(repoRoot, 'build', 'reinstall.sh');
-    if (!fs.existsSync(scriptPath)) {
-      channel.appendLine('[Panel] selfUpdate: update script not found at ' + scriptPath);
-      channel.show(true);
-      this._post({ type: 'selfUpdateStatus', status: 'error', error: 'script missing' });
-      vscode.window.showErrorMessage('Project Steersman: update script not found at ' + scriptPath + '.');
-      return;
-    }
-
-    selfUpdateInProgress = true;
-    channel.clear();
-    channel.show(true);
-    this._post({ type: 'selfUpdateStatus', status: 'running' });
-    try {
-      let buffer = '';
-      const exitCode = await vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: 'Updating Project Steersman…', cancellable: false },
-        () => new Promise((resolve, reject) => {
-          // `bash -lc` gives the operator's login PATH; the inner `bash <script>`
-          // runs the pipeline. STEERSMAN_INSTALLED_VERSION lets the script decide
-          // whether the currently-installed build already matches upstream.
-          const child = spawn('bash', ['-lc', `bash ${shellQuote(scriptPath)}`], {
-            cwd: repoRoot,
-            env: { ...process.env, STEERSMAN_INSTALLED_VERSION: this._version || '' },
-          });
-          child.stdout.on('data', (chunk) => { const t = chunk.toString(); buffer += t; channel.append(t); });
-          child.stderr.on('data', (chunk) => { const t = chunk.toString(); buffer += t; channel.append(t); });
-          child.on('error', (err) => reject(err));
-          child.on('close', (code) => resolve(code == null ? 0 : code));
-        })
-      );
-
-      if (/\bALREADY_UP_TO_DATE\b/.test(buffer)) {
-        this._post({ type: 'selfUpdateStatus', status: 'upToDate', current: this._version || null });
+    const svc = this._updateService;
+    const channel = svc.getChannel();
+    // `onStatus` fires 'running' the moment the reinstall actually starts (after the guard is
+    // claimed and the repo/script checks pass) — mirrors the old post right before withProgress.
+    const result = await svc.runReinstall({
+      onStatus: (s) => this._post({ type: 'selfUpdateStatus', ...s }),
+    });
+    switch (result.status) {
+      case 'busy':
+        vscode.window.showInformationMessage('Project Steersman: an update is already in progress.');
+        return;
+      case 'noRepo':
+        this._post({ type: 'selfUpdateStatus', status: 'error', error: 'no repo checkout' });
+        vscode.window.showErrorMessage(
+          'Project Steersman: could not locate a git checkout to update from. Set "projectSteersman.repoPath" to the absolute path of your clone.'
+        );
+        return;
+      case 'scriptMissing':
+        this._post({ type: 'selfUpdateStatus', status: 'error', error: 'script missing' });
+        vscode.window.showErrorMessage('Project Steersman: update script not found at ' + result.scriptPath + '.');
+        return;
+      case 'upToDate':
+        this._post({ type: 'selfUpdateStatus', status: 'upToDate', current: result.current });
         vscode.window.showInformationMessage('Project Steersman is already up to date.');
         return;
-      }
-      if (exitCode === 0) {
-        const m = buffer.match(/\[steersman\]\s+Installed:\s+project-steersman v(\S+)/i);
-        const installedVersion = m ? m[1] : 'latest';
-        this._post({ type: 'selfUpdateStatus', status: 'installed', version: installedVersion });
+      case 'installed': {
+        this._post({ type: 'selfUpdateStatus', status: 'installed', version: result.version });
         const choice = await vscode.window.showInformationMessage(
-          `Project Steersman updated to v${installedVersion}. Reload window to activate?`,
+          `Project Steersman updated to v${result.version}. Reload window to activate?`,
           'Reload Window', 'Later'
         );
         if (choice === 'Reload Window') {
@@ -647,21 +612,18 @@ class SteersmanWebviewController {
         }
         return;
       }
-      this._post({ type: 'selfUpdateStatus', status: 'error', error: 'exit ' + exitCode });
-      const choice = await vscode.window.showErrorMessage(
-        `Project Steersman update failed (exit ${exitCode}).`, 'Show Log'
-      );
-      if (choice === 'Show Log') { channel.show(); }
-    } catch (e) {
-      const reason = (e && e.message) ? e.message : String(e);
-      channel.appendLine('[Panel] selfUpdate: spawn failed: ' + reason);
-      this._post({ type: 'selfUpdateStatus', status: 'error', error: reason });
-      const choice = await vscode.window.showErrorMessage(
-        'Project Steersman update failed — ' + reason, 'Show Log'
-      );
-      if (choice === 'Show Log') { channel.show(); }
-    } finally {
-      selfUpdateInProgress = false;
+      case 'error':
+      default: {
+        this._post({ type: 'selfUpdateStatus', status: 'error', error: result.error });
+        // A non-zero exit carries exitCode (the "(exit N)" toast); a spawn failure does not (the
+        // "— <reason>" toast) — matching the two distinct branches of the old pipeline.
+        const message = (result.exitCode !== undefined)
+          ? `Project Steersman update failed (exit ${result.exitCode}).`
+          : 'Project Steersman update failed — ' + result.error;
+        const choice = await vscode.window.showErrorMessage(message, 'Show Log');
+        if (choice === 'Show Log') { channel.show(); }
+        return;
+      }
     }
   }
 
@@ -959,6 +921,111 @@ class SteersmanWebviewController {
       items: this._extensions ? this._extensions.list() : [],
       extensionsEnabled: this._extensions ? this._extensions.getExtensionsEnabled() : true,
     });
+  }
+
+  // Push the saved-login metadata list + the hands-off master flag to the webview (mirror of
+  // _postExtensions). The store's list() returns SAFE metadata only ({origin, cookieCount,
+  // savedAt, autoReinject}) — no cookie names/values ever cross into the webview. autoAll is
+  // the "auto for ALL sites" master switch (background capture + auto-restore). Empty list +
+  // autoAll:false when the store is off (feature-off no-op).
+  _postLogins() {
+    this._post({
+      type: 'logins',
+      items: this._cookieStore ? this._cookieStore.list() : [],
+      autoAll: this._cookieStore ? this._cookieStore.isAutoAllEnabled() : false,
+    });
+  }
+
+  // Snapshot the current window's cookies for the origin of session `id` and persist them via the
+  // cookie store. getCookies is browser-context-wide, so we filter the whole jar down to cookies
+  // belonging to the session's host before saving. Guarded no-op (a log line, never a throw) when
+  // the store is off, the session isn't connected, or its URL has no concrete origin. Only counts
+  // and the origin are ever logged — never cookie names/values.
+  async _saveLogins(id) {
+    if (!this._cookieStore) return;
+    const s = this._manager.get(id);
+    if (!s || !s.tab || s.state !== 'connected') {
+      this._log.appendLine('[Logins] save skipped: session ' + id + ' not connected');
+      return;
+    }
+    let origin;
+    let host;
+    try {
+      const u = new URL(s.url);
+      origin = u.origin;
+      host = u.hostname;
+      if (!origin || origin === 'null' || !host) {
+        this._log.appendLine('[Logins] save skipped: session ' + id + ' has no concrete origin');
+        return;
+      }
+    } catch {
+      this._log.appendLine('[Logins] save skipped: session ' + id + ' URL missing or unparseable');
+      return;
+    }
+    try {
+      const all = await s.tab.getCookies();
+      // A cookie belongs to this origin's host when its domain (leading dot stripped) equals the
+      // host, or the host is a subdomain of that domain (host ends with "." + domain).
+      const filtered = (all || []).filter((c) => {
+        const d = (c && typeof c.domain === 'string') ? c.domain.replace(/^\./, '') : '';
+        if (!d) return false;
+        return d === host || host.endsWith('.' + d);
+      });
+      await this._cookieStore.save(origin, filtered);
+      this._log.appendLine('[Logins] saved ' + filtered.length + ' cookies for ' + origin);
+    } catch (e) {
+      this._log.appendLine('[Logins] save failed for ' + origin + ': ' + (e && e.message ? e.message : e));
+    }
+    this._postLogins();
+  }
+
+  // Re-inject saved cookies for `origin` into the live window. setCookies is browser-context-wide,
+  // so writing through ANY one connected session applies the jar window-wide; then we reload any
+  // connected tab already on that origin so the restored login becomes visible. Guarded no-op (a
+  // log line, never a throw) when the store is off, nothing is saved, or no session is connected.
+  async _restoreLogins(origin) {
+    if (!this._cookieStore) return;
+    let params;
+    try {
+      params = await this._cookieStore.getForOrigin(origin);
+    } catch (e) {
+      this._log.appendLine('[Logins] restore failed reading store for ' + origin + ': ' + (e && e.message ? e.message : e));
+      return;
+    }
+    if (!params || !params.length) {
+      this._log.appendLine('[Logins] restore: no saved cookies for ' + origin);
+      return;
+    }
+    // Any one connected session's tab writes the window-wide jar — find the first.
+    let one = null;
+    for (const row of this._manager.list()) {
+      const full = this._manager.get(row.id);
+      if (full && full.state === 'connected' && full.tab) { one = full; break; }
+    }
+    if (!one) {
+      this._log.appendLine('[Logins] restore skipped: no connected session to write cookies through');
+      return;
+    }
+    try {
+      await one.tab.setCookies(params);
+      this._log.appendLine('[Logins] restored ' + params.length + ' cookies for ' + origin);
+    } catch (e) {
+      this._log.appendLine('[Logins] restore failed for ' + origin + ': ' + (e && e.message ? e.message : e));
+      return;
+    }
+    // Best-effort: reload any connected tab already on this origin so the login shows.
+    for (const row of this._manager.list()) {
+      const full = this._manager.get(row.id);
+      if (!full || full.state !== 'connected' || !full.tab || !full.url) continue;
+      try {
+        if (new URL(full.url).origin === origin) {
+          await full.tab.navigate(full.url);
+        }
+      } catch (e) {
+        this._log.appendLine('[Logins] restore reload skipped for session ' + row.id + ': ' + (e && e.message ? e.message : e));
+      }
+    }
+    this._postLogins();
   }
 
   // Parse-check a JS body in the Node host (no CSP here, unlike the webview, so new Function

@@ -12,7 +12,9 @@ const { ScriptRunner } = require('./script-runner');
 const { BookmarksStore } = require('./bookmarks-store');
 const { ExtensionsStore } = require('./extensions-store');
 const { BridgeStore } = require('./bridge-store');
+const { CookieStore } = require('./cookie-store');
 const { FaviconFetcher } = require('./favicon-fetcher');
+const { AutoUpdateService } = require('./update-service');
 
 let log;
 let manager = null;
@@ -32,6 +34,17 @@ let extensions = null;
 // Bridge (B1): per-extension KV store shared across windows (globalState-backed). Threaded into the
 // SessionManager (tabs service bridge storage calls) and the panel deps like the other stores.
 let bridge = null;
+// Persistent shared logins (Stages 2+3): per-origin cookie jars in SecretStorage (shared across
+// windows) with a plaintext index in globalState. Injected into new tabs (auto-reinject) and
+// exposed to the panel like the other stores.
+let logins = null;
+// Stage 4 background auto-capture: when the master auto-all flag is on, this timer periodically
+// reads ONE connected session's (context-wide) cookie jar and hands it to logins.autoSaveAll so
+// logins persist hands-off. Cleared on deactivate. _loginSweepBusy guards against overlapping runs.
+let loginSweepTimer = null;
+let _loginSweepBusy = false;
+// How often the auto-all sweep captures the jar (ms). Cheap flag check when auto-all is off.
+const LOGIN_SWEEP_INTERVAL_MS = 45000;
 // VS Code SecretStorage (OS-keychain-backed); handed to the panel so its update-check
 // can read an optional GitHub token for authenticated API calls against a private repo.
 let secrets = null;
@@ -43,6 +56,22 @@ let favicons = null;
 // state so the Settings "check for updates" badge can render the current version.
 let version = null;
 let extensionUri = null;
+// One host-level self-update core per activation (update-service.js). Shared by the Settings
+// badge (threaded into panelDeps so the panel delegates to it) and the background timer below,
+// so both run one implementation of the GitHub check + reinstall pipeline and share its single
+// `updating` guard. Constructed in activate() once secrets/version/extensionUri are known.
+let updateService = null;
+// Background auto-update-check timers, mirroring the loginSweepTimer pattern: a one-shot
+// setTimeout ~5s after activation plus a recurring setInterval. Held at module scope so the
+// config-change listener can rebuild them and deactivate() can clear them. Both call
+// updateService.autoCheckForUpdate(), which is silent on every failure path.
+let updateCheckTimer = null;
+let updateCheckInterval = null;
+// Startup delay before the first background check (let activation settle first), plus the
+// interval default/floor. The floor clamps an operator-set interval that is too aggressive.
+const UPDATE_CHECK_STARTUP_DELAY_MS = 5000;
+const DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES = 60;
+const MIN_UPDATE_CHECK_INTERVAL_MINUTES = 5;
 // The activity-bar sidebar's WebviewView provider (COEXISTS with the editor WebviewPanel).
 // Held at module scope so the central-scripts fs.watch can re-push its state alongside the
 // panel's; it drives the SAME UI + message protocol via a shared controller.
@@ -88,9 +117,15 @@ function activate(context) {
   // Bridge (B1): per-extension KV store backed by globalState; context.secrets is passed for the
   // (later) B3 SecretStorage tier so its construction doesn't change then.
   bridge = new BridgeStore(context.globalState, context.secrets);
+  // Persistent shared logins: plaintext index in globalState, raw cookie jars in SecretStorage.
+  logins = new CookieStore(context.globalState, context.secrets);
   secrets = context.secrets;
   favicons = new FaviconFetcher();
   apiToken = crypto.randomBytes(32).toString('hex');
+  // Shared self-update core: threaded into panelDeps() (so the Settings badge delegates to it)
+  // and driven by the background timers below. Given the same secrets/version/extensionUri/log
+  // that panelDeps() already gathers, plus context for parity with the ResourceMonitor model.
+  updateService = new AutoUpdateService({ extensionUri, version, secrets, log, context });
 
   // Clear registry entries left behind by extension hosts that crashed without unregistering.
   pruneStaleInstances();
@@ -246,6 +281,83 @@ function activate(context) {
   // yet (freshly seeded, or added before this feature existed). Fire-and-forget - never
   // awaited here - so a slow or failing favicon service can never delay or break activation.
   backfillFavicons().catch((e) => log.appendLine('[Bridge] backfillFavicons failed: ' + (e && e.message ? e.message : e)));
+
+  // Stage 4: start the hands-off auto-all cookie sweep (a cheap flag check when auto-all is off).
+  // Registered for disposal like the fs.watch above so a reload/deactivate clears the interval.
+  loginSweepTimer = setInterval(() => { loginSweepTick(); }, LOGIN_SWEEP_INTERVAL_MS);
+  context.subscriptions.push({ dispose() { if (loginSweepTimer) { clearInterval(loginSweepTimer); loginSweepTimer = null; } } });
+
+  // Automatic self-update check: start the background timers (mirrors the loginSweepTimer
+  // registration/clear discipline above). Rebuild them when the relevant settings change so a
+  // toggle/interval edit takes effect without a reload, and register both for disposal so a
+  // reload/deactivate clears the pending one-shot + the recurring interval.
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('projectSteersman.autoCheckForUpdates') ||
+          e.affectsConfiguration('projectSteersman.updateCheckIntervalMinutes')) {
+        stopUpdateCheckTimers();
+        startUpdateCheckTimers();
+      }
+    })
+  );
+  context.subscriptions.push({ dispose() { stopUpdateCheckTimers(); } });
+  startUpdateCheckTimers();
+}
+
+// One tick of the Stage-4 auto-all sweep: when the master flag is on, capture ONE connected
+// session's cookie jar (context-wide, so one session seeds the whole window) and persist it via
+// logins.autoSaveAll. The existing createTab inject hook handles auto-RESTORE, so this only needs to
+// CAPTURE. Guarded end to end: no store / flag off / no connected session / in-flight run all skip
+// silently; only a COUNT/status line is logged, never cookie data. Never throws.
+async function loginSweepTick() {
+  try {
+    if (!logins || !logins.isAutoAllEnabled()) return;
+    if (_loginSweepBusy) return; // don't pile up overlapping runs if a sweep outlasts the interval
+    _loginSweepBusy = true;
+    try {
+      const s = manager && typeof manager.latestConnected === 'function' ? manager.latestConnected() : null;
+      const tab = s && s.tab;
+      if (!tab) return; // no connected session this tick — skip silently
+      const jar = await tab.getCookies();
+      await logins.autoSaveAll(jar);
+      log.appendLine('[Logins] auto-all sweep captured ' + (Array.isArray(jar) ? jar.length : 0) + ' cookies');
+    } finally {
+      _loginSweepBusy = false;
+    }
+  } catch (e) {
+    log.appendLine('[Logins] auto-all sweep failed: ' + (e && e.message ? e.message : e));
+  }
+}
+
+// Clear both the deferred startup check and the recurring interval, if scheduled. Shared by
+// deactivate() and the config-change listener, which both tear the timers down before (maybe)
+// re-establishing them. Idempotent. Mirrors the loginSweepTimer clear discipline.
+function stopUpdateCheckTimers() {
+  if (updateCheckTimer) { clearTimeout(updateCheckTimer); updateCheckTimer = null; }
+  if (updateCheckInterval) { clearInterval(updateCheckInterval); updateCheckInterval = null; }
+}
+
+// (Re-)establish the background update-check timers per current settings: when
+// projectSteersman.autoCheckForUpdates is on, schedule a one-shot check ~5s after activation
+// plus a recurring setInterval every projectSteersman.updateCheckIntervalMinutes (default 60,
+// floored at 5); when it's off, leave both cleared. Both fire updateService.autoCheckForUpdate(),
+// which is SILENT on every failure path. Callers must stopUpdateCheckTimers() first so a rebuild
+// never stacks a second live timer. Guarded no-op when the service wasn't constructed.
+function startUpdateCheckTimers() {
+  if (!updateService) return;
+  const cfg = vscode.workspace.getConfiguration('projectSteersman');
+  if (!cfg.get('autoCheckForUpdates', true)) return;
+  const runCheck = () => {
+    if (!updateService) return;
+    Promise.resolve(updateService.autoCheckForUpdate()).catch((e) =>
+      log.appendLine('[Bridge] auto update-check failed: ' + (e && e.message ? e.message : e)));
+  };
+  updateCheckTimer = setTimeout(() => { updateCheckTimer = null; runCheck(); }, UPDATE_CHECK_STARTUP_DELAY_MS);
+  let minutes = cfg.get('updateCheckIntervalMinutes', DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES);
+  if (typeof minutes !== 'number' || !isFinite(minutes) || minutes < MIN_UPDATE_CHECK_INTERVAL_MINUTES) {
+    minutes = MIN_UPDATE_CHECK_INTERVAL_MINUTES;
+  }
+  updateCheckInterval = setInterval(runCheck, minutes * 60 * 1000);
 }
 
 // Walk the whole bookmark tree once and fetch a favicon for every bookmark that doesn't have
@@ -297,6 +409,20 @@ async function createTab(startUrl) {
   // Record which editor group (and tab) the browser landed in so the panel's "Focus"
   // can bring it back to the front later.
   await finalizeBrowserTabCapture(capture, t);
+  // Stage-3 auto-reinject: while still at about:blank, push every persisted (auto-reinject) cookie
+  // jar into the browser context (Network.setCookies is context-wide, so one tab seeds the window).
+  // Best-effort — never blocks tab creation. NEVER log cookie data; count/prefix only.
+  try {
+    if (logins) {
+      const inj = await logins.allCookiesForInjection();
+      if (inj && inj.length) {
+        await t.setCookies(inj);
+        log.appendLine('[Logins] injected ' + inj.length + ' persisted cookies');
+      }
+    }
+  } catch (e) {
+    log.appendLine('[Logins] cookie injection failed: ' + (e && e.message ? e.message : e));
+  }
   if (startUrl && startUrl !== 'about:blank') {
     try {
       await t.navigate(startUrl);
@@ -486,56 +612,60 @@ function captureBrowserPlacementSnapshot(t) {
 // Best-effort: force an EDITOR GROUP to be the active view before we launch, so the
 // editor-browser debug session — which opens relative to whatever view is active at
 // startDebugging time — lands as a normal editor tab in an editor column and NOT in the
-// sidebar/panel/aux area (the reported bug: if focus sits in a non-editor view, or the
-// Steersman webview panel isn't the active editor, the browser inherits that location).
-// Preference order:
-//   1. When the panel's column is known: reuse an existing editor group that isn't the
-//      panel's, else split a fresh empty group to the RIGHT of the panel's group.
-//   2. When the panel's column is unknown (panel hidden -> viewColumn undefined, or not
-//      open yet): still force a real editor group active — prefer one not showing our own
-//      panel — so the browser never falls back to the sidebar. There is essentially always
-//      at least one editor group; if somehow none, split a new one.
-// The panel is left in its own column, visible. Any failure degrades silently to VS Code's
-// default placement rather than aborting launch.
+// sidebar/panel/aux area, AND so each browser session gets its OWN editor group.
+//
+// Why per-group: v0.6.0 made the UI sidebar-only, deleting the editor webview panel — so
+// ProjectSteersmanPanel.current is now permanently null and the old "split beside the panel
+// column" logic no longer applies. Left unchanged, every browser stacked as sibling tabs in
+// one group, and the panel's per-tab "Focus" switch is unreliable for editor-browser tabs, so
+// with 2+ stacked browsers Focus landed on the wrong tab. Giving each browser its own column
+// makes focusEditorGroupByColumn(column) alone reveal the right tab.
+//
+// Placement: never land a new browser in a column another live session already occupies. We
+// reuse an existing editor group that no browser owns — the user's code group for the first
+// browser, or a group a closed browser vacated — which both avoids forcing an unnecessary new
+// group and reuses leftover columns; only when every editor group is already occupied (or none
+// exist) do we split a fresh group to the right. Occupied columns come from the session
+// manager's recorded placements (via its public list()/get()), which reflect the actual landing
+// column captured at each prior launch. Any failure degrades silently to VS Code's default
+// placement rather than aborting launch.
 async function arrangeBrowserPlacement() {
   try {
     const tabGroups = vscode.window.tabGroups;
     const groups = (tabGroups && tabGroups.all) || [];
-    const panel = ProjectSteersmanPanel.current && ProjectSteersmanPanel.current._panel;
-    const panelColumn = panel && panel.viewColumn;
 
-    if (panelColumn) {
-      const others = groups.filter((g) => g.viewColumn && g.viewColumn !== panelColumn);
-      if (others.length) {
-        const target = others[0];
-        log.appendLine(
-          '[Bridge] placement: reusing existing editor group (viewColumn ' + target.viewColumn +
-          ') beside panel (viewColumn ' + panelColumn + ')'
-        );
-        await focusEditorGroupByColumn(target.viewColumn);
-        return;
+    // Columns already hosting a live browser session. The session being created right now is
+    // already in the manager's list but has no viewColumn yet (it is stamped only after this
+    // launch's capture), so it is naturally excluded here.
+    const occupied = new Set();
+    if (manager && typeof manager.list === 'function' && typeof manager.get === 'function') {
+      for (const row of manager.list()) {
+        const s = manager.get(row.id);
+        if (s && s.viewColumn) occupied.add(s.viewColumn);
       }
-      // Only the panel's group is open: focus it so the split is relative to it, then
-      // open a fresh empty group to its right for the browser to land in.
-      log.appendLine('[Bridge] placement: no other editor group; splitting a new group right of panel (viewColumn ' + panelColumn + ')');
-      if (typeof panel.reveal === 'function') panel.reveal(panelColumn, false);
-      await vscode.commands.executeCommand('workbench.action.newGroupRight');
+    }
+
+    // Prefer an existing editor group that no browser occupies (skip our own — now dead —
+    // panel tab defensively). This is the first browser's reuse of the user's code group, or
+    // reuse of a column a closed browser vacated.
+    const free = groups.find(
+      (g) => g.viewColumn && !occupied.has(g.viewColumn) && !(g.tabs || []).some(isSteersmanPanelTab)
+    );
+    if (free) {
+      log.appendLine(
+        '[Bridge] placement: reusing free editor group (viewColumn ' + free.viewColumn +
+        '); occupied browser columns [' + [...occupied].join(', ') + ']'
+      );
+      await focusEditorGroupByColumn(free.viewColumn);
       return;
     }
 
-    // No visible panel column: the editor-browser would otherwise open relative to the
-    // current (possibly non-editor) active view. Force a real editor group active instead,
-    // preferring one that isn't showing our own panel so we don't cover it.
-    const editorGroup =
-      groups.find((g) => g.viewColumn && !(g.tabs || []).some(isSteersmanPanelTab)) ||
-      groups.find((g) => g.viewColumn) ||
-      null;
-    if (editorGroup) {
-      log.appendLine('[Bridge] placement: no panel column; focusing editor group (viewColumn ' + editorGroup.viewColumn + ') to keep browser in the editor area');
-      await focusEditorGroupByColumn(editorGroup.viewColumn);
-      return;
-    }
-    log.appendLine('[Bridge] placement: no editor group available; creating one for the browser');
+    // Every editor group already holds a browser (or there are none): split a fresh group to
+    // the right so this browser lands in its own distinct column.
+    log.appendLine(
+      '[Bridge] placement: no free editor group (occupied browser columns [' + [...occupied].join(', ') +
+      ']); splitting a new group right for this browser'
+    );
     await vscode.commands.executeCommand('workbench.action.newGroupRight');
   } catch (e) {
     log.appendLine('[Bridge] placement: arranging editor group failed (' + (e && e.message ? e.message : e) + '); using default placement');
@@ -676,6 +806,9 @@ function panelDeps() {
     bookmarksStore: bookmarks,
     extensionsStore: extensions,
     bridgeStore: bridge,
+    // Persistent shared logins store (Stages 2+3): the panel saves/lists/removes per-origin jars
+    // and toggles auto-reinject through this handle.
+    cookieStore: logins,
     // Lets the panel fetch a data-URI favicon (Node-side) when a bookmark is added.
     faviconFetcher: favicons,
     // Lets the panel re-inject the live in-page bookmarks bar after a Settings-editor edit.
@@ -688,6 +821,9 @@ function panelDeps() {
     secrets,
     // Current package.json version; the panel pushes it into state for the update-check badge.
     version,
+    // Shared self-update core: the panel's manual badge delegates its GitHub check + reinstall
+    // to this SAME instance the background timer uses, so both share its single `updating` guard.
+    updateService,
   };
 }
 
@@ -799,6 +935,15 @@ function pruneStaleInstances() {
 }
 
 function deactivate() {
+  // Stop the Stage-4 auto-all sweep (also disposed via context.subscriptions; clearing here too
+  // keeps deactivate self-contained). Idempotent.
+  if (loginSweepTimer) {
+    clearInterval(loginSweepTimer);
+    loginSweepTimer = null;
+  }
+  // Stop the background update-check timers (also disposed via context.subscriptions; clearing
+  // here too keeps deactivate self-contained). Idempotent.
+  stopUpdateCheckTimers();
   return stopServer();
 }
 

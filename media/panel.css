@@ -117,6 +117,26 @@ button.btn-primary:focus-visible {
   outline-offset: 1px;
 }
 
+/* Destructive text button — btn-primary chrome with an error-tinted fill so a full-logout /
+   "Clear all cookies" action reads as destructive. Reuses the errorForeground token. */
+button.btn-primary.danger {
+  background: var(--vscode-errorForeground, #f14c4c);
+  color: #fff;
+}
+
+button.btn-primary.danger:hover:not(:disabled) {
+  background: var(--vscode-errorForeground, #f14c4c);
+  filter: brightness(1.1);
+}
+
+/* Logins "Clear" button lives directly in .ext-section, a flex column whose default
+   align-items: stretch would otherwise force it full-width; pin it to content width and
+   the start of the cross axis so it hugs its label like other inline buttons. */
+button.logins-clear-btn {
+  align-self: flex-start;
+  width: auto;
+}
+
 /* Icon button — square, transparent, hover-lit. Used for row actions. */
 button.icon-button {
   display: inline-flex;
@@ -340,6 +360,17 @@ button.icon-button.settings-github-btn:hover:not(:disabled) {
   align-items: center;
   gap: 4px;
   min-width: 0;
+}
+
+/* Root cause of the caret/title vertical misalignment in compound headers: bmSectionHeader()
+   reuses .settings-section-title on an inner <span> purely for its text styling, but that class
+   also carries the standalone header's spacing margin (14px 0 4px). As a flex item, that margin
+   is asymmetric (14px top vs 4px bottom), so align-items:center on .settings-section-titlegroup
+   centers the taller margin box and the title text lands a few px below true center — making the
+   (unmargined) caret beside it look like it rides high. Zero the margin here; the plain
+   .settings-section-title (used standalone, e.g. Automations) is untouched. */
+.settings-section-titlegroup .settings-section-title {
+  margin: 0;
 }
 
 /* The rotating caret — right-pointing when collapsed, down when expanded (open). */
@@ -1257,6 +1288,34 @@ select.ext-runat:focus-visible {
   align-items: center;
   gap: 2px;
   justify-content: flex-end;
+}
+
+/* ─── Persistent logins (Stage 2/3) — a per-origin saved-login row inside an .ext-list card.
+   Mirrors .ext-row density; the count badge reuses the compact neutral pill of .ext-kind. ──── */
+.login-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+
+.login-row:hover {
+  background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.12));
+}
+
+/* Saved-cookie count badge — same compact neutral pill as .ext-kind / .script-lang. */
+.login-count-badge {
+  flex: 0 0 auto;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  border-radius: 3px;
+  padding: 1px 5px;
+  line-height: 1.4;
+  color: var(--vscode-descriptionForeground, #999);
+  border: 1px solid var(--vscode-descriptionForeground, #999);
 }
 
 /* ─── Narrow-column polish (activity-bar sidebar) ─────────────────────────────
