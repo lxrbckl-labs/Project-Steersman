@@ -184,6 +184,14 @@ button.icon-button.btn-add {
   line-height: 1;
 }
 
+/* Disabled while a new session is being set up (state 'connecting') — dimmed
+   and non-interactive, matching .update-badge:disabled / select.script-picker:disabled. */
+button.icon-button.btn-add:disabled {
+  cursor: default;
+  opacity: 0.5;
+  pointer-events: none;
+}
+
 /* Fleet-level copy button — the rail-scoped sibling of the per-row copy
    button; pairs with .btn-add (box border/sizing) so it matches the ＋ New
    Session button, and margin-left:auto pins it to the opposite (right) side
@@ -1288,6 +1296,25 @@ select.ext-runat:focus-visible {
   align-items: center;
   gap: 2px;
   justify-content: flex-end;
+}
+
+/* ─── EnhanceJira section — a master toggle (reuses .bm-bar-toggle-row/.capability-toggle, same
+   as the Extensions master toggle above) followed by per-component checkboxes (7 toolbar hides +
+   5 board-action hides), each also a .bm-bar-toggle-row/.capability-toggle pair. This wrapper
+   only sets the column layout + spacing for those checkbox stacks — no new toggle/label styling.
+   ─────────────────────────────────────────────────────────────────────────────────────────── */
+.ej-component-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+/* Thin rule that sets the "Move Sprint insights" toggle apart from the hide-checkboxes above it —
+   it relocates a button rather than hiding it, so it gets its own visual break + sub-caption. */
+.ej-move-divider {
+  border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  margin: 6px 0 2px;
 }
 
 /* ─── Persistent logins (Stage 2/3) — a per-origin saved-login row inside an .ext-list card.

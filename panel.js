@@ -72,6 +72,10 @@ class SteersmanWebviewController {
     // Settings-editor mutation; both optional so the panel still works feature-off.
     this._extensions = deps.extensionsStore || null;
     this._refreshExtensions = deps.refreshExtensions || null;
+    // EnhanceJira store + the hook that re-applies the live in-page CSS-hide record after a
+    // Settings-editor toggle; both optional so the panel still works feature-off.
+    this._enhanceJira = deps.enhanceJiraStore || null;
+    this._refreshEnhanceJira = deps.refreshEnhanceJira || null;
     // Persistent-logins store (Stage 2/3) — safe metadata + injection-ready cookies live here,
     // window-scoped SAVE/RESTORE run through it. Optional so the panel still works feature-off;
     // the webview only ever receives metadata (origin, count, savedAt), never cookie values.
@@ -145,7 +149,11 @@ class SteersmanWebviewController {
         const authNote = this._token
           ? '\n\n---\n\nAUTH: every request to the local HTTP API must send the header ' +
             '`x-steersman-token: ' + this._token + '` — e.g. ' +
-            '`curl -H "x-steersman-token: ' + this._token + '" http://localhost:' + authPort + '/url`.'
+            '`curl -H "x-steersman-token: ' + this._token + '" http://localhost:' + authPort + '/url`. ' +
+            'Treat the token as a secret: do not log it, echo it back, or paste it into commands you ' +
+            'surface. Prefer a wrapper that reads it from the instance registry ' +
+            '(`~/.project-steersman/instances/<id>.json`, which carries `{ port, token }`) and injects ' +
+            'the header internally, so the value never appears in your output.'
           : '';
         const prompt = this._config.compose() + '\n\n---\n\n' + this._manager.buildPrompt(msg.id, this._config) + authNote;
         await vscode.env.clipboard.writeText(prompt);
@@ -162,7 +170,11 @@ class SteersmanWebviewController {
         const authNote = this._token
           ? '\n\n---\n\nAUTH: every request to the local HTTP API must send the header ' +
             '`x-steersman-token: ' + this._token + '` — e.g. ' +
-            '`curl -H "x-steersman-token: ' + this._token + '" http://localhost:' + authPort + '/url`.'
+            '`curl -H "x-steersman-token: ' + this._token + '" http://localhost:' + authPort + '/url`. ' +
+            'Treat the token as a secret: do not log it, echo it back, or paste it into commands you ' +
+            'surface. Prefer a wrapper that reads it from the instance registry ' +
+            '(`~/.project-steersman/instances/<id>.json`, which carries `{ port, token }`) and injects ' +
+            'the header internally, so the value never appears in your output.'
           : '';
         const prompt = this._config.compose() + '\n\n---\n\n' + this._manager.buildFleetPrompt(this._config) + authNote;
         await vscode.env.clipboard.writeText(prompt);
@@ -368,6 +380,37 @@ class SteersmanWebviewController {
             this._log.appendLine('[Panel] setExtensionsEnabled failed: ' + (e && e.message ? e.message : e));
           }
           this._postExtensions();
+        }
+        break;
+      case 'getEnhanceJira':
+        this._postEnhanceJira();
+        break;
+      case 'setEnhanceJiraEnabled':
+        // Flip the persisted master enable, re-apply the CSS-hide record across every live tab,
+        // then repost so the webview's master toggle reflects the new state; guarded no-op (never a
+        // throw) when the EnhanceJira store is off.
+        if (this._enhanceJira) {
+          try {
+            this._enhanceJira.setEnabled(!!msg.enabled);
+            if (this._refreshEnhanceJira) await this._refreshEnhanceJira();
+          } catch (e) {
+            this._log.appendLine('[Panel] setEnhanceJiraEnabled failed: ' + (e && e.message ? e.message : e));
+          }
+          this._postEnhanceJira();
+        }
+        break;
+      case 'setEnhanceJiraComponent':
+        // Flip one component's hide flag, re-apply the CSS-hide record across every live tab, then
+        // repost so the webview's component checkboxes reflect the new state; guarded no-op (never a
+        // throw) when the EnhanceJira store is off.
+        if (this._enhanceJira) {
+          try {
+            this._enhanceJira.setComponent(msg.key, !!msg.value);
+            if (this._refreshEnhanceJira) await this._refreshEnhanceJira();
+          } catch (e) {
+            this._log.appendLine('[Panel] setEnhanceJiraComponent failed: ' + (e && e.message ? e.message : e));
+          }
+          this._postEnhanceJira();
         }
         break;
       case 'addExtension': {
@@ -920,6 +963,18 @@ class SteersmanWebviewController {
       type: 'extensions',
       items: this._extensions ? this._extensions.list() : [],
       extensionsEnabled: this._extensions ? this._extensions.getExtensionsEnabled() : true,
+    });
+  }
+
+  // Push the EnhanceJira master-enable flag + per-component hide flags to the webview (mirror of
+  // _postExtensions). Falls back to enabled:false and an empty components map when the store is off
+  // (feature-off is a no-op, never a throw).
+  _postEnhanceJira() {
+    const state = this._enhanceJira ? this._enhanceJira.getState() : { enabled: false, components: {} };
+    this._post({
+      type: 'enhanceJira',
+      enabled: state.enabled,
+      components: state.components,
     });
   }
 

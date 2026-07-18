@@ -10,7 +10,13 @@
 
   // ── State ───────────────────────────────────────────────────
   /** @type {{sessions: Array<{id:string,state:string,url:string,activity:(Object|null)}>, port: (number|string|null), view: ('sessions'|'settings'), settings: (Object|null), scripts: Array<{name:string}>, bookmarks: (Object|null), bookmarksBarEnabled: boolean, version: string}} */
-  let model = { sessions: [], port: null, view: 'sessions', settings: null, scripts: [], bookmarks: null, bookmarksBarEnabled: false, extensions: [], extensionsEnabled: true, logins: [], loginsAuto: true, version: '' };
+  let model = {
+    sessions: [], port: null, view: 'sessions', settings: null, scripts: [], bookmarks: null, bookmarksBarEnabled: false,
+    extensions: [], extensionsEnabled: true, logins: [], loginsAuto: true, version: '',
+    enhanceJira: { enabled: true, components: { version: false, epic: false, type: false, quickFilters: false, search: false, assignee: false, more: false,
+      completeSprint: false, sprintDetails: false, group: false, viewSettings: false, moreActions: false, shareButton: false, feedbackButton: false,
+      addPeople: false, boardActionsMenu: false, moveSprintInsights: false, removeToolbarGap: false, showBoardAvatars: true } }
+  };
 
   // ── Update-check UI state — module-scoped (like expandedFolders/addForm)
   // so it survives the full-rebuild render() instead of resetting each time
@@ -1152,6 +1158,175 @@
     return section;
   }
 
+  // ── EnhanceJira section — operator-only toggle set that hides Jira board toolbar components.
+  // Pure webview UI: renders from host-pushed model.enhanceJira and posts messages; the host +
+  // page injection are handled elsewhere. Master toggle mirrors extMasterToggle() exactly (same
+  // .bm-bar-toggle-row/.capability-toggle affordance); the component checkboxes (7 toolbar +
+  // 5 board-action + 2 header-icon + 2 title-bar hides, plus 1 "move" toggle set apart below a divider) reuse the same
+  // .capability-toggle/.capability-label pair, one per row, in a compact column (.ej-component-list
+  // in panel.css — the only new class besides the move-divider, for the column layout).
+  const EJ_COMPONENTS = [
+    { key: 'version', label: 'Version' },
+    { key: 'epic', label: 'Epic' },
+    { key: 'type', label: 'Type' },
+    { key: 'quickFilters', label: 'Quick filters' },
+    { key: 'search', label: 'Search' },
+    { key: 'assignee', label: 'Assignee' },
+    { key: 'more', label: 'More' }
+  ];
+
+  // Board actions — a second hide-group, same {key,label} shape as EJ_COMPONENTS and rendered
+  // with the identical enhanceJiraComponentRow()/ej-component-list pairing, just under its own
+  // "Board actions" sub-caption (.ext-form-label, the same small-label class the extension
+  // add/edit form uses above its match-patterns/JS/CSS editors).
+  const EJ_BOARD_ACTIONS = [
+    { key: 'completeSprint', label: 'Complete sprint' },
+    { key: 'sprintDetails', label: 'Sprint details' },
+    { key: 'group', label: 'Group / swimlanes' },
+    { key: 'viewSettings', label: 'View settings' },
+    { key: 'moreActions', label: 'More actions (…)' },
+    { key: 'removeToolbarGap', label: 'Remove toolbar gap' }
+  ];
+
+  // Header icons — a third hide-group for the board header's top-right icon cluster, same
+  // {key,label} shape and enhanceJiraComponentRow()/ej-component-list pairing as the groups above,
+  // under its own "Header icons" sub-caption. Insights + fullscreen in that cluster are deliberately
+  // not included here (kept, not hideable).
+  const EJ_HEADER_ICONS = [
+    { key: 'shareButton', label: 'Share' },
+    { key: 'feedbackButton', label: 'Give feedback' }
+  ];
+
+  // Title bar — a fourth hide-group for the two controls right of the board title, same
+  // {key,label} shape and enhanceJiraComponentRow()/ej-component-list pairing as the groups above,
+  // under its own "Title bar" sub-caption.
+  const EJ_TITLE_BAR = [
+    { key: 'addPeople', label: 'Add people' },
+    { key: 'boardActionsMenu', label: 'Board actions menu' }
+  ];
+
+  function enhanceJiraMasterToggle() {
+    const ej = model.enhanceJira || {};
+    const toggle = h('input', {
+      type: 'checkbox',
+      className: 'capability-toggle',
+      dataAction: 'toggleEnhanceJiraEnabled',
+      ariaLabel: 'Enable EnhanceJira'
+    });
+    toggle.checked = !!ej.enabled;
+    return h(
+      'label',
+      { className: 'bm-bar-toggle-row' },
+      toggle,
+      h('span', { className: 'capability-label' }, 'Enable EnhanceJira'),
+      !ej.enabled ? h('span', { className: 'bm-bar-hint' }, '(all disabled)') : null
+    );
+  }
+
+  function enhanceJiraComponentRow(comp) {
+    const ej = model.enhanceJira || {};
+    const components = ej.components || {};
+    const toggle = h('input', {
+      type: 'checkbox',
+      className: 'capability-toggle',
+      dataAction: 'toggleEnhanceJiraComponent',
+      'data-ej-key': comp.key,
+      ariaLabel: 'Hide ' + comp.label
+    });
+    toggle.checked = !!components[comp.key];
+    return h(
+      'label',
+      { className: 'bm-bar-toggle-row' },
+      toggle,
+      h('span', { className: 'capability-label' }, comp.label)
+    );
+  }
+
+  // The one MOVE control in the section (relocates a button rather than hiding it). Dispatches
+  // through the same generic 'toggleEnhanceJiraComponent' action/data-ej-key as the hide
+  // checkboxes above — the host store already treats every component key uniformly — but is
+  // called out with its own sub-caption + muted hint line so it doesn't read as another hide.
+  function enhanceJiraMoveToggleRow() {
+    const ej = model.enhanceJira || {};
+    const components = ej.components || {};
+    const toggle = h('input', {
+      type: 'checkbox',
+      className: 'capability-toggle',
+      dataAction: 'toggleEnhanceJiraComponent',
+      'data-ej-key': 'moveSprintInsights',
+      ariaLabel: 'Move Sprint insights to header row'
+    });
+    toggle.checked = !!components.moveSprintInsights;
+    return h(
+      'label',
+      { className: 'bm-bar-toggle-row' },
+      toggle,
+      h('span', { className: 'capability-label' }, 'Move Sprint insights to header row')
+    );
+  }
+
+  // A display toggle (not a hide) for the board's assignee-filter replacement, same generic
+  // 'toggleEnhanceJiraComponent' action/data-ej-key dispatch as the move toggle above, with its
+  // own sub-caption + muted hint line.
+  function enhanceJiraBoardAvatarsToggleRow() {
+    const ej = model.enhanceJira || {};
+    const components = ej.components || {};
+    const toggle = h('input', {
+      type: 'checkbox',
+      className: 'capability-toggle',
+      dataAction: 'toggleEnhanceJiraComponent',
+      'data-ej-key': 'showBoardAvatars',
+      ariaLabel: 'Show board avatars'
+    });
+    toggle.checked = !!components.showBoardAvatars;
+    return h(
+      'label',
+      { className: 'bm-bar-toggle-row' },
+      toggle,
+      h('span', { className: 'capability-label' }, 'Show board avatars')
+    );
+  }
+
+  function enhanceJiraSection() {
+    const section = h('div', { className: 'ext-section' });
+    section.appendChild(bmSectionHeader('enhanceJira', 'EnhanceJira'));
+    if (isSectionCollapsed('enhanceJira')) { return section; }
+    section.appendChild(enhanceJiraMasterToggle());
+    section.appendChild(h('div', { className: 'ext-form-label' }, 'Hide Jira board toolbar components'));
+    const list = h('div', { className: 'ej-component-list' });
+    EJ_COMPONENTS.forEach(function (comp) { list.appendChild(enhanceJiraComponentRow(comp)); });
+    section.appendChild(list);
+
+    section.appendChild(h('div', { className: 'ext-form-label' }, 'Board actions'));
+    const boardList = h('div', { className: 'ej-component-list' });
+    EJ_BOARD_ACTIONS.forEach(function (comp) { boardList.appendChild(enhanceJiraComponentRow(comp)); });
+    section.appendChild(boardList);
+
+    section.appendChild(h('div', { className: 'ext-form-label' }, 'Header icons'));
+    const headerIconList = h('div', { className: 'ej-component-list' });
+    EJ_HEADER_ICONS.forEach(function (comp) { headerIconList.appendChild(enhanceJiraComponentRow(comp)); });
+    section.appendChild(headerIconList);
+
+    section.appendChild(h('div', { className: 'ext-form-label' }, 'Title bar'));
+    const titleBarList = h('div', { className: 'ej-component-list' });
+    EJ_TITLE_BAR.forEach(function (comp) { titleBarList.appendChild(enhanceJiraComponentRow(comp)); });
+    section.appendChild(titleBarList);
+
+    // Set apart from the hide-checkboxes above: a thin divider (.ej-move-divider, the only new
+    // CSS rule this task adds) + its own sub-caption + a muted hint explaining it moves rather
+    // than hides.
+    section.appendChild(h('div', { className: 'ej-move-divider' }));
+    section.appendChild(h('div', { className: 'ext-form-label' }, 'Sprint insights'));
+    section.appendChild(enhanceJiraMoveToggleRow());
+    section.appendChild(h('div', { className: 'bm-bar-hint' }, 'Moves the Sprint insights button up to the board header row.'));
+
+    section.appendChild(h('div', { className: 'ej-move-divider' }));
+    section.appendChild(h('div', { className: 'ext-form-label' }, 'Board avatars'));
+    section.appendChild(enhanceJiraBoardAvatarsToggleRow());
+    section.appendChild(h('div', { className: 'bm-bar-hint' }, "Replaces Jira's assignee filter with a full row of every board member's avatar."));
+    return section;
+  }
+
   // ── Persistent logins section — operator-only. Snapshot a signed-in tab's cookies (window-wide
   // jar, filtered to the origin's host, host-side) and re-inject them into any window later. The
   // model carries METADATA ONLY (origin, cookieCount, savedAt, autoReinject) — never cookie
@@ -1328,6 +1503,8 @@
 
     wrap.appendChild(extensionsSection());
 
+    wrap.appendChild(enhanceJiraSection());
+
     wrap.appendChild(loginsSection());
 
     wrap.appendChild(bookmarksSection());
@@ -1342,6 +1519,16 @@
 
   // ── Render ──────────────────────────────────────────────────
   const app = document.getElementById('app');
+
+  // Is a new session currently being set up? Drives the ＋ New Session button's
+  // disabled state — sourced from the host-pushed session state (single source
+  // of truth) rather than client-side bookkeeping of "which session did I just
+  // create". Keying off "no session is connecting" (rather than waiting for a
+  // specific session to go 'connected') means a session that lands 'failed' or
+  // 'disconnected' without ever going green still re-enables the button.
+  function anySessionConnecting() {
+    return (model.sessions || []).some(function (s) { return s && s.state === 'connecting'; });
+  }
 
   function render() {
     // Preserve scroll position of the list across re-renders when possible.
@@ -1387,17 +1574,19 @@
 
     // Tabs view: a slim body toolbar with the ＋ New Session box button above
     // the list (moved out of the rail).
+    const creatingSession = anySessionConnecting();
     const newBtn = h(
       'button',
       {
         className: 'icon-button btn-add',
         type: 'button',
         dataAction: 'newSession',
-        title: 'New Session',
-        ariaLabel: 'New Session'
+        title: creatingSession ? 'Setting up new session…' : 'New Session',
+        ariaLabel: creatingSession ? 'Setting up new session…' : 'New Session'
       },
       '＋'
     );
+    if (creatingSession) { newBtn.disabled = true; }
     // Fleet-level copy button — rail-scoped sibling of the per-row copy button;
     // no session id, so the host copies the fleet/orchestrator prompt instead.
     // Shares .btn-add with the ＋ button so it reads as the same box control,
@@ -1498,6 +1687,10 @@
     const action = target.getAttribute('data-action');
     const id = target.getAttribute('data-id');
     if (action === 'newSession') {
+      // Defense in depth: the disabled attribute (set in render() while a
+      // session is 'connecting') already suppresses the click in a real
+      // browser, but guard the handler too in case that mechanism isn't hit.
+      if (target.disabled || anySessionConnecting()) { return; }
       post({ type: 'newSession' });
     } else if (action === 'copyFleetPrompt') {
       post({ type: 'copyFleetPrompt' });
@@ -1520,6 +1713,7 @@
       post({ type: 'getSettings' });
       post({ type: 'getBookmarks' });
       post({ type: 'getExtensions' });
+      post({ type: 'getEnhanceJira' });
       post({ type: 'getLogins' });
     } else if (action === 'toggleCapability' && id) {
       post({ type: 'setCapabilityEnabled', id: id, enabled: target.checked });
@@ -1614,6 +1808,11 @@
       render();
     } else if (action === 'deleteExtension' && id) {
       post({ type: 'removeExtension', id: id });
+    } else if (action === 'toggleEnhanceJiraEnabled') {
+      post({ type: 'setEnhanceJiraEnabled', enabled: target.checked });
+    } else if (action === 'toggleEnhanceJiraComponent') {
+      const key = target.getAttribute('data-ej-key');
+      if (key) { post({ type: 'setEnhanceJiraComponent', key: key, value: target.checked }); }
     } else if (action === 'restoreLogins') {
       const origin = target.getAttribute('data-origin');
       if (origin) { post({ type: 'restoreLogins', origin: origin }); }
@@ -1925,6 +2124,35 @@
       model.extensions = Array.isArray(msg.items) ? msg.items : [];
       model.extensionsEnabled = msg.extensionsEnabled !== undefined ? !!msg.extensionsEnabled : true;
       render();
+    } else if (msg.type === 'enhanceJira') {
+      // Additive: store the host's EnhanceJira master-enable flag + per-component hide state
+      // without touching sessions/settings/view or any other section's state.
+      const c = msg.components || {};
+      model.enhanceJira = {
+        enabled: msg.enabled !== undefined ? !!msg.enabled : true,
+        components: {
+          version: !!c.version,
+          epic: !!c.epic,
+          type: !!c.type,
+          quickFilters: !!c.quickFilters,
+          search: !!c.search,
+          assignee: !!c.assignee,
+          more: !!c.more,
+          completeSprint: !!c.completeSprint,
+          sprintDetails: !!c.sprintDetails,
+          group: !!c.group,
+          viewSettings: !!c.viewSettings,
+          moreActions: !!c.moreActions,
+          shareButton: !!c.shareButton,
+          feedbackButton: !!c.feedbackButton,
+          addPeople: !!c.addPeople,
+          boardActionsMenu: !!c.boardActionsMenu,
+          moveSprintInsights: !!c.moveSprintInsights,
+          removeToolbarGap: !!c.removeToolbarGap,
+          showBoardAvatars: c.showBoardAvatars !== undefined ? !!c.showBoardAvatars : true
+        }
+      };
+      render();
     } else if (msg.type === 'logins') {
       // Additive: store the host's saved-login METADATA list (origin, cookieCount, savedAt,
       // autoReinject) — never cookie values — plus the hands-off "auto for ALL sites" master
@@ -2020,5 +2248,6 @@
   post({ type: 'getSettings' });
   post({ type: 'getBookmarks' });
   post({ type: 'getExtensions' });
+  post({ type: 'getEnhanceJira' });
   post({ type: 'getLogins' });
 })();

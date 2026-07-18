@@ -23,6 +23,7 @@ class SessionManager {
     this.getStartUrl = ctx.getStartUrl;
     this.bookmarksStore = ctx.bookmarksStore || null;
     this.extensionsStore = ctx.extensionsStore || null;
+    this.enhanceJiraStore = ctx.enhanceJiraStore || null;
     this.bridgeStore = ctx.bridgeStore || null;
     this._counter = 0;
     // id -> { id, state, url, tab, viewColumn, editorTab, script } (insertion order = FIFO).
@@ -266,12 +267,14 @@ class SessionManager {
       // re-injects the active set on every page load via getExtensions; we also run the initial
       // injection now against the already-loaded page.
       if (this.extensionsStore) {
-        tab.getExtensions = () => this.extensionsStore.getActive();
+        // Route through _injectables() so the synthetic EnhanceJira CSS-hide record rides along
+        // with the real extensions on every page-load reinject as well as the initial injection.
+        tab.getExtensions = () => this._injectables();
         // Bridge (B1): give the tab the shared per-extension KV store so bridge extensions'
         // storage.* calls resolve host-side. injectExtensions (above/refresh) registers the worlds.
         if (this.bridgeStore) { tab.getBridge = () => this.bridgeStore; }
         try {
-          await tab.injectExtensions(this.extensionsStore.getActive());
+          await tab.injectExtensions(this._injectables());
         } catch {}
       }
       this._fire();
@@ -354,9 +357,42 @@ class SessionManager {
   // stop on the next load, but their prior mutations persist). Isolated-world JS is not live-applied
   // either — it takes effect on the next navigation. Safe no-op when no store is wired; per-tab
   // errors are swallowed so one bad tab can't sink the rest.
+  // The full injection list for a tab: every ACTIVE real extension followed by the synthetic
+  // EnhanceJira CSS-hide record (when the feature is on and at least one component is checked).
+  // The EJ record is appended LAST so its `display:none !important` rules win the cascade over any
+  // real extension CSS, and it is generated on-the-fly here (never added to the extensions STORE),
+  // so the Extensions list UI never shows it. Guards both stores so a missing one degrades to the
+  // other's records rather than throwing.
+  _injectables() {
+    const base = this.extensionsStore ? this.extensionsStore.getActive() : [];
+    const ejRecord = this.enhanceJiraStore && this.enhanceJiraStore.getActiveRecord();
+    return ejRecord ? [...base, ejRecord] : base;
+  }
+
   async refreshExtensions() {
     if (!this.extensionsStore) return;
-    const items = this.extensionsStore.getActive();
+    const items = this._injectables();
+    await Promise.all(
+      Array.from(this._sessions.values()).map(async (s) => {
+        if (s.tab && s.state === 'connected') {
+          try {
+            await s.tab.injectExtensions(items);
+          } catch {}
+        }
+      })
+    );
+  }
+
+  // Re-apply the injectables (real extensions + the synthetic EnhanceJira CSS-hide record) across
+  // every connected tab. The panel's EnhanceJira handlers call this after a master/component toggle
+  // so the change lands on the CURRENT documents immediately, not just on the next load. Mirrors
+  // refreshExtensions exactly — same all-tabs reinject loop through injectExtensions, whose per-tab
+  // reconcile reverts hidden nodes LIVE when a component is unchecked or the master is turned off.
+  // Safe no-op when no EnhanceJira store is wired; per-tab errors are swallowed so one bad tab can't
+  // sink the rest.
+  async refreshEnhanceJira() {
+    if (!this.enhanceJiraStore) return;
+    const items = this._injectables();
     await Promise.all(
       Array.from(this._sessions.values()).map(async (s) => {
         if (s.tab && s.state === 'connected') {
@@ -492,11 +528,32 @@ class SessionManager {
           '',
         ];
 
+    // Fleet-only appendix: the recon->build->reinstall->verify loop for authoring Steersman
+    // extensions, so an agent managing the whole surface has the workflow inline (the per-window
+    // /docs/tab doc drives a single page and omits it).
+    const building = fleet
+      ? '\n\n' + [
+          '## Building extensions',
+          '',
+          'Steersman extensions are operator-defined, URL-matched, auto-injected JS/CSS; richer modules add a settings section and can use the host bridge. Driving the live page gives you the best reference to build against — real DOM, real selectors, real network data. The preferred loop:',
+          '',
+          '1. Recon against the LIVE page — use /find, /eval, /text, /console, /network to derive the actual DOM, selectors, and data shapes. Don\'t build from memory or stale source.',
+          '2. Anchor on stable identifiers — prefer semantic attributes (data-testid, aria, roles, ids) over compiled/hashed class names, which break across the site\'s releases.',
+          '3. Prove it before you build — inject candidate JS/CSS via /eval, verify the effect, then revert. Leave the live page pristine.',
+          '4. Implement in the repo — as a Steersman Extension record (URL-matched JS/CSS) or a full module; match CLAUDE.md, reuse existing injection/store/settings patterns, bump the version.',
+          '5. Load it — uncommitted source does NOT hot-reload into an installed extension. Preview with F5 (Extension Development Host) or install with build/reinstall.sh --local. A reload/reinstall restarts the extension host, so the API port and window ids may reset — re-run GET /windows afterward.',
+          '6. Verify live — drive the reloaded browser through the API and confirm the extension behaves in the real page.',
+          '',
+          'This loop is general — it applies to any extension, not one specific module.',
+        ].join('\n')
+      : '';
+
     return (
       header.join('\n') +
       intro.join('\n') +
       '## Endpoints\n\n' +
-      this._endpointReference(config, fleet ? '<id>' : 'win-1')
+      this._endpointReference(config, fleet ? '<id>' : 'win-1') +
+      building
     );
   }
 
@@ -529,7 +586,8 @@ class SessionManager {
       'You manage ALL Project Steersman browser windows via ' + base + '. ' +
       'Start with `GET /windows` to list them, create with `POST /windows`, and drive any ' +
       'window by its `instance` id. Send the `x-steersman-token` header (below) on every ' +
-      'request. **Full endpoint reference: fetch `' + base + '/docs/fleet`**.'
+      'request. **Full endpoint reference: fetch `' + base + '/docs/fleet`**. ' +
+      'Building a Steersman extension? `' + base + '/docs/fleet` has the recon→build→reinstall→verify loop.'
     );
   }
 }

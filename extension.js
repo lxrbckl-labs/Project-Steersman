@@ -11,6 +11,7 @@ const { CapabilityConfig } = require('./capability-config');
 const { ScriptRunner } = require('./script-runner');
 const { BookmarksStore } = require('./bookmarks-store');
 const { ExtensionsStore } = require('./extensions-store');
+const { EnhanceJiraStore } = require('./enhancejira-store');
 const { BridgeStore } = require('./bridge-store');
 const { CookieStore } = require('./cookie-store');
 const { FaviconFetcher } = require('./favicon-fetcher');
@@ -31,6 +32,11 @@ let bookmarks = null;
 // globalState so it is shared across all windows. The session layer injects each active one on
 // page load; the panel's Settings UI (Phase 1) does operator-only CRUD.
 let extensions = null;
+// EnhanceJira: per-instance CSS-hide feature toggling Jira board chrome (version/epic/type/etc.),
+// persisted in globalState. The session layer injects a synthetic on-the-fly extension record
+// (never stored in the extensions list) alongside the real extensions; the panel's Settings UI
+// toggles the master flag + individual components.
+let enhanceJira = null;
 // Bridge (B1): per-extension KV store shared across windows (globalState-backed). Threaded into the
 // SessionManager (tabs service bridge storage calls) and the panel deps like the other stores.
 let bridge = null;
@@ -114,6 +120,7 @@ function activate(context) {
   capabilityConfig = new CapabilityConfig();
   bookmarks = new BookmarksStore(context.globalState);
   extensions = new ExtensionsStore(context.globalState);
+  enhanceJira = new EnhanceJiraStore(context.globalState);
   // Bridge (B1): per-extension KV store backed by globalState; context.secrets is passed for the
   // (later) B3 SecretStorage tier so its construction doesn't change then.
   bridge = new BridgeStore(context.globalState, context.secrets);
@@ -137,6 +144,7 @@ function activate(context) {
     getStartUrl: () => vscode.workspace.getConfiguration('projectSteersman').get('startUrl', 'about:blank'),
     bookmarksStore: bookmarks,
     extensionsStore: extensions,
+    enhanceJiraStore: enhanceJira,
     bridgeStore: bridge,
   });
   scriptRunner = new ScriptRunner({
@@ -805,6 +813,7 @@ function panelDeps() {
     capabilityConfig,
     bookmarksStore: bookmarks,
     extensionsStore: extensions,
+    enhanceJiraStore: enhanceJira,
     bridgeStore: bridge,
     // Persistent shared logins store (Stages 2+3): the panel saves/lists/removes per-origin jars
     // and toggles auto-reinject through this handle.
@@ -815,6 +824,8 @@ function panelDeps() {
     refreshBookmarkBars: () => manager.refreshBookmarkBars(),
     // Lets the panel re-apply the live in-page extensions after a Settings-editor edit.
     refreshExtensions: () => manager.refreshExtensions(),
+    // Lets the panel re-apply the live EnhanceJira CSS-hide record after a Settings-editor edit.
+    refreshEnhanceJira: () => manager.refreshEnhanceJira(),
     token: apiToken,
     // SecretStorage handle — lets the panel read/store the optional GitHub token the
     // update-check uses to authenticate against the (private) release repo.
