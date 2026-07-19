@@ -868,8 +868,6 @@ class EnhanceJiraStore {
       try {
         var exPop = window.__ejPrPopup;
         if (exPop) { exPop.desired = PR_COLORING; if (PR_COLORING) exPop.apply(); return; }
-        var POP_SEL = '[data-testid^="development-board-pr-details-popup"]';
-        var POP_KEY_RE = /[A-Z][A-Z0-9]+-\\d+/;
         var pop = {
           desired: PR_COLORING,
           _scheduled: false,
@@ -887,19 +885,6 @@ class EnhanceJiraStore {
               var e = data && data.byIssue && data.byIssue[issueKey];
               return (e && e.reviewers && e.reviewers.length) ? e.reviewers : null;
             } catch (e) { return null; }
-          },
-          // The outermost popup element sharing the popup testid prefix (stable node to read text from +
-          // mark processed). null when no popup is open.
-          root: function () {
-            var el = document.querySelector(POP_SEL);
-            if (!el) return null;
-            var root = el, p = el.parentElement;
-            while (p) {
-              var t = p.getAttribute && p.getAttribute('data-testid');
-              if (t && t.indexOf('development-board-pr-details-popup') === 0) root = p;
-              p = p.parentElement;
-            }
-            return root;
           },
           // The avatar-group CONTAINER inside the popup (holds the shown avatars + the "+N" overflow):
           // the ancestor whose testid names the group itself (not a '--avatar-N--inner' child). Falls
@@ -959,7 +944,7 @@ class EnhanceJiraStore {
           },
           // Hide Jira's original avatar-group children and append our full-reviewer strip in their place.
           // Idempotent: an existing strip is removed first so a re-render repaints cleanly.
-          render: function (group, reviewers) {
+          render: function (group, reviewers, key) {
             try {
               var kids = group.children;
               for (var i = 0; i < kids.length; i++) {
@@ -971,27 +956,43 @@ class EnhanceJiraStore {
               if (prev && prev.parentNode) prev.parentNode.removeChild(prev);
               var strip = document.createElement('div');
               strip.setAttribute('data-ej-pr-strip', '1');
+              if (key) strip.setAttribute('data-ej-key', key);
               strip.style.cssText = 'display:flex;flex-wrap:wrap;gap:5px;align-items:center;';
               for (var j = 0; j < reviewers.length; j++) strip.appendChild(this.buildAvatar(reviewers[j]));
               group.appendChild(strip);
             } catch (e) {}
           },
+          // Find every open avatar-group container, then cross-reference each against the KNOWN issue keys
+          // from the Stage-1 contract node by walking its ancestor text — the popup's issue key lives in a
+          // sibling header/branch area (e.g. "Feature/CMMS-2791"), not inside the avatar-group subtree, so a
+          // testid-prefix climb never reaches it. Matching against real keys is robust to adjacent badge text.
           apply: function () {
             try {
               if (!this.desired) return;
-              var root = this.root();
-              if (!root) return;
-              var m = (root.textContent || '').match(POP_KEY_RE);
-              if (!m) return;
-              var key = m[0];
-              var reviewers = this.reviewersFor(key);
-              if (!reviewers) return;   // companion not ready for this issue -> leave Jira's popup as-is
-              var group = this.group(root);
-              if (!group) return;
-              // Skip only when already rendered for THIS key AND our strip survived Jira's re-renders.
-              if (root.getAttribute('data-ej-pr-popup') === key && group.querySelector('[data-ej-pr-strip="1"]')) return;
-              this.render(group, reviewers);
-              root.setAttribute('data-ej-pr-popup', key);
+              var n = document.getElementById('__ej_bb_states');
+              if (!n) return;
+              var byIssue = {};
+              try { byIssue = (JSON.parse(n.textContent || '{}') || {}).byIssue || {}; } catch (e) { return; }
+              var keys = Object.keys(byIssue);
+              if (!keys.length) return;
+              var groups = document.querySelectorAll('[data-testid*="avatar-group--avatar-group"]');
+              for (var g = 0; g < groups.length; g++) {
+                var group = groups[g], key = null, node = group;
+                for (var lvl = 0; lvl < 14 && node; lvl++) {
+                  var tx = node.textContent || '';
+                  for (var k = 0; k < keys.length; k++) { if (tx.indexOf(keys[k]) > -1) { key = keys[k]; break; } }
+                  if (key) break;
+                  node = node.parentElement;
+                }
+                if (!key) continue;
+                var entry = byIssue[key];
+                var reviewers = entry && entry.reviewers;
+                if (!reviewers || !reviewers.length) continue;   // companion not ready for this issue -> leave Jira's popup as-is
+                // Skip only when already rendered for THIS key AND our strip survived Jira's re-renders.
+                var existing = group.querySelector('[data-ej-pr-strip="1"]');
+                if (existing && existing.getAttribute('data-ej-key') === key) continue;
+                this.render(group, reviewers, key);
+              }
             } catch (e) {}
           }
         };
@@ -1101,11 +1102,22 @@ class EnhanceJiraStore {
       boardId: function () {
         try { var mm = location.pathname.match(/\\/boards\\/(\\d+)/); return mm && mm[1]; } catch (e) { return null; }
       },
+      // Same-origin JSON GET with resilience: the first concurrent batch of dev-status calls (the first ~3
+      // issues in order) intermittently fails, dropping those issues from the publish. Retry a failed/non-ok
+      // fetch up to 2 more times (~250ms apart) before giving up; returns null on final failure (throw-free),
+      // which callers already tolerate.
       getJson: function (url) {
-        return fetch(url, { credentials: 'include', headers: { 'Accept': 'application/json' } }).then(function (r) {
-          if (!r.ok) throw new Error('bad status ' + r.status);
-          return r.json();
-        });
+        var opts = { credentials: 'include', headers: { 'Accept': 'application/json' } };
+        function attempt(triesLeft) {
+          return fetch(url, opts).then(function (r) {
+            if (!r.ok) throw new Error('bad status ' + r.status);
+            return r.json();
+          }).catch(function () {
+            if (triesLeft <= 0) return null;
+            return new Promise(function (res) { setTimeout(res, 250); }).then(function () { return attempt(triesLeft - 1); });
+          });
+        }
+        return attempt(2);
       },
       // Run worker(item) over items with at most maxc in flight; resolves when all settle (errors swallowed).
       runPool: function (items, worker, maxc) {
