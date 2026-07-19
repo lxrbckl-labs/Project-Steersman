@@ -125,9 +125,11 @@ const DEFAULT_MIN_APPROVALS = 3;
 
 // Config baked into the injected PR-color manager (composeJs). Card selector + approval-state colors are
 // verbatim/validated live; BOTS is the default reviewer-name exclude list (bot approvals don't count).
+// The colors are SOLID full-card surface tints (not a left bar): opaque values that read clearly on the
+// dark theme while preserving the card's rounded corners (applied to the card's surface div).
 const PR_CARD_SELECTOR = '[data-testid="platform-board-kit.ui.card.card"]';
-const PR_GREEN = '#36B37E';
-const PR_RED = '#FF5630';
+const PR_GREEN = 'rgb(30, 107, 75)';
+const PR_RED = 'rgb(139, 46, 40)';
 const PR_BOTS = ['Code Rabbit'];
 
 class EnhanceJiraStore {
@@ -565,7 +567,6 @@ class EnhanceJiraStore {
           exPr.minApprovals = MIN_APPROVALS;
           exPr.bots = PR_BOTS;
           if (PR_COLORING) {
-            exPr.ensureStyle();
             exPr.applyByKey();   // instant repaint from cached counts: honors the new threshold, zero refetch
             var empty = true;
             for (var ck in exPr.cache) { if (exPr.cache.hasOwnProperty(ck)) { empty = false; break; } }
@@ -578,7 +579,7 @@ class EnhanceJiraStore {
           desired: PR_COLORING,
           minApprovals: MIN_APPROVALS,
           bots: PR_BOTS,
-          cache: {},            // issueId -> { key, color:'green'|'red'|null, ts }
+          cache: {},            // issueId -> { key, approved, changesRequested, hasPr, ts } (raw facts; color derived at paint)
           _scheduled: false,
           _refreshing: false,
           lastRefresh: 0,
@@ -614,8 +615,9 @@ class EnhanceJiraStore {
             }).catch(function () { return []; });
           },
           // Fetch a PR's raw approval FACTS (not the green/red decision): approved = deduped approved
-          // human reviewers (excluding PR_BOTS), hasPr = any PR exists. Cached as-is so a later threshold
-          // change repaints from these counts with no refetch. undefined = fetch error (don't hard-cache).
+          // human reviewers (excluding PR_BOTS), hasPr = any PR exists, changesRequested = any reviewer
+          // requested changes. Cached as-is so a later threshold change repaints from these facts with no
+          // refetch. undefined = fetch error (don't hard-cache).
           computeCounts: function (issueId) {
             var self = this;
             var url = '/rest/dev-status/latest/issue/detail?issueId=' + encodeURIComponent(issueId) + '&applicationType=bitbucket&dataType=pullrequest';
@@ -626,7 +628,7 @@ class EnhanceJiraStore {
                 var d = detail[i] && detail[i].pullRequests;
                 if (d) for (var k = 0; k < d.length; k++) prs.push(d[k]);
               }
-              if (!prs.length) return { approved: 0, hasPr: false };   // no PR -> no bar
+              if (!prs.length) return { approved: 0, changesRequested: false, hasPr: false };   // no PR -> no tint
               var approvers = {};             // dedupe approved humans by name across PRs
               for (var a = 0; a < prs.length; a++) {
                 var revs = (prs[a] && prs[a].reviewers) || [];
@@ -636,17 +638,21 @@ class EnhanceJiraStore {
                 }
               }
               var count = 0; for (var nm in approvers) { if (approvers.hasOwnProperty(nm)) count++; }
-              return { approved: count, hasPr: true };
+              // TODO(bridge): populated from Bitbucket participants[].state in the bridge-fetch path; dev-status has no changes-requested signal
+              return { approved: count, changesRequested: false, hasPr: true };
             }).catch(function () { return undefined; });   // undefined = fetch error (don't hard-cache)
           },
-          // Pure: derive the paint class from the LIVE threshold so a minApprovals change repaints from
-          // cache with zero refetch. No PR -> null (no bar); enough approvals -> green; otherwise red.
+          // Pure three-state tint decision from the LIVE threshold (a minApprovals change repaints from
+          // cache with zero refetch). RED when any reviewer requested changes (red wins over green); GREEN
+          // when approved humans >= minApprovals; otherwise null (no tint — incl. PR-but-neither and no-PR).
           colorFor: function (entry) {
-            if (!entry || !entry.hasPr) return null;
-            return entry.approved >= this.minApprovals ? 'green' : 'red';
+            if (!entry) return null;
+            if (entry.changesRequested) return 'red';
+            if (entry.hasPr && entry.approved >= this.minApprovals) return 'green';
+            return null;
           },
-          // Fetch the Review-column issue list, then fill the per-issue color cache using ≤PR_MAXC
-          // concurrent dev-status fetches, skipping issues whose cached color is still fresh (<PR_TTL).
+          // Fetch the Review-column issue list, then fill the per-issue FACTS cache using ≤PR_MAXC
+          // concurrent dev-status fetches, skipping issues whose cached facts are still fresh (<PR_TTL).
           refresh: function () {
             var self = this;
             if (!self.desired || self._refreshing) return;
@@ -669,10 +675,10 @@ class EnhanceJiraStore {
                 var issue = queue[idx++];
                 return self.computeCounts(issue.id).then(function (counts) {
                   if (counts !== undefined) {
-                    self.cache[issue.id] = { key: issue.key, approved: counts.approved, hasPr: counts.hasPr, ts: Date.now() };
+                    self.cache[issue.id] = { key: issue.key, approved: counts.approved, changesRequested: counts.changesRequested, hasPr: counts.hasPr, ts: Date.now() };
                   } else {
-                    var prev = self.cache[issue.id];   // fetch error: keep prior counts, short TTL so it retries soon
-                    self.cache[issue.id] = { key: issue.key, approved: prev ? prev.approved : 0, hasPr: prev ? prev.hasPr : false, ts: Date.now() - PR_TTL + 5000 };
+                    var prev = self.cache[issue.id];   // fetch error: keep prior facts, short TTL so it retries soon
+                    self.cache[issue.id] = { key: issue.key, approved: prev ? prev.approved : 0, changesRequested: prev ? prev.changesRequested : false, hasPr: prev ? prev.hasPr : false, ts: Date.now() - PR_TTL + 5000 };
                   }
                   self.applyByKey();
                   return worker();
@@ -684,41 +690,37 @@ class EnhanceJiraStore {
                 .catch(function () { self._refreshing = false; });
             }).catch(function () { self._refreshing = false; });
           },
-          ensureStyle: function () {
+          // The card's visible rounded SURFACE: the first descendant div that actually paints the card —
+          // an OPAQUE background (not transparent) covering ~the whole card (>= 0.9 of the card's area).
+          // The card element itself and any ::before overlay are painted over by inner divs, so we tint
+          // THIS div; it carries the border-radius, so the rounded corners are preserved. null if none.
+          surfaceOf: function (card) {
             try {
-              if (document.getElementById('__ejPrColorStyle')) return;
-              var s = document.createElement('style');
-              s.id = '__ejPrColorStyle';
-              s.textContent = '.__ej_pr_green::before,.__ej_pr_red::before{content:"";position:absolute;left:0;top:0;bottom:0;width:5px;border-radius:3px 0 0 3px;pointer-events:none;}'
-                + '.__ej_pr_green::before{background:' + PR_GREEN + ';}'
-                + '.__ej_pr_red::before{background:' + PR_RED + ';}';
-              (document.head || document.documentElement).appendChild(s);
+              var cr = card.getBoundingClientRect();
+              var cardArea = cr.width * cr.height;
+              if (!(cardArea > 0)) return null;
+              var divs = card.querySelectorAll('div');
+              for (var i = 0; i < divs.length; i++) {
+                var el = divs[i];
+                var cs = window.getComputedStyle ? window.getComputedStyle(el) : null;
+                if (!cs) continue;
+                var bg = cs.backgroundColor;
+                if (!bg || bg === 'transparent' || bg === 'rgba(0, 0, 0, 0)') continue;
+                var r = el.getBoundingClientRect();
+                if ((r.width * r.height) / cardArea >= 0.9) return el;
+              }
             } catch (e) {}
+            return null;
           },
-          anchor: function (card) {
-            try {
-              var cs = window.getComputedStyle ? window.getComputedStyle(card) : null;
-              if (cs && cs.position === 'static') card.style.position = 'relative';
-            } catch (e) {}
-          },
-          // Set/clear a card's color class only when it differs (idempotent). color: 'green'|'red' paints
-          // the left bar; anything else strips both classes so the card returns to native styling.
+          // Tint (or restore) the card's surface div. green -> PR_GREEN, red -> PR_RED, anything else -> ''
+          // which restores the stylesheet default (no need to store the original). Idempotent: only writes
+          // when the value differs (PR_GREEN/PR_RED use the browser's serialized spacing so the guard holds).
           colorCard: function (card, color) {
             try {
-              var hasGreen = card.classList.contains('__ej_pr_green');
-              var hasRed = card.classList.contains('__ej_pr_red');
-              if (color === 'green') {
-                if (hasRed) card.classList.remove('__ej_pr_red');
-                if (!hasGreen) card.classList.add('__ej_pr_green');
-                this.anchor(card);
-              } else if (color === 'red') {
-                if (hasGreen) card.classList.remove('__ej_pr_green');
-                if (!hasRed) card.classList.add('__ej_pr_red');
-                this.anchor(card);
-              } else {
-                if (hasGreen) card.classList.remove('__ej_pr_green');
-                if (hasRed) card.classList.remove('__ej_pr_red');
-              }
+              var surface = this.surfaceOf(card);
+              if (!surface) return;
+              var want = (color === 'green') ? PR_GREEN : (color === 'red') ? PR_RED : '';
+              if (surface.style.backgroundColor !== want) surface.style.backgroundColor = want;
             } catch (e) {}
           },
           // A card's issue key = the trimmed text of its first descendant element whose text is EXACTLY a
@@ -735,9 +737,11 @@ class EnhanceJiraStore {
             } catch (e) {}
             return null;
           },
-          // Re-apply colors to the DOM (cheap; the observer's hot path and the threshold-change repaint
-          // path). Build a key->entry lookup from the cache, then derive each card's class via colorFor
-          // (LIVE threshold). Unknown keys / no-PR entries leave the card with no bar.
+          // Re-apply colors to the DOM (cheap; the observer's hot path — which fires on virtual re-renders
+          // as the board scrolls — and the threshold-change repaint path). Build a key->entry lookup from
+          // the cache, then tint each rendered card's surface via colorFor (LIVE threshold). Because
+          // colorCard resolves the surface fresh each call, a freshly-virtualized card is re-tinted on the
+          // next observer tick. Unknown keys / no-tint entries restore the card's default surface.
           applyByKey: function () {
             try {
               if (!this.desired) return;
@@ -756,14 +760,13 @@ class EnhanceJiraStore {
               }
             } catch (e) {}
           },
-          // Feature toggled off: strip every color class and remove the injected style so cards revert.
+          // Feature toggled off: restore every rendered card's surface to its default background. Also
+          // removes any stale __ejPrColorStyle node left by an older injected build (defensive no-op now
+          // that this version injects no style).
           clearAll: function () {
             try {
-              var cards = document.querySelectorAll('.__ej_pr_green,.__ej_pr_red');
-              for (var i = 0; i < cards.length; i++) {
-                cards[i].classList.remove('__ej_pr_green');
-                cards[i].classList.remove('__ej_pr_red');
-              }
+              var cards = document.querySelectorAll(PR_CARD_SEL);
+              for (var i = 0; i < cards.length; i++) this.colorCard(cards[i], null);
               var s = document.getElementById('__ejPrColorStyle');
               if (s && s.parentNode) s.parentNode.removeChild(s);
             } catch (e) {}
@@ -783,7 +786,7 @@ class EnhanceJiraStore {
             });
           });
           p.observer.observe(document.body, { childList: true, subtree: true });
-          if (p.desired) { p.ensureStyle(); p.refresh(); }
+          if (p.desired) p.refresh();
         }
         window.__ejPrColor = p;
         if (document.body) startPr();
