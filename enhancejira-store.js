@@ -1088,7 +1088,7 @@ class EnhanceJiraStore {
     if (typeof steersman === 'undefined' || !steersman || !steersman.fetch) return;
     var BB_TTL = 60000;    // per-PR participant cache TTL
     var BB_MAXC = 4;       // max concurrent throttled fetches
-    var BB_BOTS = ['Code Rabbit'];
+    var BB_BOTS = [];      // count ALL reviewers (incl. Code Rabbit) in the human tallies — no bot exclusion
     var bridge = {
       prCache: {},         // 'repo#prId' -> { participants:[...], ts }
       _refreshing: false,
