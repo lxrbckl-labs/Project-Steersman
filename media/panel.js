@@ -9,7 +9,7 @@
   const vscode = acquireVsCodeApi();
 
   // ── State ───────────────────────────────────────────────────
-  /** @type {{sessions: Array<{id:string,state:string,url:string,activity:(Object|null)}>, port: (number|string|null), view: ('sessions'|'settings'), settings: (Object|null), scripts: Array<{name:string}>, bookmarks: (Object|null), bookmarksBarEnabled: boolean, version: string}} */
+  /** @type {{sessions: Array<{id:string,state:string,url:string,activity:(Object|null)}>, port: (number|string|null), view: ('sessions'|'settings'|'enhancejira'), settings: (Object|null), scripts: Array<{name:string}>, bookmarks: (Object|null), bookmarksBarEnabled: boolean, version: string}} */
   let model = {
     sessions: [], port: null, view: 'sessions', settings: null, scripts: [], bookmarks: null, bookmarksBarEnabled: false,
     extensions: [], extensionsEnabled: true, logins: [], loginsAuto: true, version: '',
@@ -525,8 +525,11 @@
   }
 
   // ── Rail tab (worded, Nomeda-style; active one is bolded via .active) ──
+  // The 'settings' tab also reads as active while on the 'enhancejira' sub-page
+  // (a nested view reached FROM Settings), so the rail doesn't go tab-less there.
   function railTab(label, action, view) {
-    const cls = 'rail-item' + (model.view === view ? ' active' : '');
+    const active = view === 'settings' ? (model.view === 'settings' || model.view === 'enhancejira') : model.view === view;
+    const cls = 'rail-item' + (active ? ' active' : '');
     return h(
       'button',
       { className: cls, type: 'button', dataAction: action },
@@ -1287,44 +1290,120 @@
     );
   }
 
+  // Shared group-rendering body — every sub-caption + toggle-list from the section, minus the
+  // header/master toggle. Appended straight onto a container (a section wrapper, or the
+  // dedicated EnhanceJira sub-page) so the toggle-list markup/dispatch is defined exactly once
+  // and reused by both enhanceJiraSection() (kept for reference/back-compat) and enhanceJiraView()
+  // (the new dedicated sub-page — see "EnhanceJira settings view" below).
+  function enhanceJiraGroups(container) {
+    container.appendChild(h('div', { className: 'ext-form-label' }, 'Hide Jira board toolbar components'));
+    const list = h('div', { className: 'ej-component-list' });
+    EJ_COMPONENTS.forEach(function (comp) { list.appendChild(enhanceJiraComponentRow(comp)); });
+    container.appendChild(list);
+
+    container.appendChild(h('div', { className: 'ext-form-label' }, 'Board actions'));
+    const boardList = h('div', { className: 'ej-component-list' });
+    EJ_BOARD_ACTIONS.forEach(function (comp) { boardList.appendChild(enhanceJiraComponentRow(comp)); });
+    container.appendChild(boardList);
+
+    container.appendChild(h('div', { className: 'ext-form-label' }, 'Header icons'));
+    const headerIconList = h('div', { className: 'ej-component-list' });
+    EJ_HEADER_ICONS.forEach(function (comp) { headerIconList.appendChild(enhanceJiraComponentRow(comp)); });
+    container.appendChild(headerIconList);
+
+    container.appendChild(h('div', { className: 'ext-form-label' }, 'Title bar'));
+    const titleBarList = h('div', { className: 'ej-component-list' });
+    EJ_TITLE_BAR.forEach(function (comp) { titleBarList.appendChild(enhanceJiraComponentRow(comp)); });
+    container.appendChild(titleBarList);
+
+    // Set apart from the hide-checkboxes above: a thin divider (.ej-move-divider) + its own
+    // sub-caption + a muted hint explaining it moves rather than hides.
+    container.appendChild(h('div', { className: 'ej-move-divider' }));
+    container.appendChild(h('div', { className: 'ext-form-label' }, 'Sprint insights'));
+    container.appendChild(enhanceJiraMoveToggleRow());
+    container.appendChild(h('div', { className: 'bm-bar-hint' }, 'Moves the Sprint insights button up to the board header row.'));
+
+    container.appendChild(h('div', { className: 'ej-move-divider' }));
+    container.appendChild(h('div', { className: 'ext-form-label' }, 'Board avatars'));
+    container.appendChild(enhanceJiraBoardAvatarsToggleRow());
+    container.appendChild(h('div', { className: 'bm-bar-hint' }, "Replaces Jira's assignee filter with a full row of every board member's avatar."));
+  }
+
+  // Full collapsible section (master toggle + all groups) — no longer wired into settingsView()
+  // (replaced there by the compact enhanceJiraConfigureRow() below, which opens the dedicated
+  // enhanceJiraView() sub-page instead), kept as a self-contained renderer built on the same
+  // shared enhanceJiraGroups() so nothing here duplicates the toggle-list markup.
   function enhanceJiraSection() {
     const section = h('div', { className: 'ext-section' });
     section.appendChild(bmSectionHeader('enhanceJira', 'EnhanceJira'));
     if (isSectionCollapsed('enhanceJira')) { return section; }
     section.appendChild(enhanceJiraMasterToggle());
-    section.appendChild(h('div', { className: 'ext-form-label' }, 'Hide Jira board toolbar components'));
-    const list = h('div', { className: 'ej-component-list' });
-    EJ_COMPONENTS.forEach(function (comp) { list.appendChild(enhanceJiraComponentRow(comp)); });
-    section.appendChild(list);
-
-    section.appendChild(h('div', { className: 'ext-form-label' }, 'Board actions'));
-    const boardList = h('div', { className: 'ej-component-list' });
-    EJ_BOARD_ACTIONS.forEach(function (comp) { boardList.appendChild(enhanceJiraComponentRow(comp)); });
-    section.appendChild(boardList);
-
-    section.appendChild(h('div', { className: 'ext-form-label' }, 'Header icons'));
-    const headerIconList = h('div', { className: 'ej-component-list' });
-    EJ_HEADER_ICONS.forEach(function (comp) { headerIconList.appendChild(enhanceJiraComponentRow(comp)); });
-    section.appendChild(headerIconList);
-
-    section.appendChild(h('div', { className: 'ext-form-label' }, 'Title bar'));
-    const titleBarList = h('div', { className: 'ej-component-list' });
-    EJ_TITLE_BAR.forEach(function (comp) { titleBarList.appendChild(enhanceJiraComponentRow(comp)); });
-    section.appendChild(titleBarList);
-
-    // Set apart from the hide-checkboxes above: a thin divider (.ej-move-divider, the only new
-    // CSS rule this task adds) + its own sub-caption + a muted hint explaining it moves rather
-    // than hides.
-    section.appendChild(h('div', { className: 'ej-move-divider' }));
-    section.appendChild(h('div', { className: 'ext-form-label' }, 'Sprint insights'));
-    section.appendChild(enhanceJiraMoveToggleRow());
-    section.appendChild(h('div', { className: 'bm-bar-hint' }, 'Moves the Sprint insights button up to the board header row.'));
-
-    section.appendChild(h('div', { className: 'ej-move-divider' }));
-    section.appendChild(h('div', { className: 'ext-form-label' }, 'Board avatars'));
-    section.appendChild(enhanceJiraBoardAvatarsToggleRow());
-    section.appendChild(h('div', { className: 'bm-bar-hint' }, "Replaces Jira's assignee filter with a full row of every board member's avatar."));
+    enhanceJiraGroups(section);
     return section;
+  }
+
+  // ── Compact "EnhanceJira" row in the main Settings view (Option A) — replaces the old inline
+  // section above. Keeps the master enable toggle here for quick access (no need to open the
+  // sub-page just to flip it on/off); the rest of the row is a button that switches the sidebar
+  // to the dedicated enhanceJiraView() sub-page. The toggle is a plain (unlabeled-wrapper)
+  // checkbox — deliberately NOT nested inside the row's clickable button, so a click on the
+  // checkbox toggles it (via its own 'toggleEnhanceJiraEnabled' data-action, which the delegate
+  // resolves first since it's the nearest data-action ancestor-or-self) without also firing the
+  // row's 'openEnhanceJira' navigation.
+  function enhanceJiraConfigureRow() {
+    const ej = model.enhanceJira || {};
+    const toggle = h('input', {
+      type: 'checkbox',
+      className: 'capability-toggle',
+      dataAction: 'toggleEnhanceJiraEnabled',
+      ariaLabel: 'Enable EnhanceJira'
+    });
+    toggle.checked = !!ej.enabled;
+
+    const openBtn = h(
+      'button',
+      {
+        className: 'ej-configure-btn',
+        type: 'button',
+        dataAction: 'openEnhanceJira',
+        title: 'Configure EnhanceJira',
+        ariaLabel: 'Configure EnhanceJira'
+      },
+      h('span', { className: 'capability-label' }, 'EnhanceJira'),
+      chevronIcon()
+    );
+
+    const section = h('div', { className: 'ext-section' });
+    section.appendChild(h('div', { className: 'bm-bar-toggle-row ej-configure-row' }, toggle, openBtn));
+    section.appendChild(h('div', { className: 'bm-bar-hint' }, 'Declutter the Jira board + avatar filter — configure'));
+    return section;
+  }
+
+  // ── Dedicated EnhanceJira settings sub-page (Option A) — reached from the compact row above via
+  // 'openEnhanceJira'; a ← Back button (mirroring the top-bar chrome of settingsView()) returns to
+  // 'settings' via 'closeEnhanceJira'. Body is the same enhanceJiraGroups() used by
+  // enhanceJiraSection() — no duplicated toggle-list/dispatch. Purely a client-side view swap: all
+  // toggles below still post the existing 'setEnhanceJiraComponent'/'setEnhanceJiraEnabled'
+  // messages and read from model.enhanceJira, which is already fetched (getEnhanceJira is posted
+  // on 'showSettings' and at boot), so opening this sub-page needs no extra host round-trip.
+  function enhanceJiraView() {
+    const wrap = h('div', { className: 'settings-body' });
+
+    const topbar = h(
+      'div', { className: 'settings-topbar' },
+      h('button', {
+        className: 'icon-button ej-back-btn',
+        type: 'button',
+        dataAction: 'closeEnhanceJira',
+        title: 'Back to Settings',
+        ariaLabel: 'Back to Settings'
+      }, '← Back'),
+      h('span', { className: 'settings-title' }, 'EnhanceJira')
+    );
+    wrap.appendChild(topbar);
+
+    enhanceJiraGroups(wrap);
+    return wrap;
   }
 
   // ── Persistent logins section — operator-only. Snapshot a signed-in tab's cookies (window-wide
@@ -1503,7 +1582,7 @@
 
     wrap.appendChild(extensionsSection());
 
-    wrap.appendChild(enhanceJiraSection());
+    wrap.appendChild(enhanceJiraConfigureRow());
 
     wrap.appendChild(loginsSection());
 
@@ -1555,12 +1634,19 @@
       )
     );
 
-    if (model.view === 'settings') {
-      const body = settingsView();
+    if (model.view === 'settings' || model.view === 'enhancejira') {
+      // Both views share the .settings-body wrapper/scroll chrome, so the same
+      // scroll-capture (above) and restore logic below covers the EnhanceJira
+      // sub-page too — it resets to the top on a real navigation in/out (no
+      // '.settings-body' is mounted across that render) and preserves scroll
+      // across an in-page re-render (e.g. toggling a component), same as Settings.
+      const body = model.view === 'settings' ? settingsView() : enhanceJiraView();
       app.appendChild(body);
       // Auto-grow the capability instruction boxes to fit their (possibly long,
       // host-pushed) content now that they're laid out in the DOM — done before
       // the scroll restore below since it changes the body's total height.
+      // (enhanceJiraView() has no .capability-instruction textareas, so this is
+      // a harmless no-op there.)
       body.querySelectorAll('.capability-instruction').forEach(autoSizeInstruction);
       // Restore the captured scroll position (synchronously, then once more on
       // the next frame in case layout wasn't settled) so re-renders don't jump.
@@ -1808,6 +1894,14 @@
       render();
     } else if (action === 'deleteExtension' && id) {
       post({ type: 'removeExtension', id: id });
+    } else if (action === 'openEnhanceJira') {
+      // Client-side only — model.enhanceJira is already loaded (fetched on 'showSettings' and at
+      // boot), so opening the sub-page needs no host round-trip, same as showTabs/showSettings.
+      model.view = 'enhancejira';
+      render();
+    } else if (action === 'closeEnhanceJira') {
+      model.view = 'settings';
+      render();
     } else if (action === 'toggleEnhanceJiraEnabled') {
       post({ type: 'setEnhanceJiraEnabled', enabled: target.checked });
     } else if (action === 'toggleEnhanceJiraComponent') {
@@ -2101,7 +2195,10 @@
     if (!msg || typeof msg !== 'object') { return; }
     if (msg.type === 'state') {
       // Merge in place — a session-state push must not clobber model.settings
-      // or knock the user off whichever view (sessions/settings) they're on.
+      // or knock the user off whichever view (sessions/settings/enhancejira)
+      // they're on: model.view is simply never assigned here, so all three
+      // values survive a state push untouched (see the third model.view value,
+      // 'enhancejira', added by enhanceJiraView() below).
       model.sessions = Array.isArray(msg.sessions) ? msg.sessions : [];
       model.port = msg.port != null ? msg.port : model.port;
       model.scripts = Array.isArray(msg.scripts) ? msg.scripts : (model.scripts || []);

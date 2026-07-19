@@ -1317,6 +1317,66 @@ select.ext-runat:focus-visible {
   margin: 6px 0 2px;
 }
 
+/* ─── Compact "EnhanceJira" row in the main Settings view (Option A) — reuses
+   .bm-bar-toggle-row (the master-toggle row's own layout) for the flex row + gap, and
+   .capability-label/.bm-bar-hint for the text, so it reads as the same chrome as every
+   other toggle row in Settings. The only genuinely new rules are ej-configure-row/-btn
+   (the row's gap and the button's own layout) and .ej-back-btn (the sub-page's Back
+   button, an auto-width variant of the existing framed .icon-button chrome used by
+   .settings-github-btn / .update-badge). ───────────────────────────────────────────── */
+.ej-configure-row {
+  gap: 6px;
+}
+
+/* The clickable part of the row (label + chevron) that opens the EnhanceJira sub-page;
+   the master-enable checkbox sits beside it, outside this button, so toggling it doesn't
+   also navigate. */
+.ej-configure-btn {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  background: transparent;
+  border: none;
+  color: var(--vscode-foreground);
+  font: inherit;
+  padding: 3px 4px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.ej-configure-btn:hover {
+  background: var(--vscode-list-hoverBackground);
+}
+
+.ej-configure-btn:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder, #007fd4);
+  outline-offset: -1px;
+}
+
+.ej-configure-btn svg {
+  color: var(--vscode-descriptionForeground);
+  flex-shrink: 0;
+}
+
+/* Back button atop the EnhanceJira sub-page — same input-material frame as
+   .settings-github-btn/.update-badge, just auto-width for its "← Back" label. */
+button.icon-button.ej-back-btn {
+  width: auto;
+  padding: 0 8px;
+  gap: 4px;
+  font-size: 12px;
+  border: 1px solid var(--vscode-input-border, transparent);
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+}
+
+button.icon-button.ej-back-btn:hover:not(:disabled) {
+  background: var(--vscode-input-background);
+  border-color: var(--vscode-focusBorder, #007fd4);
+}
+
 /* ─── Persistent logins (Stage 2/3) — a per-origin saved-login row inside an .ext-list card.
    Mirrors .ext-row density; the count badge reuses the compact neutral pill of .ext-kind. ──── */
 .login-row {
