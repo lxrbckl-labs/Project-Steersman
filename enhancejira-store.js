@@ -568,6 +568,7 @@ class EnhanceJiraStore {
           exPr.bots = PR_BOTS;
           if (PR_COLORING) {
             exPr.applyByKey();   // instant repaint from cached counts: honors the new threshold, zero refetch
+            exPr.startRepaint(); // ensure the live-states re-apply loop is running after a toggle back on
             var empty = true;
             for (var ck in exPr.cache) { if (exPr.cache.hasOwnProperty(ck)) { empty = false; break; } }
             // Only hit the network if coloring was just turned ON, the cache is empty, or the counts are stale.
@@ -582,6 +583,7 @@ class EnhanceJiraStore {
           cache: {},            // issueId -> { key, approved, changesRequested, hasPr, ts } (raw facts; color derived at paint)
           _scheduled: false,
           _refreshing: false,
+          _repaintTimer: null,  // setInterval id for the live-states re-apply loop (singleton-guarded)
           lastRefresh: 0,
           observer: null,
           boardId: function () {
@@ -784,16 +786,43 @@ class EnhanceJiraStore {
               for (var i = 0; i < cards.length; i++) {
                 var card = cards[i];
                 var key = this.keyOfCard(card);
-                var color = (key && entryByKey[key]) ? this.colorFor(entryByKey[key]) : undefined;
+                var color = undefined;
+                if (key) {
+                  // LIVE source of truth: the relayed states node (on <html>, which our body observer
+                  // never sees — so read it fresh at paint). When present it drives the color directly
+                  // (real changes_requested + bridge approvedHumans), independent of the computeCounts
+                  // cache which may still hold a stale pre-publish dev-status fact. When absent, fall back
+                  // to that cached dev-status entry as before (green-only, no changes-requested signal).
+                  var be = this.bridgeEntry(key);
+                  if (be) {
+                    color = this.colorFor({ approved: be.approvedHumans || 0, changesRequested: !!be.changesRequested, hasPr: true });
+                  } else if (entryByKey[key]) {
+                    color = this.colorFor(entryByKey[key]);
+                  }
+                }
                 this.colorCard(card, color);
               }
             } catch (e) {}
+          },
+          // Periodic re-apply so cards catch up as the companion publishes/updates #__ej_bb_states even
+          // with NO board DOM mutations (the states node lives on <html>, off the observer's body subtree).
+          // Singleton-guarded (one interval per manager); started when the manager activates, cleared on
+          // clearAll / toggle-off. The observer still handles scroll re-renders.
+          startRepaint: function () {
+            var self = this;
+            if (self._repaintTimer) return;
+            try { self._repaintTimer = setInterval(function () { try { self.applyByKey(); } catch (e) {} }, 8000); }
+            catch (e) { self._repaintTimer = null; }
+          },
+          stopRepaint: function () {
+            if (this._repaintTimer) { try { clearInterval(this._repaintTimer); } catch (e) {} this._repaintTimer = null; }
           },
           // Feature toggled off: restore every rendered card's surface to its default background. Also
           // removes any stale __ejPrColorStyle node left by an older injected build (defensive no-op now
           // that this version injects no style).
           clearAll: function () {
             try {
+              this.stopRepaint();
               var cards = document.querySelectorAll(PR_CARD_SEL);
               for (var i = 0; i < cards.length; i++) this.colorCard(cards[i], null);
               var s = document.getElementById('__ejPrColorStyle');
@@ -814,8 +843,14 @@ class EnhanceJiraStore {
               if (Date.now() - p.lastRefresh > PR_TTL) p.refresh();
             });
           });
-          p.observer.observe(document.body, { childList: true, subtree: true });
-          if (p.desired) p.refresh();
+          // Watch documentElement (NOT body): its subtree still includes <body> (so card re-renders /
+          // scroll virtualization keep firing this), AND it catches the #__ej_bb_states node being
+          // replaced at the <html> level on every companion publish → the debounced callback runs
+          // applyByKey() → reads live states → tints. MutationObservers fire even when the tab is hidden
+          // (unlike the throttled 8s timer), so coloring wakes the moment states publish, no visibility
+          // dependence. (Only THIS manager widens to documentElement; avatars/insights/popup stay on body.)
+          p.observer.observe(document.documentElement, { childList: true, subtree: true });
+          if (p.desired) { p.refresh(); p.startRepaint(); }
         }
         window.__ejPrColor = p;
         if (document.body) startPr();
@@ -1103,8 +1138,11 @@ class EnhanceJiraStore {
           return out;
         }).catch(function () { return []; });
       },
-      // dev-status -> [{ repo:'<ws>/<repo>', prId, prKey }]. repo is the two path segments after
-      // bitbucket.org (a real <workspace>/<repo> slug when present; the uuid form otherwise — both 200).
+      // dev-status -> [{ repo:'<ws>/<repo>', prId, prKey }]. repo PREFERS pr.repositoryName — dev-status's
+      // clean '<workspace>/<repo>' slug (e.g. 'herzog-technologies/cmms') — because pr.repositoryUrl is
+      // the '{}/{<repo-uuid>}' placeholder form whose uuid path is FLAKY (returns 0 participants for some
+      // PRs). Falls back to parsing the two path segments out of repositoryUrl only when repositoryName is
+      // absent/blank.
       extractPrs: function (dj) {
         var out = [], detail = (dj && dj.detail) || [];
         for (var i = 0; i < detail.length; i++) {
@@ -1112,15 +1150,21 @@ class EnhanceJiraStore {
           if (!d) continue;
           for (var k = 0; k < d.length; k++) {
             var pr = d[k];
-            var rm = String(pr.repositoryUrl || '').match(/bitbucket\\.org\\/([^\\/]+\\/[^\\/?#]+)/);
-            var repo = rm && rm[1];
+            var repo = (typeof pr.repositoryName === 'string' && pr.repositoryName.trim()) ? pr.repositoryName.trim() : null;
+            if (!repo) {
+              var rm = String(pr.repositoryUrl || '').match(/bitbucket\\.org\\/([^\\/]+\\/[^\\/?#]+)/);
+              repo = rm && rm[1];
+            }
             if (repo && pr.id != null) out.push({ repo: repo, prId: pr.id, prKey: repo + '#' + pr.id });
           }
         }
         return out;
       },
-      // Fetch one PR's participants from the Bitbucket 2.0 API (host attaches session cookies). Cached
-      // per PR for BB_TTL; a fresh cache hit skips the network. Errors keep any prior cache and swallow.
+      // Fetch one PR's participants from the Bitbucket 2.0 API (host attaches session cookies). A fresh
+      // cache hit (< BB_TTL) skips the network. GOOD data (ok + non-empty participants) is cached for the
+      // full BB_TTL; an empty/failed result is TRANSIENT — it's only made available to this cycle's
+      // aggregation via a nearly-expired ts (so the next 90s refresh retries), and never overwrites a
+      // prior good cache. Errors are swallowed.
       fetchParticipants: function (ref) {
         var self = this;
         var c = self.prCache[ref.prKey];
@@ -1130,7 +1174,14 @@ class EnhanceJiraStore {
         return steersman.fetch(url, { sessionCookies: true }).then(function (res) {
           var data = null;
           try { data = res.body ? JSON.parse(res.body) : null; } catch (e) { data = null; }
-          self.prCache[ref.prKey] = { participants: (data && data.participants) || [], ts: Date.now() };
+          var participants = (data && data.participants) || [];
+          if (res && res.ok && participants.length) {
+            self.prCache[ref.prKey] = { participants: participants, ts: Date.now() };   // good: cache BB_TTL
+          } else if (!self.prCache[ref.prKey]) {
+            // transient empty/failed: usable this cycle, but stale ts so the next refresh refetches
+            self.prCache[ref.prKey] = { participants: participants, ts: Date.now() - BB_TTL + 5000 };
+          }
+          // else: keep the prior good cache rather than blanking it with a transient empty result
         }).catch(function () {});
       },
       // Aggregate an issue's PRs (from prCache) into reviewer FACTS. reviewers[] carries EVERY
@@ -1175,17 +1226,21 @@ class EnhanceJiraStore {
           reviewers: reviewers
         };
       },
-      // Write the whole states map to the hidden contract node the main-world coloring reads.
+      // Write the whole states map to the hidden contract node the main-world coloring reads. REPLACE the
+      // node fresh on every publish (remove old + createElement + append) rather than mutating textContent:
+      // the removal+append is a childList mutation on documentElement, which the coloring's documentElement
+      // observer catches (fires even when the tab is hidden) — a textContent update would be characterData
+      // and go unseen. Kept on document.documentElement (outside <body>) so Jira's React root never
+      // reconciles/removes it.
       publish: function (byIssue) {
         try {
-          var n = document.getElementById('__ej_bb_states');
-          if (!n) {
-            n = document.createElement('script');
-            n.type = 'application/json';
-            n.id = '__ej_bb_states';
-            if (document.documentElement) document.documentElement.appendChild(n);
-          }
+          var old = document.getElementById('__ej_bb_states');
+          if (old && old.parentNode) old.parentNode.removeChild(old);
+          var n = document.createElement('script');
+          n.type = 'application/json';
+          n.id = '__ej_bb_states';
           n.textContent = JSON.stringify({ updatedAt: Date.now(), byIssue: byIssue });
+          if (document.documentElement) document.documentElement.appendChild(n);
         } catch (e) {}
         try {
           var cnt = 0, cr = 0;
