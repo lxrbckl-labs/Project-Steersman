@@ -614,12 +614,41 @@ class EnhanceJiraStore {
               return out;
             }).catch(function () { return []; });
           },
+          // Read the bridge companion's relayed reviewer facts for an issue KEY from the hidden
+          // <script id="__ej_bb_states"> contract node (published by composeBridgeJs's isolated world).
+          // Returns the per-issue entry ({ changesRequested, changesRequestedBy, approvedHumans,
+          // reviewers }) or null when the bridge isn't ready/on/matched — the null triggers the
+          // same-origin dev-status fallback in computeCounts. Never throws.
+          bridgeEntry: function (issueKey) {
+            try {
+              if (!issueKey) return null;
+              var n = document.getElementById('__ej_bb_states');
+              if (!n) return null;
+              var txt = n.textContent || '';
+              if (!txt) return null;
+              var data = JSON.parse(txt);
+              var byIssue = data && data.byIssue;
+              return (byIssue && byIssue[issueKey]) || null;
+            } catch (e) { return null; }
+          },
           // Fetch a PR's raw approval FACTS (not the green/red decision): approved = deduped approved
           // human reviewers (excluding PR_BOTS), hasPr = any PR exists, changesRequested = any reviewer
-          // requested changes. Cached as-is so a later threshold change repaints from these facts with no
-          // refetch. undefined = fetch error (don't hard-cache).
-          computeCounts: function (issueId) {
+          // requested changes. PREFERRED source is the bridge companion's relayed Bitbucket facts
+          // (#__ej_bb_states, keyed by issueKey) — the only source with a real changes-requested signal;
+          // when absent (bridge off/not-ready) we FALL BACK to the same-origin dev-status path (approved
+          // count only, changesRequested:false) so green keeps working without the bridge. Cached as-is
+          // so a later threshold change repaints from these facts with no refetch. undefined = fetch
+          // error (don't hard-cache).
+          computeCounts: function (issueId, issueKey) {
             var self = this;
+            var relayed = self.bridgeEntry(issueKey);
+            if (relayed) {
+              return Promise.resolve({
+                approved: relayed.approvedHumans || 0,
+                changesRequested: !!relayed.changesRequested,
+                hasPr: true
+              });
+            }
             var url = '/rest/dev-status/latest/issue/detail?issueId=' + encodeURIComponent(issueId) + '&applicationType=bitbucket&dataType=pullrequest';
             return this.getJson(url).then(function (j) {
               var prs = [];
@@ -673,7 +702,7 @@ class EnhanceJiraStore {
               function worker() {
                 if (idx >= queue.length) return Promise.resolve();
                 var issue = queue[idx++];
-                return self.computeCounts(issue.id).then(function (counts) {
+                return self.computeCounts(issue.id, issue.key).then(function (counts) {
                   if (counts !== undefined) {
                     self.cache[issue.id] = { key: issue.key, approved: counts.approved, changesRequested: counts.changesRequested, hasPr: counts.hasPr, ts: Date.now() };
                   } else {
@@ -793,6 +822,160 @@ class EnhanceJiraStore {
         else document.addEventListener('DOMContentLoaded', startPr, { once: true });
       } catch (e) {}
     })();
+    // Stage-2 PR hover-card avatar expansion. Jira's board card PR-icon hover opens a portal popup
+    // (testids under 'development-board-pr-details-popup.*') that shows only ~2 reviewer avatars + a
+    // "+N" overflow. This manager watches for that popup, reads the issue key from its branch text,
+    // looks the reviewers up in the relayed #__ej_bb_states, and REPLACES the capped avatar group with
+    // a full strip — EVERY reviewer (bots included), each with a corner status badge (green check =
+    // approved, red ✕ = changes requested) and a name+status title tooltip. Gated by PR_COLORING;
+    // idempotent per popup instance; never throws; leaves Jira's popup untouched when data isn't ready.
+    (function setupPrPopup(){
+      try {
+        var exPop = window.__ejPrPopup;
+        if (exPop) { exPop.desired = PR_COLORING; if (PR_COLORING) exPop.apply(); return; }
+        var POP_SEL = '[data-testid^="development-board-pr-details-popup"]';
+        var POP_KEY_RE = /[A-Z][A-Z0-9]+-\\d+/;
+        var pop = {
+          desired: PR_COLORING,
+          _scheduled: false,
+          observer: null,
+          // Read one issue's relayed reviewers from the Stage-1 contract node (same source the coloring
+          // reads). Returns the reviewers array or null when the bridge isn't ready/matched. Never throws.
+          reviewersFor: function (issueKey) {
+            try {
+              if (!issueKey) return null;
+              var n = document.getElementById('__ej_bb_states');
+              if (!n) return null;
+              var txt = n.textContent || '';
+              if (!txt) return null;
+              var data = JSON.parse(txt);
+              var e = data && data.byIssue && data.byIssue[issueKey];
+              return (e && e.reviewers && e.reviewers.length) ? e.reviewers : null;
+            } catch (e) { return null; }
+          },
+          // The outermost popup element sharing the popup testid prefix (stable node to read text from +
+          // mark processed). null when no popup is open.
+          root: function () {
+            var el = document.querySelector(POP_SEL);
+            if (!el) return null;
+            var root = el, p = el.parentElement;
+            while (p) {
+              var t = p.getAttribute && p.getAttribute('data-testid');
+              if (t && t.indexOf('development-board-pr-details-popup') === 0) root = p;
+              p = p.parentElement;
+            }
+            return root;
+          },
+          // The avatar-group CONTAINER inside the popup (holds the shown avatars + the "+N" overflow):
+          // the ancestor whose testid names the group itself (not a '--avatar-N--inner' child). Falls
+          // back to an avatar img's parent. null if none found.
+          group: function (root) {
+            try {
+              var inner = root.querySelector('[data-testid*="avatar-group"]');
+              if (inner) {
+                var el = inner;
+                while (el && el !== root) {
+                  var t = (el.getAttribute && el.getAttribute('data-testid')) || '';
+                  if (t.indexOf('avatar-group') !== -1 && t.indexOf('--avatar-') === -1 && t.indexOf('--inner') === -1) return el;
+                  el = el.parentElement;
+                }
+              }
+              var img = root.querySelector('[data-testid*="avatar-group"] img') || root.querySelector('img');
+              return img ? img.parentElement : inner;
+            } catch (e) { return null; }
+          },
+          initials: function (name) {
+            try {
+              var parts = String(name).trim().split(/\\s+/);
+              var a = parts[0] ? parts[0].charAt(0) : '';
+              var b = parts.length > 1 ? parts[parts.length - 1].charAt(0) : '';
+              return (a + b).toUpperCase() || '?';
+            } catch (e) { return '?'; }
+          },
+          // Build one avatar wrapper: circular <img> (or an initials fallback when no avatar URL), a
+          // corner status badge, and a name+status title tooltip. Colors match the card tint family.
+          buildAvatar: function (rv) {
+            var name = rv.name || 'Reviewer';
+            var isCr = rv.state === 'changes_requested';
+            var isApp = rv.approved || rv.state === 'approved';
+            var wrap = document.createElement('div');
+            wrap.style.cssText = 'position:relative;width:24px;height:24px;display:inline-block;flex:0 0 auto;';
+            wrap.setAttribute('title', name + (isCr ? ' — requested changes' : (isApp ? ' — approved' : '')));
+            if (rv.avatar) {
+              var img = document.createElement('img');
+              img.src = rv.avatar;
+              img.alt = name;
+              img.referrerPolicy = 'no-referrer';
+              img.style.cssText = 'width:24px;height:24px;border-radius:50%;object-fit:cover;display:block;box-shadow:0 0 0 1.5px #fff;';
+              wrap.appendChild(img);
+            } else {
+              var f = document.createElement('div');
+              f.textContent = this.initials(name);
+              f.style.cssText = 'width:24px;height:24px;border-radius:50%;background:#5E6C84;color:#fff;font-size:10px;font-weight:600;display:flex;align-items:center;justify-content:center;box-shadow:0 0 0 1.5px #fff;';
+              wrap.appendChild(f);
+            }
+            if (isCr || isApp) {
+              var badge = document.createElement('div');
+              badge.textContent = isCr ? '✕' : '✓';
+              badge.style.cssText = 'position:absolute;right:-3px;bottom:-3px;width:13px;height:13px;border-radius:50%;border:1.5px solid #fff;color:#fff;font-size:9px;line-height:13px;text-align:center;background:' + (isCr ? '#FF5630' : '#36B37E') + ';';
+              wrap.appendChild(badge);
+            }
+            return wrap;
+          },
+          // Hide Jira's original avatar-group children and append our full-reviewer strip in their place.
+          // Idempotent: an existing strip is removed first so a re-render repaints cleanly.
+          render: function (group, reviewers) {
+            try {
+              var kids = group.children;
+              for (var i = 0; i < kids.length; i++) {
+                var c = kids[i];
+                if (c.getAttribute && c.getAttribute('data-ej-pr-strip') === '1') continue;
+                if (c.style) c.style.display = 'none';
+              }
+              var prev = group.querySelector('[data-ej-pr-strip="1"]');
+              if (prev && prev.parentNode) prev.parentNode.removeChild(prev);
+              var strip = document.createElement('div');
+              strip.setAttribute('data-ej-pr-strip', '1');
+              strip.style.cssText = 'display:flex;flex-wrap:wrap;gap:5px;align-items:center;';
+              for (var j = 0; j < reviewers.length; j++) strip.appendChild(this.buildAvatar(reviewers[j]));
+              group.appendChild(strip);
+            } catch (e) {}
+          },
+          apply: function () {
+            try {
+              if (!this.desired) return;
+              var root = this.root();
+              if (!root) return;
+              var m = (root.textContent || '').match(POP_KEY_RE);
+              if (!m) return;
+              var key = m[0];
+              var reviewers = this.reviewersFor(key);
+              if (!reviewers) return;   // companion not ready for this issue -> leave Jira's popup as-is
+              var group = this.group(root);
+              if (!group) return;
+              // Skip only when already rendered for THIS key AND our strip survived Jira's re-renders.
+              if (root.getAttribute('data-ej-pr-popup') === key && group.querySelector('[data-ej-pr-strip="1"]')) return;
+              this.render(group, reviewers);
+              root.setAttribute('data-ej-pr-popup', key);
+            } catch (e) {}
+          }
+        };
+        function startPop() {
+          if (window.__ejPrPopup !== pop || pop.observer) return;
+          var raf = window.requestAnimationFrame ? window.requestAnimationFrame.bind(window) : function (cb) { return setTimeout(cb, 16); };
+          pop.observer = new MutationObserver(function () {
+            if (pop._scheduled) return;
+            pop._scheduled = true;
+            raf(function () { pop._scheduled = false; if (!pop.desired) return; pop.apply(); });
+          });
+          pop.observer.observe(document.body, { childList: true, subtree: true });
+          if (pop.desired) pop.apply();
+        }
+        window.__ejPrPopup = pop;
+        if (document.body) startPop();
+        else document.addEventListener('DOMContentLoaded', startPop, { once: true });
+      } catch (e) {}
+    })();
     var DESIRED = ${desired ? 'true' : 'false'};
     var INSIGHTS_SEL = ${JSON.stringify(INSIGHTS_SELECTOR)};
     var FULLSCREEN_SEL = ${JSON.stringify(FULLSCREEN_SELECTOR)};
@@ -849,6 +1032,235 @@ class EnhanceJiraStore {
     else document.addEventListener('DOMContentLoaded', start, { once: true });
   } catch (e) {}
 })();`;
+  }
+
+  // Stage-1 DATA-PROVIDER body for the Bitbucket bridge COMPANION record. Emits an idempotent IIFE
+  // (singleton window.__ejBbBridge) that runs in the bridge's isolated world and publishes reviewer
+  // FACTS for the WHOLE Review column to a hidden <script id="__ej_bb_states"> node that the main-world
+  // coloring reads. Flow: same-origin fetch the Review issues + each issue's PR(s) via dev-status, then
+  // steersman.fetch each PR's participants from the Bitbucket 2.0 API with sessionCookies:true (host
+  // attaches the live session — no token). Bitbucket + dev-status fetches are throttled (<=4 concurrent)
+  // and cached per PR (BB_TTL ~60s) so repeated refreshes don't hammer; facts are aggregated PER ISSUE
+  // across its PRs and keyed by the SAME Jira issue key the main-world keyOfCard reads (e.g. "CMMS-2846").
+  // Refreshes on load + every 90s. Never throws into the page (whole body wrapped in try/catch, every
+  // fetch .catch()'d). When steersman.fetch is unavailable it writes NOTHING and returns — the main-world
+  // coloring then falls back to its same-origin dev-status path.
+  composeBridgeJs() {
+    return `(function(){
+  try {
+    if (window.__ejBbBridge) return;
+    if (typeof steersman === 'undefined' || !steersman || !steersman.fetch) return;
+    var BB_TTL = 60000;    // per-PR participant cache TTL
+    var BB_MAXC = 4;       // max concurrent throttled fetches
+    var BB_BOTS = ['Code Rabbit'];
+    var bridge = {
+      prCache: {},         // 'repo#prId' -> { participants:[...], ts }
+      _refreshing: false,
+      isBot: function (name) {
+        if (!name) return false;
+        for (var i = 0; i < BB_BOTS.length; i++) {
+          if (String(name).toLowerCase() === String(BB_BOTS[i]).toLowerCase()) return true;
+        }
+        return false;
+      },
+      boardId: function () {
+        try { var mm = location.pathname.match(/\\/boards\\/(\\d+)/); return mm && mm[1]; } catch (e) { return null; }
+      },
+      getJson: function (url) {
+        return fetch(url, { credentials: 'include', headers: { 'Accept': 'application/json' } }).then(function (r) {
+          if (!r.ok) throw new Error('bad status ' + r.status);
+          return r.json();
+        });
+      },
+      // Run worker(item) over items with at most maxc in flight; resolves when all settle (errors swallowed).
+      runPool: function (items, worker, maxc) {
+        return new Promise(function (resolve) {
+          var n = items.length, idx = 0, active = 0, done = 0;
+          if (!n) return resolve();
+          function pump() {
+            while (active < maxc && idx < n) {
+              var it = items[idx++];
+              active++;
+              Promise.resolve().then(function () { return worker(it); }).catch(function () {}).then(function () {
+                active--; done++;
+                if (done >= n) resolve(); else pump();
+              });
+            }
+          }
+          pump();
+        });
+      },
+      fetchIssues: function () {
+        var id = this.boardId();
+        if (!id) return Promise.resolve([]);
+        var jql = encodeURIComponent('sprint in openSprints() AND status="Review"');
+        var url = '/rest/agile/1.0/board/' + id + '/issue?fields=status&jql=' + jql + '&maxResults=100';
+        return this.getJson(url).then(function (j) {
+          var out = [], issues = (j && j.issues) || [];
+          for (var i = 0; i < issues.length; i++) {
+            if (issues[i] && issues[i].id != null) out.push({ id: String(issues[i].id), key: issues[i].key });
+          }
+          return out;
+        }).catch(function () { return []; });
+      },
+      // dev-status -> [{ repo:'<ws>/<repo>', prId, prKey }]. repo is the two path segments after
+      // bitbucket.org (a real <workspace>/<repo> slug when present; the uuid form otherwise — both 200).
+      extractPrs: function (dj) {
+        var out = [], detail = (dj && dj.detail) || [];
+        for (var i = 0; i < detail.length; i++) {
+          var d = detail[i] && detail[i].pullRequests;
+          if (!d) continue;
+          for (var k = 0; k < d.length; k++) {
+            var pr = d[k];
+            var rm = String(pr.repositoryUrl || '').match(/bitbucket\\.org\\/([^\\/]+\\/[^\\/?#]+)/);
+            var repo = rm && rm[1];
+            if (repo && pr.id != null) out.push({ repo: repo, prId: pr.id, prKey: repo + '#' + pr.id });
+          }
+        }
+        return out;
+      },
+      // Fetch one PR's participants from the Bitbucket 2.0 API (host attaches session cookies). Cached
+      // per PR for BB_TTL; a fresh cache hit skips the network. Errors keep any prior cache and swallow.
+      fetchParticipants: function (ref) {
+        var self = this;
+        var c = self.prCache[ref.prKey];
+        if (c && (Date.now() - c.ts) < BB_TTL) return Promise.resolve();
+        var url = 'https://bitbucket.org/!api/2.0/repositories/' + ref.repo + '/pullrequests/' + ref.prId +
+          '?fields=participants.state,participants.approved,participants.role,participants.user.display_name,participants.user.uuid,participants.user.links.avatar.href';
+        return steersman.fetch(url, { sessionCookies: true }).then(function (res) {
+          var data = null;
+          try { data = res.body ? JSON.parse(res.body) : null; } catch (e) { data = null; }
+          self.prCache[ref.prKey] = { participants: (data && data.participants) || [], ts: Date.now() };
+        }).catch(function () {});
+      },
+      // Aggregate an issue's PRs (from prCache) into reviewer FACTS. reviewers[] carries EVERY
+      // participant (bots INCLUDED — the Stage-2 popup shows the full picture), each deduped by display
+      // name across PRs; but the human tallies (changesRequested/changesRequestedBy/approvedHumans that
+      // drive the RED/GREEN card trigger) EXCLUDE bots (BB_BOTS). Both unioned across the issue's PRs.
+      aggregateIssue: function (prs) {
+        var self = this;
+        var reviewersByName = {}, crBy = {}, apprBy = {};
+        for (var i = 0; i < prs.length; i++) {
+          var c = self.prCache[prs[i].prKey];
+          var parts = (c && c.participants) || [];
+          for (var j = 0; j < parts.length; j++) {
+            var p = parts[j];
+            var name = p && p.user && p.user.display_name;
+            if (!name) continue;
+            var bot = self.isBot(name);
+            var approved = (p.approved === true) || (p.state === 'approved');
+            var cr = p.state === 'changes_requested';
+            var avatar = p.user && p.user.links && p.user.links.avatar && p.user.links.avatar.href;
+            var ex = reviewersByName[name];
+            if (!ex) {
+              reviewersByName[name] = { name: name, approved: approved, state: (cr ? 'changes_requested' : (approved ? 'approved' : (p.state || null))), avatar: avatar || null };
+            } else {
+              ex.approved = ex.approved || approved;
+              if (cr) ex.state = 'changes_requested';
+              else if (approved && ex.state !== 'changes_requested') ex.state = 'approved';
+              if (!ex.avatar && avatar) ex.avatar = avatar;
+            }
+            if (!bot && cr) crBy[name] = true;      // bots never trigger the red card
+            if (!bot && approved) apprBy[name] = true;   // bots never count toward the approval threshold
+          }
+        }
+        var changesRequestedBy = [], reviewers = [];
+        for (var n1 in crBy) { if (crBy.hasOwnProperty(n1)) changesRequestedBy.push(n1); }
+        var apprCount = 0; for (var n2 in apprBy) { if (apprBy.hasOwnProperty(n2)) apprCount++; }
+        for (var n3 in reviewersByName) { if (reviewersByName.hasOwnProperty(n3)) reviewers.push(reviewersByName[n3]); }
+        return {
+          changesRequested: changesRequestedBy.length > 0,
+          changesRequestedBy: changesRequestedBy,
+          approvedHumans: apprCount,
+          reviewers: reviewers
+        };
+      },
+      // Write the whole states map to the hidden contract node the main-world coloring reads.
+      publish: function (byIssue) {
+        try {
+          var n = document.getElementById('__ej_bb_states');
+          if (!n) {
+            n = document.createElement('script');
+            n.type = 'application/json';
+            n.id = '__ej_bb_states';
+            if (document.documentElement) document.documentElement.appendChild(n);
+          }
+          n.textContent = JSON.stringify({ updatedAt: Date.now(), byIssue: byIssue });
+        } catch (e) {}
+        try {
+          var cnt = 0, cr = 0;
+          for (var k in byIssue) { if (byIssue.hasOwnProperty(k)) { cnt++; if (byIssue[k].changesRequested) cr++; } }
+          console.log('[EJ-BB]', 'published issues=' + cnt + ' changesRequested=' + cr);
+        } catch (e) {}
+      },
+      refresh: function () {
+        var self = this;
+        if (self._refreshing) return;
+        self._refreshing = true;
+        var byIssuePrs = {};   // issueKey -> [{ repo, prId, prKey }]
+        self.fetchIssues().then(function (issues) {
+          // dev-status per issue (same-origin), throttled.
+          return self.runPool(issues, function (issue) {
+            var devUrl = '/rest/dev-status/latest/issue/detail?issueId=' + encodeURIComponent(issue.id) + '&applicationType=bitbucket&dataType=pullrequest';
+            return self.getJson(devUrl).then(function (dj) {
+              var prs = self.extractPrs(dj);
+              if (prs.length) byIssuePrs[issue.key] = prs;
+            }).catch(function () {});
+          }, BB_MAXC);
+        }).then(function () {
+          // Flatten to unique PR refs, then fetch participants throttled + cached.
+          var seen = {}, refs = [];
+          for (var key in byIssuePrs) {
+            if (!byIssuePrs.hasOwnProperty(key)) continue;
+            var arr = byIssuePrs[key];
+            for (var i = 0; i < arr.length; i++) {
+              if (!seen[arr[i].prKey]) { seen[arr[i].prKey] = true; refs.push(arr[i]); }
+            }
+          }
+          return self.runPool(refs, function (ref) { return self.fetchParticipants(ref); }, BB_MAXC);
+        }).then(function () {
+          var byIssue = {};
+          for (var key in byIssuePrs) {
+            if (!byIssuePrs.hasOwnProperty(key)) continue;
+            byIssue[key] = self.aggregateIssue(byIssuePrs[key]);   // only issues WITH >=1 PR are published
+          }
+          self.publish(byIssue);
+          self._refreshing = false;
+        }).catch(function () { self._refreshing = false; });
+      }
+    };
+    window.__ejBbBridge = bridge;
+    bridge.refresh();
+    try { setInterval(function () { try { bridge.refresh(); } catch (e) {} }, 90000); } catch (e) {}
+  } catch (e) {
+    try { console.log('[EJ-BB]', 'fatal', e && e.message ? e.message : e); } catch (_) {}
+  }
+})();`;
+  }
+
+  // The synthetic COMPANION extension record for injectExtensions() — a SEPARATE bridge:true record
+  // that rides alongside (never replaces) the main-world EnhanceJira record. It runs in its own
+  // isolated bridge world (bridgeHosts + bridgeSessionCookies let steersman.fetch reach Bitbucket
+  // with the live session), matching the SAME Jira boards as getActiveRecord(). Only active (non-null)
+  // when the master EnhanceJira flag is on AND prColoring is on — the same gate as the coloring
+  // feature the bridge will eventually feed. Field names mirror a real bridge ExtensionsStore record.
+  getBridgeCompanionRecord() {
+    if (!this._getEnabled()) return null;
+    if (!this._getComponents()[PR_COLORING_KEY]) return null;
+    return {
+      id: 'enhancejira-bb',
+      name: 'EnhanceJira (Bitbucket bridge)',
+      matches: ['https://*.atlassian.net/jira/software/*'],
+      css: '',
+      js: this.composeBridgeJs(),
+      runAt: 'document_start',
+      world: 'isolated',
+      enabled: true,
+      bridge: true,
+      bridgeHosts: ['bitbucket.org'],
+      bridgeSessionCookies: true,
+      hideFromAgent: false,
+    };
   }
 
   // The synthetic extension record for injectExtensions(), or null when the master flag is off or

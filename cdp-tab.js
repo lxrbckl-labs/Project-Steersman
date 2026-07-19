@@ -1079,7 +1079,32 @@ class CDPTab {
         return { ok: false, error: { type: 'host', message: 'unsupported auth type: ' + String(options.auth.type) } };
       }
     }
-    const outHeaders = this._buildFetchHeaders(options.headers, authHeader);
+    // Session-cookie attachment (B4): when options.sessionCookies is true AND the TRUSTED record
+    // opts in with bridgeSessionCookies===true, the HOST reads the browser's live cookies for the
+    // target origin (incl. HttpOnly) via CDP and attaches them as a Cookie header, so a same-user
+    // authenticated API (e.g. Bitbucket) can be called with no stored token. GATE: the record flag
+    // is the security boundary — without it a set sessionCookies is silently ignored (never attach).
+    // Independent of options.auth: if both are set, both headers are applied. NEVER-LOG: cookie
+    // names/values and the Cookie header are never logged; a failure logs host-only and proceeds
+    // unauthenticated (never throws).
+    let cookieHeader = null;
+    if (options.sessionCookies === true) {
+      if (rec && rec.bridgeSessionCookies === true) {
+        try {
+          const r = await this.send('Network.getCookies', { urls: [u.origin] });
+          const cookies = (r && Array.isArray(r.cookies)) ? r.cookies : [];
+          const pairs = cookies
+            .filter((c) => c && typeof c.name === 'string')
+            .map((c) => c.name + '=' + (c.value != null ? c.value : ''));
+          if (pairs.length) cookieHeader = pairs.join('; ');
+        } catch (_) {
+          this.log.appendLine('[Bridge] session-cookie lookup failed ext=' + extId + ' host=' + u.hostname);
+        }
+      } else {
+        this.log.appendLine('[Bridge] sessionCookies requested but record not opted in ext=' + extId + ' host=' + u.hostname);
+      }
+    }
+    const outHeaders = this._buildFetchHeaders(options.headers, authHeader, cookieHeader);
 
     const method = (options.method != null ? String(options.method) : 'GET') || 'GET';
     const timeoutMs = Math.min(
@@ -1150,17 +1175,21 @@ class CDPTab {
     return null;
   }
 
-  // Merge caller headers with a host-built Authorization (B3). When authHeader is set, any
-  // caller-supplied Authorization (case-insensitive) is dropped so host-side auth always wins.
-  _buildFetchHeaders(callerHeaders, authHeader) {
+  // Merge caller headers with a host-built Authorization (B3) and/or Cookie (B4). When authHeader is
+  // set, any caller-supplied Authorization (case-insensitive) is dropped so host-side auth always
+  // wins; likewise when cookieHeader is set, any caller-supplied Cookie is dropped so the host's
+  // session cookies always win. NEVER-LOG: the cookie header is never logged.
+  _buildFetchHeaders(callerHeaders, authHeader, cookieHeader) {
     const out = {};
     if (callerHeaders && typeof callerHeaders === 'object') {
       for (const k of Object.keys(callerHeaders)) {
         if (authHeader && k.toLowerCase() === 'authorization') continue;
+        if (cookieHeader && k.toLowerCase() === 'cookie') continue;
         out[k] = callerHeaders[k];
       }
     }
     if (authHeader) out['Authorization'] = authHeader;
+    if (cookieHeader) out['Cookie'] = cookieHeader;
     return out;
   }
 

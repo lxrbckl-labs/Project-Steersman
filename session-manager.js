@@ -369,10 +369,15 @@ class SessionManager {
   // real extension CSS, and it is generated on-the-fly here (never added to the extensions STORE),
   // so the Extensions list UI never shows it. Guards both stores so a missing one degrades to the
   // other's records rather than throwing.
+  // The EnhanceJira Bitbucket-bridge COMPANION record (Stage 0 diagnostic) rides along IN ADDITION
+  // to the main-world EnhanceJira record — a separate bridge:true record that _syncBridgeWorlds picks
+  // up for its own isolated world; null (omitted) unless master + prColoring are on.
   _injectables() {
     const base = this.extensionsStore ? this.extensionsStore.getActive() : [];
     const ejRecord = this.enhanceJiraStore && this.enhanceJiraStore.getActiveRecord();
-    return ejRecord ? [...base, ejRecord] : base;
+    const ejBridge = this.enhanceJiraStore && this.enhanceJiraStore.getBridgeCompanionRecord();
+    const extra = [ejRecord, ejBridge].filter(Boolean);
+    return extra.length ? [...base, ...extra] : base;
   }
 
   async refreshExtensions() {
