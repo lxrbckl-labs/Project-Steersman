@@ -981,6 +981,20 @@
     return m.length + ' patterns';
   }
 
+  // Table header for the Extensions list (see extensionsSection()) — three muted uppercase labels
+  // sharing the .ext-cell-name/.ext-cell-enabled/.ext-cell-actions widths with every row below it
+  // (including the built-in EnhanceJira row) so the columns line up. Rendered as the first child
+  // of .ext-list itself (not a separate element outside it) so it inherits the exact same 4px
+  // container padding as every row — that's what keeps it pixel-aligned with them.
+  function extTableHeader() {
+    return h(
+      'div', { className: 'ext-row ext-table-head' },
+      h('span', { className: 'ext-cell-name' }, 'Name'),
+      h('span', { className: 'ext-cell-enabled' }, 'Enabled'),
+      h('span', { className: 'ext-cell-actions' }, 'Actions')
+    );
+  }
+
   function extensionRow(ext, urls) {
     const toggle = h('input', {
       type: 'checkbox',
@@ -1013,12 +1027,20 @@
       { className: 'ext-summary', title: (Array.isArray(ext.matches) ? ext.matches : []).join('\n') },
       extMatchSummary(ext)
     );
-    const actions = h(
-      'div', { className: 'bm-actions' },
+    // Name / Enabled / Actions — three sibling cells (see extTableHeader() above) so the row reads
+    // as a table row; all of the previous row content (dot/kind/hidden/bridge/summary) still lives
+    // in the Name cell, just grouped under that column instead of floating loose in the row.
+    const nameCell = h('div', { className: 'ext-cell-name' }, dot, name, kindEl, hiddenEl, bridgeEl, summary);
+    const enabledCell = h('div', { className: 'ext-cell-enabled' }, toggle);
+    const actionsCell = h(
+      'div', { className: 'ext-cell-actions bm-actions' },
       actionButton(ext.id, 'editExtension', 'Edit extension', editIcon(), 'bm-rowbtn'),
       actionButton(ext.id, 'deleteExtension', 'Delete extension', closeIcon(), 'danger bm-rowbtn')
     );
-    return h('div', { className: 'ext-row', dataId: ext.id }, dot, toggle, name, kindEl, hiddenEl, bridgeEl, summary, actions);
+    // The toggle, and the edit/delete buttons, are separate data-action siblings inside their own
+    // cells (never nested inside one another) — the click delegate's closest('[data-action]') can
+    // only ever resolve to the one actually clicked.
+    return h('div', { className: 'ext-row', dataId: ext.id }, nameCell, enabledCell, actionsCell);
   }
 
   function extFormRow() {
@@ -1148,14 +1170,17 @@
     if (isSectionCollapsed('extensions')) { return section; }
     section.appendChild(extMasterToggle());
 
+    // The table always renders — header + the built-in EnhanceJira row are present even with zero
+    // user extensions, so "no extensions" now means "no user-authored rows below EnhanceJira".
     const items = model.extensions || [];
-    if (items.length) {
-      const urls = connectedUrls();
-      const list = h('div', { className: 'ext-list' });
-      items.forEach(function (ext) { list.appendChild(extensionRow(ext, urls)); });
-      section.appendChild(list);
-    } else if (!extForm) {
-      section.appendChild(h('div', { className: 'settings-loading' }, 'No extensions'));
+    const urls = connectedUrls();
+    const list = h('div', { className: 'ext-list' });
+    list.appendChild(extTableHeader());
+    list.appendChild(enhanceJiraTableRow());
+    items.forEach(function (ext) { list.appendChild(extensionRow(ext, urls)); });
+    section.appendChild(list);
+    if (!items.length && !extForm) {
+      section.appendChild(h('div', { className: 'settings-loading' }, 'No user extensions yet'));
     }
     if (extForm) { section.appendChild(extFormRow()); }
     return section;
@@ -1342,15 +1367,11 @@
     return section;
   }
 
-  // ── Compact "EnhanceJira" row in the main Settings view (Option A) — replaces the old inline
-  // section above. Keeps the master enable toggle here for quick access (no need to open the
-  // sub-page just to flip it on/off); the rest of the row is a button that switches the sidebar
-  // to the dedicated enhanceJiraView() sub-page. The toggle is a plain (unlabeled-wrapper)
-  // checkbox — deliberately NOT nested inside the row's clickable button, so a click on the
-  // checkbox toggles it (via its own 'toggleEnhanceJiraEnabled' data-action, which the delegate
-  // resolves first since it's the nearest data-action ancestor-or-self) without also firing the
-  // row's 'openEnhanceJira' navigation.
-  function enhanceJiraConfigureRow() {
+  // Bare EnhanceJira master-enable checkbox (no wrapper <label>, unlike enhanceJiraMasterToggle()
+  // above) — factored out so the compact configure row below and the built-in EnhanceJira table
+  // row (enhanceJiraTableRow(), used by extensionsSection()) share one 'toggleEnhanceJiraEnabled'
+  // checkbox instead of each building their own copy.
+  function enhanceJiraToggleInput() {
     const ej = model.enhanceJira || {};
     const toggle = h('input', {
       type: 'checkbox',
@@ -1359,6 +1380,19 @@
       ariaLabel: 'Enable EnhanceJira'
     });
     toggle.checked = !!ej.enabled;
+    return toggle;
+  }
+
+  // ── Compact "EnhanceJira" row (Option A) — superseded by enhanceJiraTableRow() below, which
+  // settingsView() now renders instead (as the built-in top row of the Extensions table). Kept
+  // defined, not called, for back-compat/reference; its toggle now comes from the shared
+  // enhanceJiraToggleInput() helper above rather than a locally duplicated checkbox. The toggle is
+  // a plain (unlabeled-wrapper) checkbox — deliberately NOT nested inside the row's clickable
+  // button, so a click on the checkbox toggles it (via its own 'toggleEnhanceJiraEnabled'
+  // data-action, which the delegate resolves first since it's the nearest data-action
+  // ancestor-or-self) without also firing the row's 'openEnhanceJira' navigation.
+  function enhanceJiraConfigureRow() {
+    const toggle = enhanceJiraToggleInput();
 
     const openBtn = h(
       'button',
@@ -1377,6 +1411,36 @@
     section.appendChild(h('div', { className: 'bm-bar-toggle-row ej-configure-row' }, toggle, openBtn));
     section.appendChild(h('div', { className: 'bm-bar-hint' }, 'Declutter the Jira board + avatar filter — configure'));
     return section;
+  }
+
+  // ── Built-in EnhanceJira row — the top row of the Extensions table (see extensionsSection()),
+  // same Name/Enabled/Actions cell shape as extensionRow(), so it lines up under extTableHeader().
+  // Unlike a user extension row it has no Edit/Delete: it's a built-in module, not a deletable
+  // user-authored record, so its Actions cell is only ever the Configure button (which just
+  // switches the view to enhanceJiraView(), same as the old enhanceJiraConfigureRow()'s openBtn).
+  // The toggle and the Configure button are sibling data-action elements in separate cells, never
+  // nested, so a click on one can never also resolve to the other via closest('[data-action]').
+  function enhanceJiraTableRow() {
+    const nameCell = h(
+      'div', { className: 'ext-cell-name' },
+      h('span', { className: 'ext-name' }, 'EnhanceJira'),
+      h('span', { className: 'ext-builtin-badge', title: 'Built-in module' }, 'built-in')
+    );
+    const enabledCell = h('div', { className: 'ext-cell-enabled' }, enhanceJiraToggleInput());
+    const configureBtn = h(
+      'button',
+      {
+        className: 'ext-configure-btn',
+        type: 'button',
+        dataAction: 'openEnhanceJira',
+        title: 'Configure EnhanceJira',
+        ariaLabel: 'Configure EnhanceJira'
+      },
+      'Configure',
+      chevronIcon()
+    );
+    const actionsCell = h('div', { className: 'ext-cell-actions bm-actions' }, configureBtn);
+    return h('div', { className: 'ext-row ext-builtin-row' }, nameCell, enabledCell, actionsCell);
   }
 
   // ── Dedicated EnhanceJira settings sub-page (Option A) — reached from the compact row above via
@@ -1580,9 +1644,9 @@
 
     wrap.appendChild(scriptsSection());
 
+    // EnhanceJira's compact row now lives as the built-in top row of the Extensions table above
+    // (see enhanceJiraTableRow(), rendered inside extensionsSection()) — no separate row here.
     wrap.appendChild(extensionsSection());
-
-    wrap.appendChild(enhanceJiraConfigureRow());
 
     wrap.appendChild(loginsSection());
 

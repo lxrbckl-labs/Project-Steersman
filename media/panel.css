@@ -1141,6 +1141,99 @@ button.icon-button.bm-confirm:hover:not(:disabled) {
   background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.12));
 }
 
+/* ─── Extensions table cells — Name / Enabled / Actions, shared by extTableHeader(),
+   extensionRow() and the built-in enhanceJiraTableRow(), so every row (including the header)
+   lines up in the same three columns. ─────────────────────────────────────────────────────── */
+.ext-cell-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ext-cell-enabled {
+  flex: 0 0 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ext-cell-actions {
+  flex: 0 0 auto;
+  min-width: 64px;
+  justify-content: flex-end;
+}
+
+/* Header row — muted uppercase column labels, same cell widths as the rows below it so they
+   align; not hoverable/clickable (no data-action), so it deliberately does not use .ext-row's
+   :hover rule despite sharing its layout via the .ext-row class. */
+.ext-table-head {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--vscode-descriptionForeground, #999);
+  border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  margin-bottom: 2px;
+  cursor: default;
+}
+
+.ext-table-head:hover {
+  background: transparent;
+}
+
+/* Built-in EnhanceJira row — same .ext-row chrome as a user extension row, just a quieter
+   background so it reads as distinct from the deletable, user-authored rows below it. */
+.ext-builtin-row {
+  background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.06));
+}
+
+/* "built-in" tag — same neutral pill treatment as .ext-hidden-badge/.ext-kind. */
+.ext-builtin-badge {
+  flex: 0 0 auto;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  border-radius: 3px;
+  padding: 1px 5px;
+  line-height: 1.4;
+  color: var(--vscode-descriptionForeground, #999);
+  border: 1px solid var(--vscode-descriptionForeground, #999);
+}
+
+/* Configure button inside a table row's Actions cell — text + chevron, sized to sit inline with
+   the 26px .icon-button.bm-rowbtn Edit/Delete buttons on other rows (mirrors .ej-configure-btn's
+   hover/focus/svg treatment, just fixed-height + non-growing instead of filling a full-width row). */
+.ext-configure-btn {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  padding: 0 8px;
+  background: transparent;
+  border: none;
+  color: var(--vscode-foreground);
+  font: inherit;
+  font-size: 11px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.ext-configure-btn:hover {
+  background: var(--vscode-list-hoverBackground);
+}
+
+.ext-configure-btn:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder, #007fd4);
+  outline-offset: -1px;
+}
+
+.ext-configure-btn svg {
+  color: var(--vscode-descriptionForeground);
+  flex-shrink: 0;
+}
+
 .ext-name {
   flex: 1 1 auto;
   min-width: 0;
