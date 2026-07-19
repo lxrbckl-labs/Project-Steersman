@@ -1128,10 +1128,15 @@ class EnhanceJiraStore {
             while (active < maxc && idx < n) {
               var it = items[idx++];
               active++;
-              Promise.resolve().then(function () { return worker(it); }).catch(function () {}).then(function () {
-                active--; done++;
-                if (done >= n) resolve(); else pump();
-              });
+              // Capture item per-iteration: the first pump() synchronously launches maxc workers before any
+              // microtask runs, so a shared function-scoped var would leave every worker seeing only the LAST
+              // assigned item (dropping items[0..maxc-2]). The IIFE gives each worker its own item.
+              (function (item) {
+                Promise.resolve().then(function () { return worker(item); }).catch(function () {}).then(function () {
+                  active--; done++;
+                  if (done >= n) resolve(); else pump();
+                });
+              })(it);
             }
           }
           pump();
