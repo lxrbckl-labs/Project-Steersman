@@ -1170,12 +1170,14 @@
     if (isSectionCollapsed('extensions')) { return section; }
     section.appendChild(extMasterToggle());
 
-    // The table always renders — header + the built-in EnhanceJira row are present even with zero
-    // user extensions, so "no extensions" now means "no user-authored rows below EnhanceJira".
+    // The list always renders — the built-in EnhanceJira row is present even with zero
+    // user extensions (no header row is rendered), so "no extensions" now means "no
+    // user-authored rows below EnhanceJira".
     const items = model.extensions || [];
     const urls = connectedUrls();
     const list = h('div', { className: 'ext-list' });
-    list.appendChild(extTableHeader());
+    // extTableHeader() is intentionally not appended — the "Name / Actions" header row is no
+    // longer rendered (kept defined above for reference/back-compat only).
     list.appendChild(enhanceJiraTableRow());
     items.forEach(function (ext) { list.appendChild(extensionRow(ext, urls)); });
     section.appendChild(list);
@@ -1414,11 +1416,14 @@
   }
 
   // ── Built-in EnhanceJira row — the top row of the Extensions table (see extensionsSection()),
-  // same Name/Actions cell shape as extensionRow(), so it lines up under extTableHeader(). Unlike
-  // a user extension row it has no enable toggle or Edit/Delete: the master toggle now lives on
-  // the EnhanceJira Configure page (see enhanceJiraView()), and it's a built-in module, not a
-  // deletable user-authored record, so its Actions cell is only ever the arrow button that
-  // switches the view to enhanceJiraView() (same 'openEnhanceJira' dispatch as before).
+  // same Name/Actions cell shape as extensionRow(). Unlike a user extension row it has no enable
+  // toggle or Edit/Delete: the master toggle now lives on the EnhanceJira Configure page (see
+  // enhanceJiraView()), and it's a built-in module, not a deletable user-authored record. Since
+  // it has no other inner controls, the whole ROW carries the 'openEnhanceJira' dispatch (role
+  // + tabindex make it keyboard-focusable; see the keydown handler below for Enter/Space
+  // activation, which isn't automatic for a non-native role="button" element). The chevron stays
+  // as a visual affordance only — it's inert (tabindex -1, aria-hidden) so it doesn't create a
+  // second, redundant focus stop alongside the row.
   function enhanceJiraTableRow() {
     const nameCell = h(
       'div', { className: 'ext-cell-name' },
@@ -1429,14 +1434,24 @@
       {
         className: 'ext-configure-btn',
         type: 'button',
-        dataAction: 'openEnhanceJira',
-        title: 'Configure EnhanceJira',
-        ariaLabel: 'Configure EnhanceJira'
+        tabindex: '-1',
+        'aria-hidden': 'true'
       },
       chevronIcon()
     );
     const actionsCell = h('div', { className: 'ext-cell-actions bm-actions' }, configureBtn);
-    return h('div', { className: 'ext-row ext-builtin-row' }, nameCell, actionsCell);
+    return h(
+      'div',
+      {
+        className: 'ext-row ext-builtin-row',
+        dataAction: 'openEnhanceJira',
+        role: 'button',
+        tabindex: '0',
+        ariaLabel: 'Open EnhanceJira settings'
+      },
+      nameCell,
+      actionsCell
+    );
   }
 
   // ── Dedicated EnhanceJira settings sub-page (Option A) — reached from the Extensions table row
@@ -2147,6 +2162,14 @@
     } else if (t.matches('.bm-rename-input')) {
       if (ev.key === 'Enter') { ev.preventDefault(); submitRename(renameId); }
       else if (ev.key === 'Escape') { ev.preventDefault(); renameId = null; render(); }
+    } else if (t.matches('[role="button"][data-action="openEnhanceJira"]')) {
+      // Enter/Space activation for the row's role="button" (not automatic like a native
+      // <button>) — re-dispatch as a click so it goes through the one existing 'openEnhanceJira'
+      // handler in the click delegate above instead of duplicating its logic here.
+      if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'Spacebar') {
+        ev.preventDefault();
+        t.click();
+      }
     }
   });
 

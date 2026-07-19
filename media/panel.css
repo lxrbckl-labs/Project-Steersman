@@ -1192,9 +1192,19 @@ button.icon-button.bm-confirm:hover:not(:disabled) {
 }
 
 /* Built-in EnhanceJira row — same .ext-row chrome as a user extension row, just a quieter
-   background so it reads as distinct from the deletable, user-authored rows below it. */
+   background so it reads as distinct from the deletable, user-authored rows below it. Unlike a
+   user extension row (which has multiple inner controls), this row has only the decorative
+   chevron inside it, so the whole row is the click/keyboard target for 'openEnhanceJira' — the
+   :hover highlight already comes from .ext-row:hover above; this just adds the pointer cursor
+   and a focus ring for the row's role="button"/tabindex. */
 .ext-builtin-row {
   background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.06));
+  cursor: pointer;
+}
+
+.ext-builtin-row:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder, #007fd4);
+  outline-offset: -1px;
 }
 
 /* "built-in" tag — same neutral pill treatment as .ext-hidden-badge/.ext-kind. No longer rendered
