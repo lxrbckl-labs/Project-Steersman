@@ -257,7 +257,25 @@ class CDPTab {
       }
     } else if (msg.method === 'Page.frameNavigated') {
       const f = msg.params && msg.params.frame;
-      if (f && f.url && !f.parentId) this._lastKnownUrl = f.url;
+      // MAIN frame only (subframes carry a parentId). frameNavigated fires at navigation COMMIT —
+      // the new document exists with readyState=loading, before the page's JS renders its UI. We
+      // re-run the same extensions live-apply used on loadEventFired here so the declutter <style>
+      // lands during readyState=loading (before the native toolbar renders), rather than only at
+      // load-complete. The document-start addScriptToEvaluateOnNewDocument registration is silently
+      // ineffective over the js-debug editor-browser CDP proxy (CSS was measured absent all through
+      // loading/interactive/complete), so this early live-apply is the reliable early-CSS path. The
+      // reconcile live-apply is idempotent (CSS replace-in-place), so it's safe to run here even if
+      // the new document's context is momentarily bare, and again at DOMContentLoaded/load below.
+      if (f && f.url && !f.parentId) {
+        this._lastKnownUrl = f.url;
+        this._reinjectExtensions();
+      }
+    } else if (msg.method === 'Page.domContentEventFired') {
+      // Early belt-and-suspenders: DOMContentLoaded is still before load-complete and covers the
+      // rare case where the new main-world execution context wasn't yet ready at frameNavigated
+      // (Runtime.evaluate would have no-op'd). Re-asserting the (idempotent) extensions live-apply
+      // here keeps the declutter CSS present well before loadEventFired's final safety-net reinject.
+      this._reinjectExtensions();
     } else if (msg.method === 'Page.loadEventFired') {
       // A load replaces the document and drops our host node — re-inject the bar.
       this._reinjectBookmarks();
