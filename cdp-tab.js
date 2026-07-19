@@ -79,6 +79,10 @@ class CDPTab {
     this._bridgeScriptIds = new Map(); // extId -> Page.addScriptToEvaluateOnNewDocument identifier
     this._bridgeBindings = new Set();  // extIds we've Runtime.addBinding'd (once per tab)
     this._bridgeCtxToExt = new Map();  // executionContextId -> extId (trusted attribution)
+    // Main frame id for THIS tab, captured from Page.frameNavigated (the frame with no parentId).
+    // Used to Page.createIsolatedWorld a bridge world live on the current document (see
+    // _syncBridgeWorlds' live-apply step) so bridge companions run on refresh, not only next-nav.
+    this._mainFrameId = '';
     // Whether we've currently forced Page.setBypassCSP(true) on THIS tab (Phase 3). We only turn it
     // on when at least one active extension carries CSS (an injected <style> element can be blocked
     // by a page's style-src CSP), and turn it back off when the last CSS-bearing extension is gone,
@@ -268,6 +272,7 @@ class CDPTab {
       // the new document's context is momentarily bare, and again at DOMContentLoaded/load below.
       if (f && f.url && !f.parentId) {
         this._lastKnownUrl = f.url;
+        if (f.id) this._mainFrameId = f.id;
         this._reinjectExtensions();
       }
     } else if (msg.method === 'Page.domContentEventFired') {
@@ -909,9 +914,11 @@ class CDPTab {
   // per tab) and (re)register its per-ext-world document-start script. Extensions that are no longer
   // bridge/active have their world registration removed (the leftover binding is harmless — its
   // world is no longer created, so the binding is never exposed). Runs from injectExtensions, so it
-  // rides every refresh. LIMITATION: like isolated-world JS, a bridge body takes effect on the NEXT
-  // navigation (its world only exists from document-start onward), not live on the current page; its
-  // CSS still applies live via the main bootstrap. Swallows CDP errors; never throws.
+  // rides every refresh. The document-start registration below takes effect only on the NEXT
+  // navigation (and is unreliable over the js-debug editor-browser proxy), so a final LIVE-APPLY step
+  // (analogous to the main-world live-apply in injectExtensions) creates each bridge world on the
+  // CURRENT document and runs its bootstrap now — that's what makes companions run on a refresh, not
+  // just next-nav; its CSS still applies live via the main bootstrap. Swallows CDP errors; never throws.
   async _syncBridgeWorlds(items) {
     const list = Array.isArray(items) ? items : [];
     const hasJs = (e) => e && typeof e.js === 'string' && e.js.trim();
@@ -955,6 +962,61 @@ class CDPTab {
         this.log.appendLine('[Bridge] register world failed for ' + world + ': ' + (e && e.message ? e.message : e));
       }
     }
+
+    // LIVE-APPLY on the CURRENT document. The document-start registrations above only fire on the
+    // NEXT navigation and are unreliable over the js-debug proxy, so on a refresh the companion's
+    // isolated world never runs on the just-loaded document. Fix: for each active bridge ext that has
+    // no live world yet, create its named isolated world on the current main frame and run the same
+    // bootstrap in it now. Once-per-document guard: _bridgeCtxToExt (rebuilt from
+    // Runtime.executionContext* — cleared on refresh, repopulated when a world is created) already
+    // maps a live context for this extId when its world exists, so the 3 reinject events of a single
+    // load spawn at most one world; the companion body's own singleton guard (window.__ejBbBridge)
+    // makes a fresh world per refresh correct and idempotent.
+    const liveExtIds = new Set(this._bridgeCtxToExt.values());
+    const toLiveApply = bridgeList.filter((e) => !liveExtIds.has(e.id));
+    if (toLiveApply.length) {
+      const frameId = await this._getMainFrameId();
+      if (frameId) {
+        for (const ext of toLiveApply) {
+          const world = BRIDGE_WORLD_PREFIX + ext.id;
+          let contextId = null;
+          try {
+            // NB: `grantUniveralAccess` is the CDP protocol's (misspelled) parameter name — keep it.
+            const r = await this.send('Page.createIsolatedWorld', {
+              frameId,
+              worldName: world,
+              grantUniveralAccess: false,
+            });
+            contextId = r && r.executionContextId;
+          } catch (e) {
+            this.log.appendLine('[Bridge] FALLBACK SIGNAL: createIsolatedWorld("' + world + '") REJECTED by proxy: ' + (e && e.message ? e.message : e) + ' — live bridge apply unsupported on this transport.');
+          }
+          if (!contextId) continue;
+          try {
+            await this.send('Runtime.evaluate', {
+              expression: this._buildBridgeBootstrap(ext),
+              contextId,
+              awaitPromise: false,
+            });
+          } catch (e) {
+            this.log.appendLine('[Bridge] live apply failed for ' + world + ': ' + (e && e.message ? e.message : e));
+          }
+        }
+      }
+    }
+  }
+
+  // Best-effort main frame id for THIS tab: prefer the value captured from Page.frameNavigated; on a
+  // fresh connect to an already-loaded page (no frameNavigated yet) fall back to Page.getFrameTree
+  // and cache it. Returns '' if still unknown (callers no-op gracefully). Never throws.
+  async _getMainFrameId() {
+    if (this._mainFrameId) return this._mainFrameId;
+    try {
+      const r = await this.send('Page.getFrameTree');
+      const id = r && r.frameTree && r.frameTree.frame && r.frameTree.frame.id;
+      if (id) this._mainFrameId = id;
+    } catch {}
+    return this._mainFrameId;
   }
 
   // Maintain the TRUSTED contextId->extId map from execution-context lifecycle events, and route a
