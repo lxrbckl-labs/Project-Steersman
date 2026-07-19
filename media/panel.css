@@ -1141,9 +1141,11 @@ button.icon-button.bm-confirm:hover:not(:disabled) {
   background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.12));
 }
 
-/* ─── Extensions table cells — Name / Enabled / Actions, shared by extTableHeader(),
-   extensionRow() and the built-in enhanceJiraTableRow(), so every row (including the header)
-   lines up in the same three columns. ─────────────────────────────────────────────────────── */
+/* ─── Extensions table cells — Name / Actions, shared by extTableHeader(), extensionRow() and the
+   built-in enhanceJiraTableRow(), so every row (including the header) lines up in the same two
+   columns. (.ext-cell-enabled below is unused now that the Enabled column was removed — the
+   per-extension enable toggle moved into .ext-cell-actions, and the EnhanceJira master toggle
+   moved to its own Configure page — kept defined for reference, not referenced from panel.js.) */
 .ext-cell-name {
   flex: 1 1 auto;
   min-width: 0;
@@ -1161,8 +1163,15 @@ button.icon-button.bm-confirm:hover:not(:disabled) {
 
 .ext-cell-actions {
   flex: 0 0 auto;
-  min-width: 64px;
+  min-width: 84px;
   justify-content: flex-end;
+}
+
+/* A user extension row's enable toggle now sits inside .ext-cell-actions, ahead of Edit/Delete
+   (see extensionRow()) — .bm-actions' 1px gap is tuned for icon-button-to-icon-button spacing, so
+   give the checkbox a bit of breathing room from the buttons that follow it. */
+.ext-cell-actions .capability-toggle {
+  margin-right: 4px;
 }
 
 /* Header row — muted uppercase column labels, same cell widths as the rows below it so they
@@ -1188,7 +1197,8 @@ button.icon-button.bm-confirm:hover:not(:disabled) {
   background: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.06));
 }
 
-/* "built-in" tag — same neutral pill treatment as .ext-hidden-badge/.ext-kind. */
+/* "built-in" tag — same neutral pill treatment as .ext-hidden-badge/.ext-kind. No longer rendered
+   by enhanceJiraTableRow() (the badge was dropped from the row), kept defined for reference. */
 .ext-builtin-badge {
   flex: 0 0 auto;
   font-size: 10px;
@@ -1201,21 +1211,21 @@ button.icon-button.bm-confirm:hover:not(:disabled) {
   border: 1px solid var(--vscode-descriptionForeground, #999);
 }
 
-/* Configure button inside a table row's Actions cell — text + chevron, sized to sit inline with
-   the 26px .icon-button.bm-rowbtn Edit/Delete buttons on other rows (mirrors .ej-configure-btn's
-   hover/focus/svg treatment, just fixed-height + non-growing instead of filling a full-width row). */
+/* Configure button inside the EnhanceJira row's Actions cell — icon-only chevron now (the
+   "Configure" text was dropped), sized to the same 26px square as the .icon-button.bm-rowbtn
+   Edit/Delete buttons on user extension rows so the arrow lines up with them. */
 .ext-configure-btn {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  justify-content: center;
+  width: 26px;
   height: 26px;
-  padding: 0 8px;
+  padding: 0;
   background: transparent;
   border: none;
   color: var(--vscode-foreground);
   font: inherit;
-  font-size: 11px;
   border-radius: 3px;
   cursor: pointer;
 }
