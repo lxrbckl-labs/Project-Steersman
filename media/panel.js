@@ -15,7 +15,8 @@
     extensions: [], extensionsEnabled: true, logins: [], loginsAuto: true, version: '',
     enhanceJira: { enabled: true, components: { version: false, epic: false, type: false, quickFilters: false, search: false, assignee: false, more: false,
       completeSprint: false, sprintDetails: false, group: false, viewSettings: false, moreActions: false, shareButton: false, feedbackButton: false,
-      addPeople: false, boardActionsMenu: false, moveSprintInsights: false, removeToolbarGap: false, showBoardAvatars: true } }
+      addPeople: false, boardActionsMenu: false, moveSprintInsights: false, removeToolbarGap: false, showBoardAvatars: true, prColoring: true },
+      prMinApprovals: 3 }
   };
 
   // ── Update-check UI state — module-scoped (like expandedFolders/addForm)
@@ -1317,6 +1318,54 @@
     );
   }
 
+  // A display toggle (not a hide) for the PR-approval card coloring, same generic
+  // 'toggleEnhanceJiraComponent' action/data-ej-key dispatch as the move/avatars toggles above,
+  // with its own sub-caption + the minimum-approvals number field below it.
+  function enhanceJiraPrColoringToggleRow() {
+    const ej = model.enhanceJira || {};
+    const components = ej.components || {};
+    const toggle = h('input', {
+      type: 'checkbox',
+      className: 'capability-toggle',
+      dataAction: 'toggleEnhanceJiraComponent',
+      'data-ej-key': 'prColoring',
+      ariaLabel: 'Color Review cards by PR approval'
+    });
+    toggle.checked = !!components.prColoring;
+    return h(
+      'label',
+      { className: 'bm-bar-toggle-row' },
+      toggle,
+      h('span', { className: 'capability-label' }, 'Color Review cards by PR approval')
+    );
+  }
+
+  // Number field for the PR-coloring "minimum approvals" threshold — NOT a data-action click
+  // target (unlike the checkboxes above): it's a plain <input type="number"> wired through the
+  // delegated 'change' listener below (same delegation style as the per-row script <select>),
+  // keyed by data-field (the same attribute the bookmark add-form/rename textInput() uses) so it
+  // never collides with the click handler's data-action dispatch.
+  function enhanceJiraMinApprovalsRow() {
+    const ej = model.enhanceJira || {};
+    const value = typeof ej.prMinApprovals === 'number' ? ej.prMinApprovals : 3;
+    const input = h('input', {
+      type: 'number',
+      className: 'ej-min-approvals-input',
+      min: '1',
+      max: '20',
+      step: '1',
+      'data-field': 'ejMinApprovals',
+      ariaLabel: 'Minimum approvals to turn a card green'
+    });
+    input.value = String(value);
+    return h(
+      'div',
+      { className: 'ej-min-approvals-row' },
+      h('span', { className: 'capability-label' }, 'Minimum approvals to turn a card green'),
+      input
+    );
+  }
+
   // Shared group-rendering body — every sub-caption + toggle-list from the section, minus the
   // header/master toggle. Appended straight onto a container (a section wrapper, or the
   // dedicated EnhanceJira sub-page) so the toggle-list markup/dispatch is defined exactly once
@@ -1354,6 +1403,12 @@
     container.appendChild(h('div', { className: 'ext-form-label' }, 'Board avatars'));
     container.appendChild(enhanceJiraBoardAvatarsToggleRow());
     container.appendChild(h('div', { className: 'bm-bar-hint' }, "Replaces Jira's assignee filter with a full row of every board member's avatar."));
+
+    container.appendChild(h('div', { className: 'ej-move-divider' }));
+    container.appendChild(h('div', { className: 'ext-form-label' }, 'PR coloring'));
+    container.appendChild(enhanceJiraPrColoringToggleRow());
+    container.appendChild(enhanceJiraMinApprovalsRow());
+    container.appendChild(h('div', { className: 'bm-bar-hint' }, 'Bots like Code Rabbit are not counted.'));
   }
 
   // Full collapsible section (master toggle + all groups) — no longer wired into settingsView()
@@ -2149,6 +2204,14 @@
         post({ type: 'runScript', instance: id, name: name });
       }
       target.value = '';
+    } else if (target.matches('input[data-field="ejMinApprovals"]')) {
+      // EnhanceJira "minimum approvals" number field — not a data-action click target, wired
+      // here (mirrors the runScript <select> above) so it never goes through the generic click
+      // delegate. The host clamps 1-20; a non-numeric value is simply not posted.
+      const parsed = parseInt(target.value, 10);
+      if (!isNaN(parsed)) {
+        post({ type: 'setEnhanceJiraMinApprovals', value: parsed });
+      }
     }
   });
 
@@ -2338,8 +2401,10 @@
           boardActionsMenu: !!c.boardActionsMenu,
           moveSprintInsights: !!c.moveSprintInsights,
           removeToolbarGap: !!c.removeToolbarGap,
-          showBoardAvatars: c.showBoardAvatars !== undefined ? !!c.showBoardAvatars : true
-        }
+          showBoardAvatars: c.showBoardAvatars !== undefined ? !!c.showBoardAvatars : true,
+          prColoring: c.prColoring !== undefined ? !!c.prColoring : true
+        },
+        prMinApprovals: typeof msg.prMinApprovals === 'number' ? msg.prMinApprovals : 3
       };
       render();
     } else if (msg.type === 'logins') {

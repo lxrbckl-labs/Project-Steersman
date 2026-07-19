@@ -1430,6 +1430,34 @@ select.ext-runat:focus-visible {
   margin: 6px 0 2px;
 }
 
+/* "PR coloring" group's minimum-approvals number field — label + input row, same flex/gap
+   rhythm as .bm-bar-toggle-row above (minus the pointer cursor, since only the input itself is
+   interactive). The input reuses .bm-input's frame/font but at a fixed narrow width, since it's
+   a 1-20 integer rather than free text. */
+.ej-min-approvals-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ej-min-approvals-input {
+  flex: 0 0 auto;
+  width: 48px;
+  height: 24px;
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
+  border-radius: 3px;
+  background: var(--vscode-input-background, var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.06)));
+  color: var(--vscode-input-foreground, var(--vscode-foreground));
+  font: inherit;
+  font-size: 12px;
+  padding: 0 6px;
+}
+
+.ej-min-approvals-input:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder, #007fd4);
+  outline-offset: -1px;
+}
+
 /* ─── Compact "EnhanceJira" row in the main Settings view (Option A) — reuses
    .bm-bar-toggle-row (the master-toggle row's own layout) for the flex row + gap, and
    .capability-label/.bm-bar-hint for the text, so it reads as the same chrome as every

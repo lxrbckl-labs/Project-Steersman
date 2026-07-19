@@ -413,6 +413,21 @@ class SteersmanWebviewController {
           this._postEnhanceJira();
         }
         break;
+      case 'setEnhanceJiraMinApprovals':
+        // Update the PR-coloring "minimum approvals" threshold, re-apply the CSS-hide record
+        // across every live tab, then repost so the webview's number field reflects the
+        // (possibly clamped) stored value; guarded no-op (never a throw) when the EnhanceJira
+        // store is off.
+        if (this._enhanceJira) {
+          try {
+            this._enhanceJira.setMinApprovals(msg.value);
+            if (this._refreshEnhanceJira) await this._refreshEnhanceJira();
+          } catch (e) {
+            this._log.appendLine('[Panel] setEnhanceJiraMinApprovals failed: ' + (e && e.message ? e.message : e));
+          }
+          this._postEnhanceJira();
+        }
+        break;
       case 'addExtension': {
         // Authoritative JS syntax guard (the webview's own new Function check is inert under the
         // panel CSP). A parse error in a main-world body would break the shared bootstrap for every
@@ -975,6 +990,7 @@ class SteersmanWebviewController {
       type: 'enhanceJira',
       enabled: state.enabled,
       components: state.components,
+      prMinApprovals: state.prMinApprovals,
     });
   }
 

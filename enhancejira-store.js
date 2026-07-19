@@ -56,9 +56,14 @@ const GAP_KEY = 'removeToolbarGap';
 // title (managed by composeJs's __ejAvatars singleton).
 const SHOW_AVATARS_KEY = 'showBoardAvatars';
 
-// Every known component key handled by this store: the 16 CSS-hide keys plus the move, gap, and
-// avatars keys.
-const COMPONENT_KEYS = SELECTOR_KEYS.concat(MOVE_KEY, GAP_KEY, SHOW_AVATARS_KEY);
+// The PR-coloring feature: a boolean component that is NOT a CSS hide — when on, injected JS colors the
+// board's Review-column cards by their Bitbucket PR approval state via Jira's same-origin dev-status API
+// (managed by composeJs's __ejPrColor singleton).
+const PR_COLORING_KEY = 'prColoring';
+
+// Every known component key handled by this store: the 16 CSS-hide keys plus the move, gap, avatars,
+// and PR-coloring keys.
+const COMPONENT_KEYS = SELECTOR_KEYS.concat(MOVE_KEY, GAP_KEY, SHOW_AVATARS_KEY, PR_COLORING_KEY);
 
 // Per-key defaults for missing/absent storage. The original 7 filter hides stay off by default; the
 // 5 board-action hides, the 2 header-icon-cluster hides, the 2 title-bar hides, and the
@@ -83,6 +88,7 @@ const DEFAULTS = {
   moveSprintInsights: true,
   removeToolbarGap: true,
   showBoardAvatars: true,
+  prColoring: true,
 };
 
 // Selectors used by the injected insights-move manager (composeJs). Verbatim, validated live. The
@@ -111,6 +117,18 @@ const AVATAR_CARD_SELECTOR = '[data-testid="board.common.fields.assignee-field-s
 // the empty wrapper around the hidden controls-bar so no ~56px gap remains below the board header.
 const GAP_RULE =
   'div:has(> div > [data-testid="software-board.header.controls-bar"]){display:none !important;}';
+
+// globalState key for the PR-coloring minimum-approvals threshold (its own key so it persists like the
+// flags but as a number). Missing/corrupt storage resolves to DEFAULT_MIN_APPROVALS; setter clamps 1–20.
+const MIN_APPROVALS_KEY = 'steersman.enhanceJiraMinApprovals';
+const DEFAULT_MIN_APPROVALS = 3;
+
+// Config baked into the injected PR-color manager (composeJs). Card selector + approval-state colors are
+// verbatim/validated live; BOTS is the default reviewer-name exclude list (bot approvals don't count).
+const PR_CARD_SELECTOR = '[data-testid="platform-board-kit.ui.card.card"]';
+const PR_GREEN = '#36B37E';
+const PR_RED = '#FF5630';
+const PR_BOTS = ['Code Rabbit'];
 
 class EnhanceJiraStore {
   // globalState: a VS Code Memento (context.globalState), same shape as ExtensionsStore's ctor.
@@ -149,9 +167,28 @@ class EnhanceJiraStore {
     return out;
   }
 
-  // Full state snapshot: the master flag plus all 7 component flags, safe to serialize.
+  // The PR-coloring minimum-approvals threshold, coerced to an integer and clamped 1–20, defaulting to
+  // DEFAULT_MIN_APPROVALS when nothing sane is stored (mirrors _getEnabled's throw-free read).
+  _getMinApprovals() {
+    let stored;
+    try {
+      stored = this._globalState && this._globalState.get(MIN_APPROVALS_KEY);
+    } catch {
+      stored = undefined;
+    }
+    const n = Math.round(Number(stored));
+    if (!Number.isFinite(n)) return DEFAULT_MIN_APPROVALS;
+    return Math.min(20, Math.max(1, n));
+  }
+
+  // Full state snapshot: the master flag, all component flags, and the PR-coloring approval threshold,
+  // safe to serialize. Shape: { enabled, components:{...}, prMinApprovals }.
   getState() {
-    return { enabled: this._getEnabled(), components: this._getComponents() };
+    return {
+      enabled: this._getEnabled(),
+      components: this._getComponents(),
+      prMinApprovals: this._getMinApprovals(),
+    };
   }
 
   // Persist the master enable flag, coercing to a plain boolean. Fire-and-forget; swallows
@@ -159,6 +196,19 @@ class EnhanceJiraStore {
   setEnabled(value) {
     try {
       return this._globalState && this._globalState.update(ENABLED_KEY, !!value);
+    } catch {
+      return undefined;
+    }
+  }
+
+  // Persist the PR-coloring approval threshold, coercing to an integer and clamping 1–20 (falling back
+  // to DEFAULT_MIN_APPROVALS for NaN). Fire-and-forget; swallows storage errors like the other setters.
+  setMinApprovals(n) {
+    let v = Math.round(Number(n));
+    if (!Number.isFinite(v)) v = DEFAULT_MIN_APPROVALS;
+    v = Math.min(20, Math.max(1, v));
+    try {
+      return this._globalState && this._globalState.update(MIN_APPROVALS_KEY, v);
     } catch {
       return undefined;
     }
@@ -209,6 +259,8 @@ class EnhanceJiraStore {
   composeJs() {
     const desired = !!this._getComponents()[MOVE_KEY];
     const showAvatars = !!this._getComponents()[SHOW_AVATARS_KEY];
+    const prColoring = !!this._getComponents()[PR_COLORING_KEY];
+    const minApprovals = this._getMinApprovals();
     return `(function(){
   try {
     var SHOW_AVATARS = ${showAvatars ? 'true' : 'false'};
@@ -495,6 +547,249 @@ class EnhanceJiraStore {
         else document.addEventListener('DOMContentLoaded', startAv, { once: true });
       } catch (e) {}
     })();
+    var PR_COLORING = ${prColoring ? 'true' : 'false'};
+    var MIN_APPROVALS = ${minApprovals};
+    var PR_BOTS = ${JSON.stringify(PR_BOTS)};
+    var PR_CARD_SEL = ${JSON.stringify(PR_CARD_SELECTOR)};
+    var PR_GREEN = ${JSON.stringify(PR_GREEN)};
+    var PR_RED = ${JSON.stringify(PR_RED)};
+    var PR_KEY_RE = /^[A-Z][A-Z0-9]*-\\d+$/;
+    var PR_TTL = 60000;
+    var PR_MAXC = 4;
+    (function setupPrColor(){
+      try {
+        var exPr = window.__ejPrColor;
+        if (exPr) {
+          var wasOn = exPr.desired;
+          exPr.desired = PR_COLORING;
+          exPr.minApprovals = MIN_APPROVALS;
+          exPr.bots = PR_BOTS;
+          if (PR_COLORING) {
+            exPr.ensureStyle();
+            exPr.applyByKey();   // instant repaint from cached counts: honors the new threshold, zero refetch
+            var empty = true;
+            for (var ck in exPr.cache) { if (exPr.cache.hasOwnProperty(ck)) { empty = false; break; } }
+            // Only hit the network if coloring was just turned ON, the cache is empty, or the counts are stale.
+            if (!wasOn || empty || (Date.now() - exPr.lastRefresh) > PR_TTL) exPr.refresh();
+          } else exPr.clearAll();
+          return;
+        }
+        var p = {
+          desired: PR_COLORING,
+          minApprovals: MIN_APPROVALS,
+          bots: PR_BOTS,
+          cache: {},            // issueId -> { key, color:'green'|'red'|null, ts }
+          _scheduled: false,
+          _refreshing: false,
+          lastRefresh: 0,
+          observer: null,
+          boardId: function () {
+            try { var mm = location.pathname.match(/\\/boards\\/(\\d+)/); return mm && mm[1]; } catch (e) { return null; }
+          },
+          isBot: function (name) {
+            if (!name) return false;
+            for (var i = 0; i < this.bots.length; i++) {
+              if (String(name).toLowerCase() === String(this.bots[i]).toLowerCase()) return true;
+            }
+            return false;
+          },
+          getJson: function (url) {
+            return fetch(url, { credentials: 'include', headers: { 'Accept': 'application/json' } }).then(function (r) {
+              if (!r.ok) throw new Error('bad status ' + r.status);
+              return r.json();
+            });
+          },
+          fetchIssues: function () {
+            var id = this.boardId();
+            if (!id) return Promise.resolve([]);
+            var jql = encodeURIComponent('sprint in openSprints() AND status="Review"');
+            var url = '/rest/agile/1.0/board/' + id + '/issue?fields=status&jql=' + jql + '&maxResults=100';
+            return this.getJson(url).then(function (j) {
+              var out = [];
+              var issues = (j && j.issues) || [];
+              for (var i = 0; i < issues.length; i++) {
+                if (issues[i] && issues[i].id != null) out.push({ id: String(issues[i].id), key: issues[i].key });
+              }
+              return out;
+            }).catch(function () { return []; });
+          },
+          // Fetch a PR's raw approval FACTS (not the green/red decision): approved = deduped approved
+          // human reviewers (excluding PR_BOTS), hasPr = any PR exists. Cached as-is so a later threshold
+          // change repaints from these counts with no refetch. undefined = fetch error (don't hard-cache).
+          computeCounts: function (issueId) {
+            var self = this;
+            var url = '/rest/dev-status/latest/issue/detail?issueId=' + encodeURIComponent(issueId) + '&applicationType=bitbucket&dataType=pullrequest';
+            return this.getJson(url).then(function (j) {
+              var prs = [];
+              var detail = (j && j.detail) || [];
+              for (var i = 0; i < detail.length; i++) {
+                var d = detail[i] && detail[i].pullRequests;
+                if (d) for (var k = 0; k < d.length; k++) prs.push(d[k]);
+              }
+              if (!prs.length) return { approved: 0, hasPr: false };   // no PR -> no bar
+              var approvers = {};             // dedupe approved humans by name across PRs
+              for (var a = 0; a < prs.length; a++) {
+                var revs = (prs[a] && prs[a].reviewers) || [];
+                for (var b = 0; b < revs.length; b++) {
+                  var rv = revs[b];
+                  if (rv && rv.approved === true && !self.isBot(rv.name)) approvers[rv.name] = true;
+                }
+              }
+              var count = 0; for (var nm in approvers) { if (approvers.hasOwnProperty(nm)) count++; }
+              return { approved: count, hasPr: true };
+            }).catch(function () { return undefined; });   // undefined = fetch error (don't hard-cache)
+          },
+          // Pure: derive the paint class from the LIVE threshold so a minApprovals change repaints from
+          // cache with zero refetch. No PR -> null (no bar); enough approvals -> green; otherwise red.
+          colorFor: function (entry) {
+            if (!entry || !entry.hasPr) return null;
+            return entry.approved >= this.minApprovals ? 'green' : 'red';
+          },
+          // Fetch the Review-column issue list, then fill the per-issue color cache using ≤PR_MAXC
+          // concurrent dev-status fetches, skipping issues whose cached color is still fresh (<PR_TTL).
+          refresh: function () {
+            var self = this;
+            if (!self.desired || self._refreshing) return;
+            self._refreshing = true;
+            self.lastRefresh = Date.now();
+            self.fetchIssues().then(function (issues) {
+              self.lastRefresh = Date.now();
+              var queue = [];
+              var now = Date.now();
+              for (var i = 0; i < issues.length; i++) {
+                var it = issues[i];
+                var c = self.cache[it.id];
+                if (c && (now - c.ts) < PR_TTL) { c.key = it.key; }   // fresh: keep, refresh key
+                else queue.push(it);
+              }
+              self.applyByKey();   // paint what we already know before any refetch
+              var idx = 0;
+              function worker() {
+                if (idx >= queue.length) return Promise.resolve();
+                var issue = queue[idx++];
+                return self.computeCounts(issue.id).then(function (counts) {
+                  if (counts !== undefined) {
+                    self.cache[issue.id] = { key: issue.key, approved: counts.approved, hasPr: counts.hasPr, ts: Date.now() };
+                  } else {
+                    var prev = self.cache[issue.id];   // fetch error: keep prior counts, short TTL so it retries soon
+                    self.cache[issue.id] = { key: issue.key, approved: prev ? prev.approved : 0, hasPr: prev ? prev.hasPr : false, ts: Date.now() - PR_TTL + 5000 };
+                  }
+                  self.applyByKey();
+                  return worker();
+                }).catch(function () { return worker(); });
+              }
+              var workers = [];
+              for (var w = 0; w < PR_MAXC; w++) workers.push(worker());
+              Promise.all(workers).then(function () { self._refreshing = false; self.applyByKey(); })
+                .catch(function () { self._refreshing = false; });
+            }).catch(function () { self._refreshing = false; });
+          },
+          ensureStyle: function () {
+            try {
+              if (document.getElementById('__ejPrColorStyle')) return;
+              var s = document.createElement('style');
+              s.id = '__ejPrColorStyle';
+              s.textContent = '.__ej_pr_green::before,.__ej_pr_red::before{content:"";position:absolute;left:0;top:0;bottom:0;width:5px;border-radius:3px 0 0 3px;pointer-events:none;}'
+                + '.__ej_pr_green::before{background:' + PR_GREEN + ';}'
+                + '.__ej_pr_red::before{background:' + PR_RED + ';}';
+              (document.head || document.documentElement).appendChild(s);
+            } catch (e) {}
+          },
+          anchor: function (card) {
+            try {
+              var cs = window.getComputedStyle ? window.getComputedStyle(card) : null;
+              if (cs && cs.position === 'static') card.style.position = 'relative';
+            } catch (e) {}
+          },
+          // Set/clear a card's color class only when it differs (idempotent). color: 'green'|'red' paints
+          // the left bar; anything else strips both classes so the card returns to native styling.
+          colorCard: function (card, color) {
+            try {
+              var hasGreen = card.classList.contains('__ej_pr_green');
+              var hasRed = card.classList.contains('__ej_pr_red');
+              if (color === 'green') {
+                if (hasRed) card.classList.remove('__ej_pr_red');
+                if (!hasGreen) card.classList.add('__ej_pr_green');
+                this.anchor(card);
+              } else if (color === 'red') {
+                if (hasGreen) card.classList.remove('__ej_pr_green');
+                if (!hasRed) card.classList.add('__ej_pr_red');
+                this.anchor(card);
+              } else {
+                if (hasGreen) card.classList.remove('__ej_pr_green');
+                if (hasRed) card.classList.remove('__ej_pr_red');
+              }
+            } catch (e) {}
+          },
+          // A card's issue key = the trimmed text of its first descendant element whose text is EXACTLY a
+          // Jira key (e.g. "CMMS-2763"). The whole-card textContent concatenates the story-point badge onto
+          // the key with no separator ("...CMMS-27635..."), so a boundary regex over the card text is
+          // unreliable; an exact per-element match is both correct and cheaper (and can't collide "-12"/"-123").
+          keyOfCard: function (card) {
+            try {
+              var els = card.querySelectorAll('a,span,div');
+              for (var i = 0; i < els.length; i++) {
+                var tx = (els[i].textContent || '').trim();
+                if (PR_KEY_RE.test(tx)) return tx;
+              }
+            } catch (e) {}
+            return null;
+          },
+          // Re-apply colors to the DOM (cheap; the observer's hot path and the threshold-change repaint
+          // path). Build a key->entry lookup from the cache, then derive each card's class via colorFor
+          // (LIVE threshold). Unknown keys / no-PR entries leave the card with no bar.
+          applyByKey: function () {
+            try {
+              if (!this.desired) return;
+              var entryByKey = {};
+              for (var id in this.cache) {
+                if (!this.cache.hasOwnProperty(id)) continue;
+                var c = this.cache[id];
+                if (c && c.key) entryByKey[c.key] = c;
+              }
+              var cards = document.querySelectorAll(PR_CARD_SEL);
+              for (var i = 0; i < cards.length; i++) {
+                var card = cards[i];
+                var key = this.keyOfCard(card);
+                var color = (key && entryByKey[key]) ? this.colorFor(entryByKey[key]) : undefined;
+                this.colorCard(card, color);
+              }
+            } catch (e) {}
+          },
+          // Feature toggled off: strip every color class and remove the injected style so cards revert.
+          clearAll: function () {
+            try {
+              var cards = document.querySelectorAll('.__ej_pr_green,.__ej_pr_red');
+              for (var i = 0; i < cards.length; i++) {
+                cards[i].classList.remove('__ej_pr_green');
+                cards[i].classList.remove('__ej_pr_red');
+              }
+              var s = document.getElementById('__ejPrColorStyle');
+              if (s && s.parentNode) s.parentNode.removeChild(s);
+            } catch (e) {}
+          }
+        };
+        function startPr() {
+          if (window.__ejPrColor !== p || p.observer) return;
+          var raf = window.requestAnimationFrame ? window.requestAnimationFrame.bind(window) : function (cb) { return setTimeout(cb, 16); };
+          p.observer = new MutationObserver(function () {
+            if (p._scheduled) return;
+            p._scheduled = true;
+            raf(function () {
+              p._scheduled = false;
+              if (!p.desired) return;
+              p.applyByKey();
+              if (Date.now() - p.lastRefresh > PR_TTL) p.refresh();
+            });
+          });
+          p.observer.observe(document.body, { childList: true, subtree: true });
+          if (p.desired) { p.ensureStyle(); p.refresh(); }
+        }
+        window.__ejPrColor = p;
+        if (document.body) startPr();
+        else document.addEventListener('DOMContentLoaded', startPr, { once: true });
+      } catch (e) {}
+    })();
     var DESIRED = ${desired ? 'true' : 'false'};
     var INSIGHTS_SEL = ${JSON.stringify(INSIGHTS_SELECTOR)};
     var FULLSCREEN_SEL = ${JSON.stringify(FULLSCREEN_SELECTOR)};
@@ -562,9 +857,11 @@ class EnhanceJiraStore {
     const css = this.composeCss();
     const move = !!components[MOVE_KEY];
     const avatars = !!components[SHOW_AVATARS_KEY];
-    // Active whenever master is on AND there is something to do: a CSS hide, the move feature, or the
-    // board-avatars feature (both JS-driven features ride along in composeJs()'s injected record).
-    if (!css && !move && !avatars) return null;
+    const prColoring = !!components[PR_COLORING_KEY];
+    // Active whenever master is on AND there is something to do: a CSS hide, the move feature, the
+    // board-avatars feature, or the PR-coloring feature (all JS-driven features ride along in
+    // composeJs()'s injected record).
+    if (!css && !move && !avatars && !prColoring) return null;
     return {
       id: '__steersman_enhancejira__',
       matches: ['https://*.atlassian.net/jira/software/*'],
