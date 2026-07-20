@@ -1254,12 +1254,21 @@ class EnhanceJiraStore {
         if (c && (Date.now() - c.ts) < BB_TTL) return Promise.resolve();
         var url = 'https://bitbucket.org/!api/2.0/repositories/' + ref.repo + '/pullrequests/' + ref.prId +
           '?fields=participants.state,participants.approved,participants.role,participants.user.display_name,participants.user.uuid,participants.user.links.avatar.href';
+        // XHR-style request headers (A1): the bitbucket.org/!api/2.0 internal endpoint 3xx-REDIRECTs a
+        // plain GET, which the host bridge surfaces as a typed 'blocked' error (redirect:'manual' SSRF
+        // guard) — the recurring '[EJ-BB] bbFetch ERROR'. These headers make it return JSON directly.
+        // Referer is a real bitbucket.org PR URL built from the same repo/id (settable host-side in Node).
+        var referer = 'https://bitbucket.org/' + ref.repo + '/pull-requests/' + ref.prId;
         // Hard-bounded on BOTH sides so a non-responding host bridge can never stall runPool: pass
         // timeoutMs so the HOST aborts at BB_TO (the page-side __sm_call would otherwise wait ~33s),
         // and race the whole call (withTimeout) so we give up page-side even if the binding never
         // round-trips. This is best-effort enrichment — on timeout we simply cache nothing for this PR
         // and the already-published dev-status base stands.
-        var call = steersman.fetch(url, { sessionCookies: true, timeoutMs: BB_TO }).then(function (res) {
+        var call = steersman.fetch(url, {
+          sessionCookies: true,
+          timeoutMs: BB_TO,
+          headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json', 'Referer': referer }
+        }).then(function (res) {
           if (!self.loggedBb) { self.loggedBb = true; try { console.log('[EJ-BB]', 'bbFetch status=' + (res && res.status) + ' ok=' + (res && res.ok)); } catch (e) {} }
           var data = null;
           try { data = res.body ? JSON.parse(res.body) : null; } catch (e) { data = null; }
