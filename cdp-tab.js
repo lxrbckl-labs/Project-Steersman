@@ -83,13 +83,15 @@ class CDPTab {
     // Used to Page.createIsolatedWorld a bridge world live on the current document (see
     // _syncBridgeWorlds' live-apply step) so bridge companions run on refresh, not only next-nav.
     this._mainFrameId = '';
-    // Navigation loaderId for THIS tab, captured from Page.frameNavigated (changes on every
-    // navigation and arrives reliably via that event). Used to dedup the bridge live-apply
-    // once-per-DOCUMENT, replacing the flaky _bridgeCtxToExt guard whose context-lifecycle events
-    // are unreliable over the js-debug proxy. _bridgeAppliedLoaderId is the loaderId we last
-    // live-applied for (undefined = never applied sentinel, so the initial load always applies).
-    this._navLoaderId = '';
-    this._bridgeAppliedLoaderId = undefined;
+    // Monotonic per-navigation counter for THIS tab, bumped once in the Page.frameNavigated
+    // main-frame branch (the primary reinject trigger, which fires reliably over the proxy). Used
+    // to dedup the bridge live-apply once-per-DOCUMENT, replacing both the flaky _bridgeCtxToExt
+    // guard (context-lifecycle events are unreliable over the js-debug proxy) and the loaderId that
+    // preceded it (f.loaderId is EMPTY '' over the editor-browser proxy, so every load looked
+    // "already applied"). _bridgeAppliedNavSeq is the counter value we last live-applied for
+    // (-1 = never applied sentinel, and the counter starts at 0, so the initial load always applies).
+    this._navSeq = 0;
+    this._bridgeAppliedNavSeq = -1;
     // Whether we've currently forced Page.setBypassCSP(true) on THIS tab (Phase 3). We only turn it
     // on when at least one active extension carries CSS (an injected <style> element can be blocked
     // by a page's style-src CSP), and turn it back off when the last CSS-bearing extension is gone,
@@ -280,7 +282,7 @@ class CDPTab {
       if (f && f.url && !f.parentId) {
         this._lastKnownUrl = f.url;
         if (f.id) this._mainFrameId = f.id;
-        this._navLoaderId = f.loaderId || '';
+        this._navSeq++;
         this._reinjectExtensions();
       }
     } else if (msg.method === 'Page.domContentEventFired') {
@@ -975,12 +977,13 @@ class CDPTab {
     // NEXT navigation and are unreliable over the js-debug proxy, so on a refresh the companion's
     // isolated world never runs on the just-loaded document. Fix: for each active bridge ext,
     // create its named isolated world on the current main frame and run the same bootstrap in it now.
-    // Live-apply once per DOCUMENT (loaderId), reliable across refreshes. The context-lifecycle
-    // events that _bridgeCtxToExt relies on are unreliable over the js-debug proxy, so we key the
-    // once-per-load dedup on the navigation loaderId instead (changes on every navigation; the 3
-    // reinject events of one load share it, so we apply once per load). Companion body is a
+    // Live-apply once per DOCUMENT, reliable across refreshes. The context-lifecycle events that
+    // _bridgeCtxToExt relies on are unreliable over the js-debug proxy, and f.loaderId is empty ''
+    // over the editor-browser proxy, so we key the once-per-load dedup on the monotonic _navSeq
+    // counter instead (bumped once in the frameNavigated main-frame branch; the other 2 reinject
+    // events of one load share the same value, so we apply once per load). Companion body is a
     // window.__ejBbBridge singleton, so a fresh world per document is correct.
-    const alreadyApplied = this._bridgeAppliedLoaderId !== undefined && this._navLoaderId === this._bridgeAppliedLoaderId;
+    const alreadyApplied = this._bridgeAppliedNavSeq === this._navSeq;
     const toLiveApply = alreadyApplied ? [] : bridgeList;
     if (toLiveApply.length) {
       const frameId = await this._getMainFrameId();
@@ -1010,7 +1013,7 @@ class CDPTab {
             this.log.appendLine('[Bridge] live apply failed for ' + world + ': ' + (e && e.message ? e.message : e));
           }
         }
-        this._bridgeAppliedLoaderId = this._navLoaderId; // mark this document applied (only after a frameId + the apply loop)
+        this._bridgeAppliedNavSeq = this._navSeq; // mark this document applied (only after a frameId + the apply loop)
       }
     }
   }
