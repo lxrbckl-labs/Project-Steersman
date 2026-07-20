@@ -287,6 +287,8 @@ class EnhanceJiraStore {
           roster: null,
           _scheduled: false,
           observer: null,
+          _headerTries: 0,      // bounded retry budget for the header-row race (reset once it appears)
+          _headerTimer: null,   // one pending header-retry timer at a time
           addEntries: function (map) {
             try {
               var nodes = document.querySelectorAll(AV_ENTRY_SEL);
@@ -488,7 +490,19 @@ class EnhanceJiraStore {
                 (document.head || document.documentElement).appendChild(hide);
               }
               var row = document.querySelector(AV_HEADER_SEL);
-              if (!row) return;
+              if (!row) {
+                // Header row not in the DOM yet (first/rapid load): the body MutationObserver may have
+                // already fired for this tick, so instead of silently giving up (blank strip until an
+                // unrelated later mutation), retry on a short bounded timer so the strip paints on the
+                // first settle and re-paints after every refresh. Reset below once the row appears.
+                if (this.desired && this._headerTries < 40 && !this._headerTimer) {
+                  var selfR = this;
+                  this._headerTries++;
+                  this._headerTimer = setTimeout(function () { selfR._headerTimer = null; selfR.render(); }, 150);
+                }
+                return;
+              }
+              this._headerTries = 0;   // header present: replenish the retry budget for the next cycle
               // Absolute-center the strip in the header row: make the row a positioning context
               // (only when it is otherwise static, so we never fight an existing offset parent).
               try {
@@ -1081,26 +1095,19 @@ class EnhanceJiraStore {
   try {
     if (window.__ejBbBridge) return;
     var hasFetch = !(typeof steersman === 'undefined' || !steersman || !steersman.fetch);
-    console.log('[EJ-BB]', 'available=' + hasFetch + (hasFetch ? '' : ' — steersman.fetch unavailable, publishing available:false marker'));
-    if (!hasFetch) {
-      // Companion ran but the bridge binding is not wired: write a states node with an availability
-      // marker (available:false, empty byIssue) instead of nothing, so the main world (and the host
-      // #__ej_bb_states diagnostic) can tell "companion ran but no bridge" apart from "never ran".
-      try {
-        var oldU = document.getElementById('__ej_bb_states');
-        if (oldU && oldU.parentNode) oldU.parentNode.removeChild(oldU);
-        var nU = document.createElement('script');
-        nU.type = 'application/json';
-        nU.id = '__ej_bb_states';
-        nU.textContent = JSON.stringify({ available: false, byIssue: {} });
-        if (document.documentElement) document.documentElement.appendChild(nU);
-      } catch (e) {}
-      return;
-    }
+    console.log('[EJ-BB]', 'available=' + hasFetch + (hasFetch ? '' : ' — steersman.fetch unavailable; publishing same-origin dev-status base only (no Bitbucket enrichment)'));
+    // NOTE (refresh-proof redesign): the companion NO LONGER early-returns when the host bridge is
+    // unavailable. Same-origin dev-status works from this isolated world regardless, so the pipeline
+    // always runs and always publishes a real states node (coloring + approver list). The cross-origin
+    // Bitbucket call is best-effort ENRICHMENT (deniers/changes-requested + avatars), gated on
+    // bbAvailable and hard-bounded so it can never block the guaranteed base publish.
     var BB_TTL = 60000;    // per-PR participant cache TTL
     var BB_MAXC = 4;       // max concurrent throttled fetches
-    var BB_BOTS = [];      // count ALL reviewers (incl. Code Rabbit) in the human tallies — no bot exclusion
+    var DEV_TO = 8000;     // hard timeout for each same-origin dev-status fetch (page fetch has none)
+    var BB_TO = 8000;      // host-abort timeout for the cross-origin Bitbucket participants fetch
+    var BB_BOTS = ${JSON.stringify(PR_BOTS)};   // exclude bot approvers (e.g. Code Rabbit) from the human tallies — matches the main-world PR_BOTS and the operator's green/red requirement; the popup still shows bots (reviewers[] keeps them)
     var bridge = {
+      bbAvailable: hasFetch, // false => dev-status base only; true => attempt Bitbucket enrichment too
       prCache: {},         // 'repo#prId' -> { participants:[...], ts }
       _refreshing: false,
       loggedBb: false,     // per-refresh guard: log only the FIRST bridge-fetch outcome each cycle
@@ -1118,13 +1125,32 @@ class EnhanceJiraStore {
       // issues in order) intermittently fails, dropping those issues from the publish. Retry a failed/non-ok
       // fetch up to 2 more times (~250ms apart) before giving up; returns null on final failure (throw-free),
       // which callers already tolerate.
+      // Race a promise against a timeout: resolves the promise's value if it settles first, or the
+      // fallback if it rejects OR the timeout elapses. NEVER rejects — so a single hung/erroring fetch
+      // can never stall runPool or leave the refresh chain unsettled (the root of "publish never fires").
+      withTimeout: function (p, ms, fb) {
+        return new Promise(function (resolve) {
+          var done = false;
+          var t = setTimeout(function () { if (!done) { done = true; resolve(fb); } }, ms);
+          Promise.resolve(p).then(
+            function (v) { if (!done) { done = true; clearTimeout(t); resolve(v); } },
+            function () { if (!done) { done = true; clearTimeout(t); resolve(fb); } }
+          );
+        });
+      },
       getJson: function (url) {
+        var self = this;
         var opts = { credentials: 'include', headers: { 'Accept': 'application/json' } };
         function attempt(triesLeft) {
-          return fetch(url, opts).then(function (r) {
+          // Each attempt is hard-bounded (DEV_TO): the page fetch has no native timeout, so without
+          // this a stalled same-origin request would hang the whole pipeline. withTimeout resolves
+          // null on timeout/failure, which we treat as a retryable miss.
+          var f = fetch(url, opts).then(function (r) {
             if (!r.ok) throw new Error('bad status ' + r.status);
             return r.json();
-          }).catch(function () {
+          });
+          return self.withTimeout(f, DEV_TO, null).then(function (v) {
+            if (v != null) return v;
             if (triesLeft <= 0) return null;
             return new Promise(function (res) { setTimeout(res, 250); }).then(function () { return attempt(triesLeft - 1); });
           });
@@ -1200,7 +1226,12 @@ class EnhanceJiraStore {
         if (c && (Date.now() - c.ts) < BB_TTL) return Promise.resolve();
         var url = 'https://bitbucket.org/!api/2.0/repositories/' + ref.repo + '/pullrequests/' + ref.prId +
           '?fields=participants.state,participants.approved,participants.role,participants.user.display_name,participants.user.uuid,participants.user.links.avatar.href';
-        return steersman.fetch(url, { sessionCookies: true }).then(function (res) {
+        // Hard-bounded on BOTH sides so a non-responding host bridge can never stall runPool: pass
+        // timeoutMs so the HOST aborts at BB_TO (the page-side __sm_call would otherwise wait ~33s),
+        // and race the whole call (withTimeout) so we give up page-side even if the binding never
+        // round-trips. This is best-effort enrichment — on timeout we simply cache nothing for this PR
+        // and the already-published dev-status base stands.
+        var call = steersman.fetch(url, { sessionCookies: true, timeoutMs: BB_TO }).then(function (res) {
           if (!self.loggedBb) { self.loggedBb = true; try { console.log('[EJ-BB]', 'bbFetch status=' + (res && res.status) + ' ok=' + (res && res.ok)); } catch (e) {} }
           var data = null;
           try { data = res.body ? JSON.parse(res.body) : null; } catch (e) { data = null; }
@@ -1213,6 +1244,7 @@ class EnhanceJiraStore {
           }
           // else: keep the prior good cache rather than blanking it with a transient empty result
         }).catch(function (e) { if (!self.loggedBb) { self.loggedBb = true; try { console.log('[EJ-BB]', 'bbFetch ERROR ' + String(e).slice(0, 80)); } catch (_) {} } });
+        return self.withTimeout(call, BB_TO + 1500, undefined);
       },
       // Aggregate an issue's PRs (from prCache) into reviewer FACTS. reviewers[] carries EVERY
       // participant (bots INCLUDED — the Stage-2 popup shows the full picture), each deduped by display
@@ -1256,64 +1288,144 @@ class EnhanceJiraStore {
           reviewers: reviewers
         };
       },
+      // Aggregate ONE issue's dev-status response into the SAME reviewer-facts shape as aggregateIssue,
+      // using only same-origin data (detail[].pullRequests[].reviewers[].{name, approved}). This is the
+      // RELIABLE BASE for red/green (approvedHumans) and the approver list (reviewers[]). dev-status has
+      // no changes-requested signal, so changesRequested is always false here (deniers come only from the
+      // Bitbucket enrichment). Human tally excludes BB_BOTS; reviewers[] keeps everyone (bots included).
+      aggregateDev: function (dj) {
+        var self = this;
+        var reviewersByName = {}, apprBy = {};
+        var detail = (dj && dj.detail) || [];
+        for (var i = 0; i < detail.length; i++) {
+          var prs = (detail[i] && detail[i].pullRequests) || [];
+          for (var k = 0; k < prs.length; k++) {
+            var revs = (prs[k] && prs[k].reviewers) || [];
+            for (var b = 0; b < revs.length; b++) {
+              var rv = revs[b];
+              var name = rv && rv.name;
+              if (!name) continue;
+              var approved = rv.approved === true;
+              var avatar = rv.avatarUrl || null;   // dev-status may omit avatars — the popup then falls back to initials
+              var ex = reviewersByName[name];
+              if (!ex) {
+                reviewersByName[name] = { name: name, approved: approved, state: (approved ? 'approved' : null), avatar: avatar };
+              } else {
+                ex.approved = ex.approved || approved;
+                if (approved && ex.state !== 'changes_requested') ex.state = 'approved';
+                if (!ex.avatar && avatar) ex.avatar = avatar;
+              }
+              if (approved && !self.isBot(name)) apprBy[name] = true;
+            }
+          }
+        }
+        var reviewers = [], apprCount = 0;
+        for (var n1 in reviewersByName) { if (reviewersByName.hasOwnProperty(n1)) reviewers.push(reviewersByName[n1]); }
+        for (var n2 in apprBy) { if (apprBy.hasOwnProperty(n2)) apprCount++; }
+        return { changesRequested: false, changesRequestedBy: [], approvedHumans: apprCount, reviewers: reviewers };
+      },
+      // Merge the dev-status BASE map with the Bitbucket ENRICHED map, keyed by issue key. Prefer the
+      // enriched entry only when it actually produced reviewers (it adds the changes-requested/denier
+      // signal + real avatars); otherwise keep the reliable base so coloring + the approver list still
+      // work for issues whose Bitbucket call timed out. Only base issues (>=1 PR) are emitted.
+      mergeBase: function (base, enriched) {
+        var out = {};
+        for (var key in base) {
+          if (!base.hasOwnProperty(key)) continue;
+          var e = enriched && enriched[key];
+          out[key] = (e && e.reviewers && e.reviewers.length) ? e : base[key];
+        }
+        return out;
+      },
       // Write the whole states map to the hidden contract node the main-world coloring reads. REPLACE the
       // node fresh on every publish (remove old + createElement + append) rather than mutating textContent:
       // the removal+append is a childList mutation on documentElement, which the coloring's documentElement
       // observer catches (fires even when the tab is hidden) — a textContent update would be characterData
       // and go unseen. Kept on document.documentElement (outside <body>) so Jira's React root never
       // reconciles/removes it.
-      publish: function (byIssue) {
+      publish: function (byIssue, label) {
         try {
           var old = document.getElementById('__ej_bb_states');
           if (old && old.parentNode) old.parentNode.removeChild(old);
           var n = document.createElement('script');
           n.type = 'application/json';
           n.id = '__ej_bb_states';
-          n.textContent = JSON.stringify({ available: true, updatedAt: Date.now(), byIssue: byIssue });
+          n.textContent = JSON.stringify({ available: true, bbAvailable: !!this.bbAvailable, updatedAt: Date.now(), byIssue: byIssue });
           if (document.documentElement) document.documentElement.appendChild(n);
         } catch (e) {}
         try {
           var cnt = 0, cr = 0;
           for (var k in byIssue) { if (byIssue.hasOwnProperty(k)) { cnt++; if (byIssue[k].changesRequested) cr++; } }
-          console.log('[EJ-BB]', 'published issues=' + cnt + ' changesRequested=' + cr);
+          console.log('[EJ-BB]', 'published' + (label ? ' (' + label + ')' : '') + ' issues=' + cnt + ' changesRequested=' + cr);
         } catch (e) {}
       },
+      // Refresh pipeline, redesigned to ALWAYS publish. Stage 1 (same-origin dev-status) is the RELIABLE
+      // BASE and is published as soon as it resolves — coloring + the approver list work immediately,
+      // with zero dependence on the cross-origin bridge. Stage 2 (Bitbucket participants) is best-effort
+      // ENRICHMENT (deniers/changes-requested + avatars), hard-bounded so it can never block; when it
+      // resolves in time we re-publish the merged (richer) map. A safePublish guard + a final .catch
+      // guarantee #__ej_bb_states always exists even on error/timeout.
       refresh: function () {
         var self = this;
         if (self._refreshing) return;
         self._refreshing = true;
         self.loggedBb = false;   // fresh cycle: allow one bbFetch-outcome log
-        var byIssuePrs = {};   // issueKey -> [{ repo, prId, prKey }]
-        self.fetchIssues().then(function (issues) {
-          try { console.log('[EJ-BB]', 'reviewIssues=' + issues.length); } catch (e) {}
-          // dev-status per issue (same-origin), throttled.
-          return self.runPool(issues, function (issue) {
-            var devUrl = '/rest/dev-status/latest/issue/detail?issueId=' + encodeURIComponent(issue.id) + '&applicationType=bitbucket&dataType=pullrequest';
-            return self.getJson(devUrl).then(function (dj) {
-              var prs = self.extractPrs(dj);
-              if (prs.length) byIssuePrs[issue.key] = prs;
-            }).catch(function () {});
-          }, BB_MAXC);
-        }).then(function () {
-          // Flatten to unique PR refs, then fetch participants throttled + cached.
-          var seen = {}, refs = [];
-          for (var key in byIssuePrs) {
-            if (!byIssuePrs.hasOwnProperty(key)) continue;
-            var arr = byIssuePrs[key];
-            for (var i = 0; i < arr.length; i++) {
-              if (!seen[arr[i].prKey]) { seen[arr[i].prKey] = true; refs.push(arr[i]); }
+        var byIssuePrs = {};     // issueKey -> [{ repo, prId, prKey }]
+        var devBase = {};        // issueKey -> reliable reviewer facts from same-origin dev-status
+        var published = false;   // ensure publish() fires at least once
+        function safePublish(map, label) { try { self.publish(map, label); published = true; } catch (e) {} }
+        // Wrap the whole chain CONSTRUCTION (not just the async .catch): a synchronous throw before the
+        // first .then attaches would otherwise escape the trailing .catch, leaving #__ej_bb_states
+        // unpublished AND self._refreshing stuck true (which would no-op the 90s auto-refresh until a
+        // fresh page load). On a sync throw we still publish the (empty) base and clear the flag.
+        try {
+          self.fetchIssues().then(function (issues) {
+            try { console.log('[EJ-BB]', 'reviewIssues=' + issues.length); } catch (e) {}
+            // Stage 1: dev-status per issue (same-origin, throttled) — collects BOTH the PR refs (for the
+            // Bitbucket enrichment) AND the reliable base reviewer facts.
+            return self.runPool(issues, function (issue) {
+              var devUrl = '/rest/dev-status/latest/issue/detail?issueId=' + encodeURIComponent(issue.id) + '&applicationType=bitbucket&dataType=pullrequest';
+              return self.getJson(devUrl).then(function (dj) {
+                var prs = self.extractPrs(dj);
+                if (prs.length) { byIssuePrs[issue.key] = prs; devBase[issue.key] = self.aggregateDev(dj); }
+              }).catch(function () {});
+            }, BB_MAXC);
+          }).then(function () {
+            // GUARANTEED early publish from the dev-status base (coloring + approver list work now).
+            safePublish(self.mergeBase(devBase, {}), 'base');
+            if (!self.bbAvailable) { self._refreshing = false; return; }   // no host bridge: base is final
+            // Stage 2: flatten to unique PR refs, then fetch Bitbucket participants (throttled + cached +
+            // hard-bounded). This is enrichment only — the base above already stands.
+            var seen = {}, refs = [];
+            for (var key in byIssuePrs) {
+              if (!byIssuePrs.hasOwnProperty(key)) continue;
+              var arr = byIssuePrs[key];
+              for (var i = 0; i < arr.length; i++) {
+                if (!seen[arr[i].prKey]) { seen[arr[i].prKey] = true; refs.push(arr[i]); }
+              }
             }
-          }
-          return self.runPool(refs, function (ref) { return self.fetchParticipants(ref); }, BB_MAXC);
-        }).then(function () {
-          var byIssue = {};
-          for (var key in byIssuePrs) {
-            if (!byIssuePrs.hasOwnProperty(key)) continue;
-            byIssue[key] = self.aggregateIssue(byIssuePrs[key]);   // only issues WITH >=1 PR are published
-          }
-          self.publish(byIssue);
+            return self.runPool(refs, function (ref) { return self.fetchParticipants(ref); }, BB_MAXC).then(function () {
+              var enriched = {};
+              for (var k2 in byIssuePrs) {
+                if (!byIssuePrs.hasOwnProperty(k2)) continue;
+                enriched[k2] = self.aggregateIssue(byIssuePrs[k2]);
+              }
+              // Re-publish the merged map: enriched where Bitbucket produced reviewers, else the base.
+              safePublish(self.mergeBase(devBase, enriched), 'enriched');
+              self._refreshing = false;
+            });
+          }).catch(function () {
+            // Any unexpected error/timeout still leaves a states node standing.
+            if (!published) safePublish(self.mergeBase(devBase, {}), 'base');
+            self._refreshing = false;
+          });
+        } catch (e) {
+          // Synchronous throw during chain construction: publish the base so the painter has a node,
+          // and clear _refreshing so the auto-refresh interval keeps working.
+          try { console.log('[EJ-BB]', 'refresh sync error ' + (e && e.message ? e.message : e)); } catch (_) {}
+          if (!published) safePublish(self.mergeBase(devBase, {}), 'base');
           self._refreshing = false;
-        }).catch(function () { self._refreshing = false; });
+        }
       }
     };
     window.__ejBbBridge = bridge;

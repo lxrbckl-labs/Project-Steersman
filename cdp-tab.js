@@ -976,15 +976,31 @@ class CDPTab {
     // navigation/refresh makes it a reliable once-per-document signal, with no dependence on
     // loaderId / frameNavigated / context-lifecycle events. Companion body is a window.__ejBbBridge
     // singleton, so a fresh world per document is correct.
+    // Claim this apply pass on the page via two window flags (fresh window per document = correct
+    // per-document scope). __ejBridgeApplied is the SUCCESS latch — set LATER, only when the
+    // companion actually ran (see the applyOk gate below); __ejBridgeApplying is the in-flight guard
+    // so two overlapping reinjects (frameNavigated + domContentEventFired fire close together) don't
+    // both apply. SMOKING-GUN FIX (was: latch set here at the TOP, before createIsolatedWorld): a
+    // pass that FAILS at the readyState=loading commit tick (createIsolatedWorld often rejects there)
+    // must NOT latch, so the later domContentEventFired/loadEventFired re-fires RETRY — that's what
+    // makes coloring/popup survive an arbitrary number of refreshes. __ejBridgeApplyTries is a
+    // per-document retry counter (resets naturally on the next document's fresh window).
     let firstForThisDoc = true;
+    let applyTries = 0;
     if (bridgeList.length) {
       try {
         const chk = await this.send('Runtime.evaluate', {
-          expression: '(function(){ if (window.__ejBridgeApplied) return false; window.__ejBridgeApplied = true; return true; })()',
+          expression: '(function(){ var t=(window.__ejBridgeApplyTries||0);' +
+            ' if (window.__ejBridgeApplied) return {claim:false,tries:t};' +
+            ' if (window.__ejBridgeApplying) return {claim:false,tries:t};' +
+            ' window.__ejBridgeApplying = true; window.__ejBridgeApplyTries = t + 1;' +
+            ' return {claim:true,tries:t + 1}; })()',
           returnByValue: true,
         });
-        firstForThisDoc = !!(chk && chk.result && chk.result.value === true);
-      } catch (e) { firstForThisDoc = true; } // on eval error, err toward applying
+        const v = chk && chk.result && chk.result.value;
+        firstForThisDoc = !!(v && v.claim === true);
+        applyTries = (v && typeof v.tries === 'number') ? v.tries : 0;
+      } catch (e) { firstForThisDoc = true; applyTries = 1; } // on eval error, err toward applying — count as try #1 so a stacked failure still schedules the safety-net retry
     }
     const toLiveApply = firstForThisDoc ? bridgeList : [];
     if (toLiveApply.length) {
@@ -1052,7 +1068,27 @@ class CDPTab {
           });
         } catch (e) {}
       }
-      this.log.appendLine('[Bridge] live-apply: firstForThisDoc=' + firstForThisDoc + ' frameId=' + (!!frameId) + ' exts=[' + results.map(r => r.id + ':cw=' + r.cwOk + ',eval=' + r.evalOk).join(', ') + ']');
+      // LATCH DECISION (the fix): mark the document APPLIED only when the companion actually ran —
+      // a main frame was found AND every live-apply created a working isolated world + ran its
+      // bootstrap (evalOk). Otherwise release ONLY the in-flight guard, leaving the success latch
+      // unset so the next domContentEventFired/loadEventFired re-fire RETRIES (createIsolatedWorld is
+      // far likelier to succeed post-DOMContentLoaded than at the readyState=loading commit tick).
+      const applyOk = !!frameId && results.length > 0 && results.every((r) => r.evalOk);
+      try {
+        await this.send('Runtime.evaluate', {
+          expression: '(function(){ window.__ejBridgeApplying = false;' +
+            (applyOk ? ' window.__ejBridgeApplied = true;' : '') + ' })()',
+        });
+      } catch (e) {}
+      // Safety-net retry: page load events give ~3 re-fires per document, but if they're exhausted
+      // (or all consumed while one slow pass was in flight) a failed apply would otherwise strand the
+      // companion until the next manual refresh. Schedule a bounded, self-resetting (per-document
+      // counter) delayed reinject so repeated refreshes each re-establish the companion reliably. A
+      // retry that finds the document already latched claims nothing and no-ops cleanly.
+      if (!applyOk && applyTries > 0 && applyTries < 8) {
+        try { setTimeout(() => { try { this._reinjectExtensions(); } catch (_) {} }, 1500); } catch (_) {}
+      }
+      this.log.appendLine('[Bridge] live-apply: firstForThisDoc=' + firstForThisDoc + ' frameId=' + (!!frameId) + ' applyOk=' + applyOk + (applyOk ? ' (latched)' : ' (will retry, try ' + applyTries + '/8)') + ' exts=[' + results.map(r => r.id + ':cw=' + r.cwOk + ',eval=' + r.evalOk).join(', ') + ']');
     } else if (!firstForThisDoc) {
       // Skipped (already applied for this document): still record the skip so we can see it.
       try {
