@@ -859,16 +859,38 @@ class CDPTab {
     return (
       '(function(){try{' +
       // Page-side bridge runtime.
-      'var __sm_seq=0;var __sm_pending={};' +
+      // ORPHANED-REPLY FIX: this bootstrap can run TWICE into the SAME isolated world — once from the
+      // document-start Page.addScriptToEvaluateOnNewDocument({worldName}) registration, once from the
+      // live-apply Page.createIsolatedWorld({worldName}) pass (Chrome returns the SAME context for a
+      // repeated worldName). When __sm_seq/__sm_pending were bootstrap-closure locals, the second run
+      // installed a fresh __steersman_bridge_resolve over an EMPTY pending map while the companion's
+      // own singleton guard (window.__ejBbBridge) kept the FIRST run's steersman/__sm_call alive — so
+      // every reply looked up a rid the new map had never seen, hit the `if(!p)` bail, and vanished
+      // silently; every call then died at its page-side deadline. Fix: hang the seq + pending map off
+      // `window` (per isolated world, fresh per document) so a repeated bootstrap REUSES them, exactly
+      // like the __ejBbBridge singleton guard. Never orphan an in-flight call again.
+      'var __sm_st=window.__steersman_bridge_state;' +
+      'if(!__sm_st){__sm_st={seq:0,pending:{},orphans:0};window.__steersman_bridge_state=__sm_st;}' +
+      'if(!__sm_st.pending)__sm_st.pending={};' +
       'function __sm_call(op,args,timeout){return new Promise(function(resolve,reject){' +
-      'var rid=++__sm_seq;var t=setTimeout(function(){if(__sm_pending[rid]){delete __sm_pending[rid];' +
+      'var __sm_pending=__sm_st.pending;' +
+      'var rid=++__sm_st.seq;var t=setTimeout(function(){if(__sm_pending[rid]){delete __sm_pending[rid];' +
       'reject({type:"timeout",message:"bridge call timed out"});}},timeout||10000);' +
       '__sm_pending[rid]={resolve:resolve,reject:reject,timer:t};' +
       'try{window.' + BRIDGE_BINDING + '(JSON.stringify({rid:rid,op:op,args:args}));}' +
       'catch(e){clearTimeout(t);delete __sm_pending[rid];reject({type:"host",message:"bridge unavailable: "+(e&&e.message)});}});}' +
-      'window.__steersman_bridge_resolve=function(rid,reply){var p=__sm_pending[rid];if(!p)return;' +
-      'clearTimeout(p.timer);delete __sm_pending[rid];' +
-      'if(reply&&reply.ok){p.resolve(reply.value);}else{p.reject((reply&&reply.error)||{type:"host",message:"bridge error"});}};' +
+      // Install the resolver ONCE per world (singleton, same pattern as __ejBbBridge). It reads the
+      // shared pending map off window, so it stays correct even if a later bootstrap skips this branch.
+      'if(!window.__steersman_bridge_resolve){' +
+      'window.__steersman_bridge_resolve=function(rid,reply){var st=window.__steersman_bridge_state||{pending:{}};' +
+      'var p=st.pending&&st.pending[rid];' +
+      // An unknown rid is the ORPHANED-REPLY signature — it must never fail silently again. Log the
+      // first few per world only (a stuck bridge would otherwise spam every 90s refresh cycle).
+      'if(!p){st.orphans=(st.orphans||0)+1;' +
+      'if(st.orphans<=3){try{console.warn("[Steersman bridge] orphaned reply: no pending call for rid="+rid+" (pending="+Object.keys(st.pending||{}).length+", orphans="+st.orphans+")");}catch(_){}}' +
+      'return;}' +
+      'clearTimeout(p.timer);delete st.pending[rid];' +
+      'if(reply&&reply.ok){p.resolve(reply.value);}else{p.reject((reply&&reply.error)||{type:"host",message:"bridge error"});}};}' +
       // The `steersman` object handed to the bridge body.
       'var steersman={id:' + idJson + ',' +
       'mark:function(n){try{if(n&&n.setAttribute)n.setAttribute("data-steersman-ext",' + idJson + ');}catch(e){}return n;},' +
@@ -1439,11 +1461,24 @@ class CDPTab {
   // promise). rid + reply are JSON-embedded; contextId targets the bridge world.
   async _resolveInContext(ctxId, rid, reply) {
     try {
-      await this.send('Runtime.evaluate', {
+      const r = await this.send('Runtime.evaluate', {
         expression: '__steersman_bridge_resolve(' + JSON.stringify(rid) + ',' + JSON.stringify(reply) + ')',
         contextId: ctxId,
         returnByValue: true,
       });
+      // A CDP-level success does NOT mean the resolve ran: a ReferenceError (resolver never installed
+      // in this context) or any throw inside it comes back as exceptionDetails on an otherwise-OK
+      // response. Left uninspected, a promise that never settles is completely invisible host-side —
+      // that is how the orphaned-reply bug hid for four ship-and-reload rounds. Throttled to the first
+      // few per tab so a persistently broken context can't flood the log every refresh cycle.
+      const ex = r && r.exceptionDetails;
+      if (ex) {
+        this._resolveExcCount = (this._resolveExcCount || 0) + 1;
+        if (this._resolveExcCount <= 5) {
+          const msg = (ex.exception && (ex.exception.description || ex.exception.value)) || ex.text || 'unknown';
+          this.log.appendLine('[Bridge] resolve THREW in page (ctx=' + ctxId + ', rid=' + rid + '): ' + String(msg).slice(0, 300) + ' — the page-side promise will never settle' + (this._resolveExcCount === 5 ? ' [further resolve-exception logs suppressed]' : ''));
+        }
+      }
     } catch (e) {
       try { this.log.appendLine('[Bridge] resolve failed (ctx=' + ctxId + ', rid=' + rid + '): ' + (e && e.message ? e.message : e)); } catch (_) {}
     }

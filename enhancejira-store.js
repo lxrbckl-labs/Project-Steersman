@@ -1280,8 +1280,25 @@ class EnhanceJiraStore {
             self.prCache[ref.prKey] = { participants: participants, ts: Date.now() - BB_TTL + 5000 };
           }
           // else: keep the prior good cache rather than blanking it with a transient empty result
-        }).catch(function (e) { if (!self.loggedBb) { self.loggedBb = true; try { console.log('[EJ-BB]', 'bbFetch ERROR ' + String(e).slice(0, 80)); } catch (_) {} } });
-        return self.withTimeout(call, BB_TO + 1500, undefined);
+        }).catch(function (e) {
+          if (!self.loggedBb) {
+            self.loggedBb = true;
+            // Bridge rejections are typed OBJECTS ({type:'timeout'|'blocked'|'host'|..., message}).
+            // String(e) rendered them as the useless '[object Object]', hiding the discriminator that
+            // says WHICH failure this is — stringify the structure instead (same cap-and-truncate).
+            var d;
+            try { d = (e instanceof Error) ? (e.message || String(e)) : JSON.stringify(e); } catch (_) { d = String(e); }
+            if (d === undefined) d = String(e);
+            try { console.log('[EJ-BB]', 'bbFetch ERROR ' + String(d).slice(0, 200)); } catch (_) {}
+          }
+        });
+        // TIMEOUT ORDERING (do not re-invert): the page-side __sm_call deadline is timeoutMs + 3000
+        // (= BB_TO + 3000), so this outer race MUST be strictly LOOSER than that or it discards a
+        // reply that arrived inside the transport's own budget. It was BB_TO + 1500 (9.5s) against an
+        // 11s transport deadline, i.e. it pre-empted the transport and threw away late-but-valid
+        // replies. Keep this margin > 3000 so the transport's typed error always wins the race and
+        // this wrapper only ever fires as the last-resort "binding never round-tripped" backstop.
+        return self.withTimeout(call, BB_TO + 4500, undefined);
       },
       // Aggregate an issue's PRs (from prCache) into reviewer FACTS. reviewers[] carries EVERY
       // participant (deduped by display name across PRs) for the Stage-2 popup. The tallies
