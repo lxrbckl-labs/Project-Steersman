@@ -132,6 +132,16 @@ const PR_GREEN = 'rgb(30, 107, 75)';
 const PR_RED = 'rgb(139, 46, 40)';
 const PR_BOTS = ['Code Rabbit'];
 
+// The Review-column coloring paints via an EXTENSION-OWNED left-edge ::before bar, NOT an inline
+// background: Atlassian's Design System / Compiled uses a layered `!important` card background that
+// inline styles (even inline !important) cannot beat, but a pseudo-element the extension owns renders
+// fine. The injected JS manager only toggles `data-ej-pr="green"|"red"` on the card; these rules (part
+// of the record's css, so they ride the CSS-injection path AND keep setBypassCSP on) draw the bar.
+const PR_BAR_CSS =
+  `${PR_CARD_SELECTOR}[data-ej-pr]{position:relative !important;}` +
+  `${PR_CARD_SELECTOR}[data-ej-pr="green"]::before{content:'';position:absolute;left:0;top:0;bottom:0;width:5px;background:${PR_GREEN};z-index:1;border-top-left-radius:inherit;border-bottom-left-radius:inherit;}` +
+  `${PR_CARD_SELECTOR}[data-ej-pr="red"]::before{content:'';position:absolute;left:0;top:0;bottom:0;width:5px;background:${PR_RED};z-index:1;border-top-left-radius:inherit;border-bottom-left-radius:inherit;}`;
+
 class EnhanceJiraStore {
   // globalState: a VS Code Memento (context.globalState), same shape as ExtensionsStore's ctor.
   // Nothing to load/normalize eagerly here (unlike ExtensionsStore's list) since both pieces of
@@ -242,6 +252,11 @@ class EnhanceJiraStore {
     // this rule is gated on the same flag: when showBoardAvatars is off neither hide is present and the
     // native filter shows. A brief empty gap before the strip resolves is accepted; a native flash is not.
     if (components[SHOW_AVATARS_KEY]) css += `${AVATAR_FILTER_SELECTOR}{display:none !important;}`;
+    // PR-coloring ON: contribute the Review-column ::before bar rules. This both DRAWS the bars (the
+    // reliable CSS-injection path, vs. inline styles ADS overrides) and — critically — guarantees the
+    // record carries a non-empty css so cdp-tab keeps setBypassCSP ON while coloring is active, even if
+    // the operator turns off every CSS-hide (otherwise the injected color style would be CSP-blocked).
+    if (components[PR_COLORING_KEY]) css += PR_BAR_CSS;
     return css;
   }
 
@@ -687,14 +702,15 @@ class EnhanceJiraStore {
               return { approved: count, changesRequested: false, hasPr: true };
             }).catch(function () { return undefined; });   // undefined = fetch error (don't hard-cache)
           },
-          // Pure three-state tint decision from the LIVE threshold (a minApprovals change repaints from
-          // cache with zero refetch). RED when any reviewer requested changes (red wins over green); GREEN
-          // when approved humans >= minApprovals; otherwise null (no tint — incl. PR-but-neither and no-PR).
+          // Tint decision from the LIVE threshold (a minApprovals change repaints from cache with zero
+          // refetch). A card with a PR ALWAYS gets a bar: GREEN when it has enough human approvals and no
+          // changes-requested; otherwise RED (under-threshold OR changes-requested). No PR -> null (no
+          // bar). Restores the v1.1.0 intent — a linked-but-under-approved PR is RED, not blank (the
+          // regression that left the column looking empty when max approvals < threshold).
           colorFor: function (entry) {
-            if (!entry) return null;
-            if (entry.changesRequested) return 'red';
-            if (entry.hasPr && entry.approved >= this.minApprovals) return 'green';
-            return null;
+            if (!entry || !entry.hasPr) return null;
+            if (!entry.changesRequested && entry.approved >= this.minApprovals) return 'green';
+            return 'red';
           },
           // Fetch the Review-column issue list, then fill the per-issue FACTS cache using ≤PR_MAXC
           // concurrent dev-status fetches, skipping issues whose cached facts are still fresh (<PR_TTL).
@@ -735,10 +751,9 @@ class EnhanceJiraStore {
                 .catch(function () { self._refreshing = false; });
             }).catch(function () { self._refreshing = false; });
           },
-          // The card's visible rounded SURFACE: the first descendant div that actually paints the card —
-          // an OPAQUE background (not transparent) covering ~the whole card (>= 0.9 of the card's area).
-          // The card element itself and any ::before overlay are painted over by inner divs, so we tint
-          // THIS div; it carries the border-radius, so the rounded corners are preserved. null if none.
+          // DEAD as of the ::before-bar switch (v1.2.13): inline backgroundColor on a card surface div
+          // could not beat ADS's layered !important background, so coloring now paints via the
+          // PR_BAR_CSS ::before bar toggled by data-ej-pr (see colorCard). Kept (no-deletions) but unused.
           surfaceOf: function (card) {
             try {
               var cr = card.getBoundingClientRect();
@@ -757,15 +772,17 @@ class EnhanceJiraStore {
             } catch (e) {}
             return null;
           },
-          // Tint (or restore) the card's surface div. green -> PR_GREEN, red -> PR_RED, anything else -> ''
-          // which restores the stylesheet default (no need to store the original). Idempotent: only writes
-          // when the value differs (PR_GREEN/PR_RED use the browser's serialized spacing so the guard holds).
+          // Mark (or unmark) the card with data-ej-pr so the extension-owned ::before bar (PR_BAR_CSS)
+          // paints: 'green' | 'red' set the attribute, anything else removes it (restoring no-bar). The
+          // bar itself is drawn by the injected CSS, which beats ADS's layered !important background that
+          // inline styles cannot. Idempotent: only writes when the attribute actually changes.
           colorCard: function (card, color) {
             try {
-              var surface = this.surfaceOf(card);
-              if (!surface) return;
-              var want = (color === 'green') ? PR_GREEN : (color === 'red') ? PR_RED : '';
-              if (surface.style.backgroundColor !== want) surface.style.backgroundColor = want;
+              var want = (color === 'green') ? 'green' : (color === 'red') ? 'red' : '';
+              var cur = card.getAttribute('data-ej-pr') || '';
+              if (cur === want) return;
+              if (want) card.setAttribute('data-ej-pr', want);
+              else card.removeAttribute('data-ej-pr');
             } catch (e) {}
           },
           // A card's issue key = the trimmed text of its first descendant element whose text is EXACTLY a
@@ -926,8 +943,11 @@ class EnhanceJiraStore {
               return (a + b).toUpperCase() || '?';
             } catch (e) { return '?'; }
           },
-          // Build one avatar wrapper: circular <img> (or an initials fallback when no avatar URL), a
-          // corner status badge, and a name+status title tooltip. Colors match the card tint family.
+          // Build one avatar wrapper: a circular profile <img> when the reviewer carries an avatar URL,
+          // else an initials circle. All values go in via DOM props/setAttribute (never innerHTML), so a
+          // reviewer name can't break the raw-injected body. The <img> gets an onerror fallback to the
+          // initials circle: reviewer avatar URLs (esp. cross-origin Bitbucket ones) may be blocked/404,
+          // so a broken image degrades to initials instead of showing a broken-image glyph.
           buildAvatar: function (rv) {
             var name = rv.name || 'Reviewer';
             var isCr = rv.state === 'changes_requested';
@@ -936,18 +956,25 @@ class EnhanceJiraStore {
             wrap.style.cssText = 'position:relative;width:24px;height:24px;display:inline-block;flex:0 0 auto;';
             wrap.setAttribute('title', name + (isCr ? ' — requested changes' : (isApp ? ' — approved' : '')));
             var ring = isCr ? 'box-shadow:0 0 0 2px #FF5630;' : (isApp ? 'box-shadow:0 0 0 2px #36B37E;' : '');
+            var self = this;
+            function initialsEl() {
+              var f = document.createElement('div');
+              f.textContent = self.initials(name);
+              f.style.cssText = 'width:24px;height:24px;border-radius:50%;background:#5E6C84;color:#fff;font-size:10px;font-weight:600;display:flex;align-items:center;justify-content:center;' + ring;
+              return f;
+            }
             if (rv.avatar) {
               var img = document.createElement('img');
               img.src = rv.avatar;
               img.alt = name;
               img.referrerPolicy = 'no-referrer';
               img.style.cssText = 'width:24px;height:24px;border-radius:50%;object-fit:cover;display:block;' + ring;
+              img.onerror = function () {
+                try { if (img.parentNode === wrap) wrap.removeChild(img); if (!wrap.firstChild) wrap.appendChild(initialsEl()); } catch (e) {}
+              };
               wrap.appendChild(img);
             } else {
-              var f = document.createElement('div');
-              f.textContent = this.initials(name);
-              f.style.cssText = 'width:24px;height:24px;border-radius:50%;background:#5E6C84;color:#fff;font-size:10px;font-weight:600;display:flex;align-items:center;justify-content:center;' + ring;
-              wrap.appendChild(f);
+              wrap.appendChild(initialsEl());
             }
             return wrap;
           },
@@ -1306,7 +1333,9 @@ class EnhanceJiraStore {
               var name = rv && rv.name;
               if (!name) continue;
               var approved = rv.approved === true;
-              var avatar = rv.avatarUrl || null;   // dev-status may omit avatars — the popup then falls back to initials
+              // dev-status reviewer avatar field name varies by instance; try the common shapes. Often
+              // absent — then the popup uses the Bitbucket-enriched avatar (aggregateIssue) or initials.
+              var avatar = rv.avatar || rv.avatarUrl || (rv.avatarUrls && (rv.avatarUrls['48x48'] || rv.avatarUrls['24x24'])) || null;
               var ex = reviewersByName[name];
               if (!ex) {
                 reviewersByName[name] = { name: name, approved: approved, state: (approved ? 'approved' : null), avatar: avatar };
