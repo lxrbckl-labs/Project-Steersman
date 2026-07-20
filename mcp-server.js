@@ -560,7 +560,7 @@ async function main() {
 
   // The composed capability prompt is delivered to the client's model via `instructions`.
   const server = new Server(
-    { name: 'project-steersman', version: '1.2.6' },
+    { name: 'project-steersman', version: '1.2.7' },
     { capabilities: { tools: {}, resources: {} }, instructions }
   );
 
