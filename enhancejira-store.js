@@ -921,24 +921,19 @@ class EnhanceJiraStore {
             var wrap = document.createElement('div');
             wrap.style.cssText = 'position:relative;width:24px;height:24px;display:inline-block;flex:0 0 auto;';
             wrap.setAttribute('title', name + (isCr ? ' — requested changes' : (isApp ? ' — approved' : '')));
+            var ring = isCr ? 'box-shadow:0 0 0 2px #FF5630;' : (isApp ? 'box-shadow:0 0 0 2px #36B37E;' : '');
             if (rv.avatar) {
               var img = document.createElement('img');
               img.src = rv.avatar;
               img.alt = name;
               img.referrerPolicy = 'no-referrer';
-              img.style.cssText = 'width:24px;height:24px;border-radius:50%;object-fit:cover;display:block;box-shadow:0 0 0 1.5px #fff;';
+              img.style.cssText = 'width:24px;height:24px;border-radius:50%;object-fit:cover;display:block;' + ring;
               wrap.appendChild(img);
             } else {
               var f = document.createElement('div');
               f.textContent = this.initials(name);
-              f.style.cssText = 'width:24px;height:24px;border-radius:50%;background:#5E6C84;color:#fff;font-size:10px;font-weight:600;display:flex;align-items:center;justify-content:center;box-shadow:0 0 0 1.5px #fff;';
+              f.style.cssText = 'width:24px;height:24px;border-radius:50%;background:#5E6C84;color:#fff;font-size:10px;font-weight:600;display:flex;align-items:center;justify-content:center;' + ring;
               wrap.appendChild(f);
-            }
-            if (isCr || isApp) {
-              var badge = document.createElement('div');
-              badge.textContent = isCr ? '✕' : '✓';
-              badge.style.cssText = 'position:absolute;right:-3px;bottom:-3px;width:13px;height:13px;border-radius:50%;border:1.5px solid #fff;color:#fff;font-size:9px;line-height:13px;text-align:center;background:' + (isCr ? '#FF5630' : '#36B37E') + ';';
-              wrap.appendChild(badge);
             }
             return wrap;
           },
