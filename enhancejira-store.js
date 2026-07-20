@@ -704,14 +704,14 @@ class EnhanceJiraStore {
             }).catch(function () { return undefined; });   // undefined = fetch error (don't hard-cache)
           },
           // Tint decision from the LIVE threshold (a minApprovals change repaints from cache with zero
-          // refetch). A card with a PR ALWAYS gets a bar: GREEN when it has enough human approvals and no
-          // changes-requested; otherwise RED (under-threshold OR changes-requested). No PR -> null (no
-          // bar). Restores the v1.1.0 intent — a linked-but-under-approved PR is RED, not blank (the
-          // regression that left the column looking empty when max approvals < threshold).
+          // refetch). RED only when a change was requested (an active blocker that outranks approvals, so
+          // it is checked FIRST). GREEN when enough approvals (Code Rabbit counted). Otherwise — a PR that
+          // is neither blocked nor sufficiently approved — NO bar (leave the card default). No PR -> null.
           colorFor: function (entry) {
             if (!entry || !entry.hasPr) return null;
-            if (!entry.changesRequested && entry.approved >= this.minApprovals) return 'green';
-            return 'red';
+            if (entry.changesRequested) return 'red';                 // red ONLY when changes were requested (blocker wins)
+            if (entry.approved >= this.minApprovals) return 'green';  // green when enough approvals (incl. Code Rabbit)
+            return null;                                              // has a PR but neither condition -> no bar (default)
           },
           // Fetch the Review-column issue list, then fill the per-issue FACTS cache using ≤PR_MAXC
           // concurrent dev-status fetches, skipping issues whose cached facts are still fresh (<PR_TTL).
