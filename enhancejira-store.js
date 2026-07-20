@@ -1080,7 +1080,23 @@ class EnhanceJiraStore {
     return `(function(){
   try {
     if (window.__ejBbBridge) return;
-    if (typeof steersman === 'undefined' || !steersman || !steersman.fetch) return;
+    var hasFetch = !(typeof steersman === 'undefined' || !steersman || !steersman.fetch);
+    console.log('[EJ-BB]', 'available=' + hasFetch + (hasFetch ? '' : ' — steersman.fetch unavailable, publishing available:false marker'));
+    if (!hasFetch) {
+      // Companion ran but the bridge binding is not wired: write a states node with an availability
+      // marker (available:false, empty byIssue) instead of nothing, so the main world (and the host
+      // #__ej_bb_states diagnostic) can tell "companion ran but no bridge" apart from "never ran".
+      try {
+        var oldU = document.getElementById('__ej_bb_states');
+        if (oldU && oldU.parentNode) oldU.parentNode.removeChild(oldU);
+        var nU = document.createElement('script');
+        nU.type = 'application/json';
+        nU.id = '__ej_bb_states';
+        nU.textContent = JSON.stringify({ available: false, byIssue: {} });
+        if (document.documentElement) document.documentElement.appendChild(nU);
+      } catch (e) {}
+      return;
+    }
     var BB_TTL = 60000;    // per-PR participant cache TTL
     var BB_MAXC = 4;       // max concurrent throttled fetches
     var BB_BOTS = [];      // count ALL reviewers (incl. Code Rabbit) in the human tallies — no bot exclusion
@@ -1251,7 +1267,7 @@ class EnhanceJiraStore {
           var n = document.createElement('script');
           n.type = 'application/json';
           n.id = '__ej_bb_states';
-          n.textContent = JSON.stringify({ updatedAt: Date.now(), byIssue: byIssue });
+          n.textContent = JSON.stringify({ available: true, updatedAt: Date.now(), byIssue: byIssue });
           if (document.documentElement) document.documentElement.appendChild(n);
         } catch (e) {}
         try {

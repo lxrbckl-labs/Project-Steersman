@@ -1006,7 +1006,20 @@ class CDPTab {
           } catch (e) {
             this.log.appendLine('[Bridge] FALLBACK SIGNAL: createIsolatedWorld("' + world + '") REJECTED by proxy: ' + (e && e.message ? e.message : e) + ' — live bridge apply unsupported on this transport.');
           }
+          let bindOk = false;
           if (contextId) {
+            // Expose the bridge binding into THIS live-created context by its id: the
+            // executionContextName-based addBinding (registered in the document-start loop) does
+            // NOT reach a createIsolatedWorld world over this js-debug proxy, so the companion's
+            // steersman.fetch would otherwise be non-functional. addBinding with executionContextId
+            // is deprecated-but-supported and targets exactly this one context.
+            try {
+              await this.send('Runtime.addBinding', { name: BRIDGE_BINDING, executionContextId: contextId });
+              bindOk = true;
+            } catch (e) {
+              // fall back: the name-based binding registered elsewhere may still cover it
+              try { await this.send('Runtime.addBinding', { name: BRIDGE_BINDING, executionContextName: BRIDGE_WORLD_PREFIX + ext.id }); bindOk = true; } catch (e2) {}
+            }
             try {
               await this.send('Runtime.evaluate', {
                 expression: this._buildBridgeBootstrap(ext),
@@ -1018,7 +1031,7 @@ class CDPTab {
               this.log.appendLine('[Bridge] live apply failed for ' + world + ': ' + (e && e.message ? e.message : e));
             }
           }
-          results.push({ id: ext.id, cwOk: !!contextId, ctxId: contextId || null, evalOk });
+          results.push({ id: ext.id, cwOk: !!contextId, ctxId: contextId || null, bindOk, evalOk });
         }
         // Page-readable diagnostic of what the bridge-apply did (no secrets/cookies), so we can
         // observe over the proxy: window.__ejBridgeDebug + one host log line.
