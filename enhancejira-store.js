@@ -124,13 +124,14 @@ const MIN_APPROVALS_KEY = 'steersman.enhanceJiraMinApprovals';
 const DEFAULT_MIN_APPROVALS = 3;
 
 // Config baked into the injected PR-color manager (composeJs). Card selector + approval-state colors are
-// verbatim/validated live; BOTS is the default reviewer-name exclude list (bot approvals don't count).
-// The colors are SOLID full-card surface tints (not a left bar): opaque values that read clearly on the
-// dark theme while preserving the card's rounded corners (applied to the card's surface div).
+// verbatim/validated live; BOTS is the reviewer-name exclude list for the approval tally. Per operator
+// requirement it is EMPTY: the threshold counts ALL approved reviewers, including Code Rabbit's
+// auto-approval (e.g. 2 human approvals + Code Rabbit = 3 = green). The colors are the green/red bar
+// values (see PR_BAR_CSS) — coloring paints via an extension-owned ::before bar, not an inline tint.
 const PR_CARD_SELECTOR = '[data-testid="platform-board-kit.ui.card.card"]';
 const PR_GREEN = 'rgb(30, 107, 75)';
 const PR_RED = 'rgb(139, 46, 40)';
-const PR_BOTS = ['Code Rabbit'];
+const PR_BOTS = [];
 
 // The Review-column coloring paints via an EXTENSION-OWNED left-edge ::before bar, NOT an inline
 // background: Atlassian's Design System / Compiled uses a layered `!important` card background that
@@ -1132,7 +1133,7 @@ class EnhanceJiraStore {
     var BB_MAXC = 4;       // max concurrent throttled fetches
     var DEV_TO = 8000;     // hard timeout for each same-origin dev-status fetch (page fetch has none)
     var BB_TO = 8000;      // host-abort timeout for the cross-origin Bitbucket participants fetch
-    var BB_BOTS = ${JSON.stringify(PR_BOTS)};   // exclude bot approvers (e.g. Code Rabbit) from the human tallies — matches the main-world PR_BOTS and the operator's green/red requirement; the popup still shows bots (reviewers[] keeps them)
+    var BB_BOTS = ${JSON.stringify(PR_BOTS)};   // empty (derives from PR_BOTS): count ALL approved reviewers, INCLUDING Code Rabbit, toward the threshold — the operator's rule (e.g. 2 humans + Code Rabbit = 3 = green). The popup lists every reviewer regardless (reviewers[] keeps them).
     var bridge = {
       bbAvailable: hasFetch, // false => dev-status base only; true => attempt Bitbucket enrichment too
       prCache: {},         // 'repo#prId' -> { participants:[...], ts }
@@ -1274,9 +1275,10 @@ class EnhanceJiraStore {
         return self.withTimeout(call, BB_TO + 1500, undefined);
       },
       // Aggregate an issue's PRs (from prCache) into reviewer FACTS. reviewers[] carries EVERY
-      // participant (bots INCLUDED — the Stage-2 popup shows the full picture), each deduped by display
-      // name across PRs; but the human tallies (changesRequested/changesRequestedBy/approvedHumans that
-      // drive the RED/GREEN card trigger) EXCLUDE bots (BB_BOTS). Both unioned across the issue's PRs.
+      // participant (deduped by display name across PRs) for the Stage-2 popup. The tallies
+      // (changesRequested/changesRequestedBy/approvedHumans that drive the RED/GREEN card trigger)
+      // exclude only names in BB_BOTS — which is EMPTY per the operator's rule, so ALL approvers,
+      // including Code Rabbit, count toward the threshold. Both unioned across the issue's PRs.
       aggregateIssue: function (prs) {
         var self = this;
         var reviewersByName = {}, crBy = {}, apprBy = {};
@@ -1300,8 +1302,8 @@ class EnhanceJiraStore {
               else if (approved && ex.state !== 'changes_requested') ex.state = 'approved';
               if (!ex.avatar && avatar) ex.avatar = avatar;
             }
-            if (!bot && cr) crBy[name] = true;      // bots never trigger the red card
-            if (!bot && approved) apprBy[name] = true;   // bots never count toward the approval threshold
+            if (!bot && cr) crBy[name] = true;      // only names in BB_BOTS are skipped (currently none)
+            if (!bot && approved) apprBy[name] = true;   // BB_BOTS empty -> every approver counts, incl. Code Rabbit
           }
         }
         var changesRequestedBy = [], reviewers = [];
@@ -1319,7 +1321,8 @@ class EnhanceJiraStore {
       // using only same-origin data (detail[].pullRequests[].reviewers[].{name, approved}). This is the
       // RELIABLE BASE for red/green (approvedHumans) and the approver list (reviewers[]). dev-status has
       // no changes-requested signal, so changesRequested is always false here (deniers come only from the
-      // Bitbucket enrichment). Human tally excludes BB_BOTS; reviewers[] keeps everyone (bots included).
+      // Bitbucket enrichment). Tally excludes only BB_BOTS (empty per operator), so every approver —
+      // including Code Rabbit — counts toward the threshold; reviewers[] keeps everyone regardless.
       aggregateDev: function (dj) {
         var self = this;
         var reviewersByName = {}, apprBy = {};
