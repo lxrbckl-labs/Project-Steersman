@@ -83,15 +83,6 @@ class CDPTab {
     // Used to Page.createIsolatedWorld a bridge world live on the current document (see
     // _syncBridgeWorlds' live-apply step) so bridge companions run on refresh, not only next-nav.
     this._mainFrameId = '';
-    // Monotonic per-navigation counter for THIS tab, bumped once in the Page.frameNavigated
-    // main-frame branch (the primary reinject trigger, which fires reliably over the proxy). Used
-    // to dedup the bridge live-apply once-per-DOCUMENT, replacing both the flaky _bridgeCtxToExt
-    // guard (context-lifecycle events are unreliable over the js-debug proxy) and the loaderId that
-    // preceded it (f.loaderId is EMPTY '' over the editor-browser proxy, so every load looked
-    // "already applied"). _bridgeAppliedNavSeq is the counter value we last live-applied for
-    // (-1 = never applied sentinel, and the counter starts at 0, so the initial load always applies).
-    this._navSeq = 0;
-    this._bridgeAppliedNavSeq = -1;
     // Whether we've currently forced Page.setBypassCSP(true) on THIS tab (Phase 3). We only turn it
     // on when at least one active extension carries CSS (an injected <style> element can be blocked
     // by a page's style-src CSP), and turn it back off when the last CSS-bearing extension is gone,
@@ -282,7 +273,6 @@ class CDPTab {
       if (f && f.url && !f.parentId) {
         this._lastKnownUrl = f.url;
         if (f.id) this._mainFrameId = f.id;
-        this._navSeq++;
         this._reinjectExtensions();
       }
     } else if (msg.method === 'Page.domContentEventFired') {
@@ -977,20 +967,34 @@ class CDPTab {
     // NEXT navigation and are unreliable over the js-debug proxy, so on a refresh the companion's
     // isolated world never runs on the just-loaded document. Fix: for each active bridge ext,
     // create its named isolated world on the current main frame and run the same bootstrap in it now.
-    // Live-apply once per DOCUMENT, reliable across refreshes. The context-lifecycle events that
-    // _bridgeCtxToExt relies on are unreliable over the js-debug proxy, and f.loaderId is empty ''
-    // over the editor-browser proxy, so we key the once-per-load dedup on the monotonic _navSeq
-    // counter instead (bumped once in the frameNavigated main-frame branch; the other 2 reinject
-    // events of one load share the same value, so we apply once per load). Companion body is a
-    // window.__ejBbBridge singleton, so a fresh world per document is correct.
-    const alreadyApplied = this._bridgeAppliedNavSeq === this._navSeq;
-    const toLiveApply = alreadyApplied ? [] : bridgeList;
+    // Live-apply once per DOCUMENT, reliable across refreshes. Prior once-per-load dedup guards were
+    // all unreliable over the js-debug proxy: the _bridgeCtxToExt context-lifecycle events don't fire
+    // reliably, f.loaderId is empty '' over the editor-browser proxy, and the _navSeq counter (bumped
+    // in Page.frameNavigated) missed navigations frameNavigated didn't emit — so the apply was
+    // skipped. MAIN-WORLD Runtime.evaluate (default context, no contextId) DOES work reliably over
+    // this proxy, so we dedup on a per-document flag set atomically on window: fresh window on every
+    // navigation/refresh makes it a reliable once-per-document signal, with no dependence on
+    // loaderId / frameNavigated / context-lifecycle events. Companion body is a window.__ejBbBridge
+    // singleton, so a fresh world per document is correct.
+    let firstForThisDoc = true;
+    if (bridgeList.length) {
+      try {
+        const chk = await this.send('Runtime.evaluate', {
+          expression: '(function(){ if (window.__ejBridgeApplied) return false; window.__ejBridgeApplied = true; return true; })()',
+          returnByValue: true,
+        });
+        firstForThisDoc = !!(chk && chk.result && chk.result.value === true);
+      } catch (e) { firstForThisDoc = true; } // on eval error, err toward applying
+    }
+    const toLiveApply = firstForThisDoc ? bridgeList : [];
     if (toLiveApply.length) {
       const frameId = await this._getMainFrameId();
+      const results = [];
       if (frameId) {
         for (const ext of toLiveApply) {
           const world = BRIDGE_WORLD_PREFIX + ext.id;
           let contextId = null;
+          let evalOk = false;
           try {
             // NB: `grantUniveralAccess` is the CDP protocol's (misspelled) parameter name — keep it.
             const r = await this.send('Page.createIsolatedWorld', {
@@ -1002,19 +1006,37 @@ class CDPTab {
           } catch (e) {
             this.log.appendLine('[Bridge] FALLBACK SIGNAL: createIsolatedWorld("' + world + '") REJECTED by proxy: ' + (e && e.message ? e.message : e) + ' — live bridge apply unsupported on this transport.');
           }
-          if (!contextId) continue;
-          try {
-            await this.send('Runtime.evaluate', {
-              expression: this._buildBridgeBootstrap(ext),
-              contextId,
-              awaitPromise: false,
-            });
-          } catch (e) {
-            this.log.appendLine('[Bridge] live apply failed for ' + world + ': ' + (e && e.message ? e.message : e));
+          if (contextId) {
+            try {
+              await this.send('Runtime.evaluate', {
+                expression: this._buildBridgeBootstrap(ext),
+                contextId,
+                awaitPromise: false,
+              });
+              evalOk = true;
+            } catch (e) {
+              this.log.appendLine('[Bridge] live apply failed for ' + world + ': ' + (e && e.message ? e.message : e));
+            }
           }
+          results.push({ id: ext.id, cwOk: !!contextId, ctxId: contextId || null, evalOk });
         }
-        this._bridgeAppliedNavSeq = this._navSeq; // mark this document applied (only after a frameId + the apply loop)
+        // Page-readable diagnostic of what the bridge-apply did (no secrets/cookies), so we can
+        // observe over the proxy: window.__ejBridgeDebug + one host log line.
+        try {
+          await this.send('Runtime.evaluate', {
+            expression: 'window.__ejBridgeDebug = ' + JSON.stringify({ applied: firstForThisDoc, frameId: !!frameId, exts: results }) + ';',
+          });
+        } catch (e) {}
       }
+      this.log.appendLine('[Bridge] live-apply: firstForThisDoc=' + firstForThisDoc + ' frameId=' + (!!frameId) + ' exts=[' + results.map(r => r.id + ':cw=' + r.cwOk + ',eval=' + r.evalOk).join(', ') + ']');
+    } else if (!firstForThisDoc) {
+      // Skipped (already applied for this document): still record the skip so we can see it.
+      try {
+        await this.send('Runtime.evaluate', {
+          expression: 'window.__ejBridgeDebug = ' + JSON.stringify({ applied: false, skipped: true }) + ';',
+        });
+      } catch (e) {}
+      this.log.appendLine('[Bridge] live-apply: firstForThisDoc=false (skipped — already applied for this document)');
     }
   }
 
