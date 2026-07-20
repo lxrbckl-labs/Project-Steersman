@@ -1103,6 +1103,7 @@ class EnhanceJiraStore {
     var bridge = {
       prCache: {},         // 'repo#prId' -> { participants:[...], ts }
       _refreshing: false,
+      loggedBb: false,     // per-refresh guard: log only the FIRST bridge-fetch outcome each cycle
       isBot: function (name) {
         if (!name) return false;
         for (var i = 0; i < BB_BOTS.length; i++) {
@@ -1200,6 +1201,7 @@ class EnhanceJiraStore {
         var url = 'https://bitbucket.org/!api/2.0/repositories/' + ref.repo + '/pullrequests/' + ref.prId +
           '?fields=participants.state,participants.approved,participants.role,participants.user.display_name,participants.user.uuid,participants.user.links.avatar.href';
         return steersman.fetch(url, { sessionCookies: true }).then(function (res) {
+          if (!self.loggedBb) { self.loggedBb = true; try { console.log('[EJ-BB]', 'bbFetch status=' + (res && res.status) + ' ok=' + (res && res.ok)); } catch (e) {} }
           var data = null;
           try { data = res.body ? JSON.parse(res.body) : null; } catch (e) { data = null; }
           var participants = (data && data.participants) || [];
@@ -1210,7 +1212,7 @@ class EnhanceJiraStore {
             self.prCache[ref.prKey] = { participants: participants, ts: Date.now() - BB_TTL + 5000 };
           }
           // else: keep the prior good cache rather than blanking it with a transient empty result
-        }).catch(function () {});
+        }).catch(function (e) { if (!self.loggedBb) { self.loggedBb = true; try { console.log('[EJ-BB]', 'bbFetch ERROR ' + String(e).slice(0, 80)); } catch (_) {} } });
       },
       // Aggregate an issue's PRs (from prCache) into reviewer FACTS. reviewers[] carries EVERY
       // participant (bots INCLUDED — the Stage-2 popup shows the full picture), each deduped by display
@@ -1280,8 +1282,10 @@ class EnhanceJiraStore {
         var self = this;
         if (self._refreshing) return;
         self._refreshing = true;
+        self.loggedBb = false;   // fresh cycle: allow one bbFetch-outcome log
         var byIssuePrs = {};   // issueKey -> [{ repo, prId, prKey }]
         self.fetchIssues().then(function (issues) {
+          try { console.log('[EJ-BB]', 'reviewIssues=' + issues.length); } catch (e) {}
           // dev-status per issue (same-origin), throttled.
           return self.runPool(issues, function (issue) {
             var devUrl = '/rest/dev-status/latest/issue/detail?issueId=' + encodeURIComponent(issue.id) + '&applicationType=bitbucket&dataType=pullrequest';

@@ -1007,7 +1007,18 @@ class CDPTab {
             this.log.appendLine('[Bridge] FALLBACK SIGNAL: createIsolatedWorld("' + world + '") REJECTED by proxy: ' + (e && e.message ? e.message : e) + ' — live bridge apply unsupported on this transport.');
           }
           let bindOk = false;
+          let mapped = false;
           if (contextId) {
+            // Seed the TRUSTED contextId->extId routing map directly at world-creation time. The
+            // Runtime.executionContextCreated events that normally populate _bridgeCtxToExt (see
+            // _onBridgeEvent) do NOT reliably fire — with the bridge world name — for worlds created via
+            // Page.createIsolatedWorld over the js-debug proxy, so a steersman.fetch posted from this
+            // world would reach _onBridgeCall with extId===undefined ("unknown bridge context") and every
+            // call would reject. We have the contextId right here, so register the mapping directly. The
+            // _onBridgeEvent lifecycle handling stays for worlds that DO emit the events; this just
+            // additionally covers the createIsolatedWorld case. (executionContextsCleared clears the map
+            // on the next navigation, and this live-apply re-seeds per document, so it stays correct.)
+            try { this._bridgeCtxToExt.set(contextId, ext.id); mapped = true; } catch (e) {}
             // Expose the bridge binding into THIS live-created context by its id: the
             // executionContextName-based addBinding (registered in the document-start loop) does
             // NOT reach a createIsolatedWorld world over this js-debug proxy, so the companion's
@@ -1031,7 +1042,7 @@ class CDPTab {
               this.log.appendLine('[Bridge] live apply failed for ' + world + ': ' + (e && e.message ? e.message : e));
             }
           }
-          results.push({ id: ext.id, cwOk: !!contextId, ctxId: contextId || null, bindOk, evalOk });
+          results.push({ id: ext.id, cwOk: !!contextId, ctxId: contextId || null, bindOk, evalOk, mapped });
         }
         // Page-readable diagnostic of what the bridge-apply did (no secrets/cookies), so we can
         // observe over the proxy: window.__ejBridgeDebug + one host log line.
