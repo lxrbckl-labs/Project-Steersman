@@ -259,6 +259,498 @@ const PR_SURFACE_TINT_CSS =
   prSurfaceTint('green', PR_SOLID_GREEN_DARK, PR_DARK_PREFIX) +
   prSurfaceTint('red', PR_SOLID_RED_DARK, PR_DARK_PREFIX);
 
+// ===================================================================================================
+// >>> THE AVATAR DIAL <<<  Edit these three values to change the per-reviewer avatar shading.
+// ===================================================================================================
+// This shades an INDIVIDUAL reviewer's avatar by THAT PERSON'S own review state (green = they
+// approved, red = they requested changes, unshaded = neither yet). It is deliberately a different
+// question from the card colour above, which reports the issue's AGGREGATE state — so a red card can
+// legitimately carry green avatars, and that is not a bug.
+//
+// Each shaded avatar gets TWO layers:
+//   1. a 2px solid RING around it (the primary, at-a-glance signal), and
+//   2. a light TINT wash over it at AVATAR_TINT_ALPHA (secondary, so the whole disc carries the
+//      colour) — kept low enough that the face stays recognisable.
+//
+// WHY THESE ARE NOT LITERALLY THE PR_SOLID_* CARD VALUES: they are the SAME TWO HUES, moved along
+// the luminance axis, because the constraint is inverted. A card fill sits BEHIND 12px text, so it
+// must be far from the text's luminance (deep in dark theme, pale in light theme) — that is what
+// PR_SOLID_* is tuned for. A 2px ring carries NO text; it sits against the board background and must
+// simply be SEEN. PR_SOLID_GREEN_DARK rgb(11,71,43) against the dark board surface rgb(36,37,40) is
+// only ~1.4:1 — effectively invisible as a hairline. So each ring is a HUE-PRESERVING BRIGHTENING of
+// the corresponding dark card solid, i.e. every channel multiplied by one scalar, which leaves the
+// hue mathematically identical and only raises luminance:
+//
+//   green  rgb(11, 71, 43)  x 2.6  ->  rgb(29, 185, 112)   (hue 152 deg, unchanged)
+//   red    rgb(112, 28, 22) x 2.0  ->  rgb(224, 56, 44)    (hue 4 deg,   unchanged)
+//
+// These are deliberately THEME-NEUTRAL (one value used in both light and dark). They are mid-
+// luminance, so they read against a dark board (~5.9:1 green, ~3.4:1 red) and against a white one
+// (~2.3:1 green, ~4.1:1 red) without needing a second, leak-prone theme-prefixed rule set — and
+// unlike the card CSS these are applied as inline styles from JS, where there is no stylesheet to
+// prefix in the first place.
+//
+// If you want them LOUDER, raise AVATAR_TINT_ALPHA (the wash) first — the ring is already saturated.
+// Above ~0.45 the tint starts to swallow facial detail, which is the thing this dial trades against.
+const AVATAR_RING_GREEN_RGB = '29, 185, 112';   // PR_SOLID_GREEN_DARK x 2.6 (same hue, raised luminance)
+const AVATAR_RING_RED_RGB = '224, 56, 44';      // PR_SOLID_RED_DARK   x 2.0 (same hue, raised luminance)
+const AVATAR_TINT_ALPHA = 0.28;                 // wash opacity over the photo; keep the face readable
+
+// Whether the BOARD-HEADER avatar strip (#__ej_avatar_strip, next to the board title) is shaded too.
+// OFF by default at the operator's request: that strip lists board MEMBERS, not a ticket's reviewers,
+// so shading it aggregates one person's state across every issue they review — a board-wide readout
+// nobody asked for, sitting on a surface that is not about review at all. The per-ticket hover-popup
+// shading (which IS per-reviewer, per-issue) is unaffected by this dial and stays on. Flip to true to
+// get the aggregate view back; the code path below is retained in full, just gated.
+const AVATAR_SHADE_HEADER_STRIP = false;
+
+// ===================================================================================================
+// >>> THE FROSTED-POPUP DIAL <<<  Edit these three values to change the hover card's frosted glass.
+// ===================================================================================================
+// Turns the PR hover card (Jira's dev-info popup — the per-card approver/denier panel our avatar strip
+// renders into) from a solid slab into frosted glass: a SEMI-TRANSPARENT surface over a BLURRED
+// backdrop. Transparency is what makes the blur visible at all — over a fully opaque background there
+// is nothing showing through to blur — so the alpha and the blur are one setting in two numbers.
+//
+// backdrop-filter, NOT filter. `filter: blur()` blurs the element AND its content, which would smear
+// the reviewer names, avatars and rings into mush. `backdrop-filter` blurs only what is painted BEHIND
+// the element; the popup's own content stays pixel-sharp.
+//
+// THE COMPOSITING TRAP, CHECKED LIVE. An element with backdrop-filter blurs its "backdrop root", and a
+// wrongly-placed ancestor silently makes the effect a no-op or blurs the wrong layer. The real ancestry
+// (measured on the live board) is:
+//     popup  [data-testid="development-board-dev-info-icon.popup"]  fixed, transform, z-index 400
+//       -> div.atlaskit-portal            z-index 399
+//       -> div.atlaskit-portal-container
+//       -> body#jira                      transform: translate(0, 32px)
+// A backdrop root is established by filter / opacity < 1 / mask / mix-blend-mode / will-change of
+// those / contain:paint — a TRANSFORM IS NOT ONE OF THEM, so body's transform does not clip the
+// backdrop and the popup blurs the whole board behind it. Every ancestor was verified to carry
+// filter:none, opacity:1, mix-blend-mode:normal, will-change:auto, contain:none. The popup's OWN
+// transform is harmless (an element's own transform never gates its own backdrop-filter). This is why
+// the property goes on the popup element itself and not on a wrapper.
+//
+// WHY THERE IS A brightness() AND NOT A SEPARATE SCRIM. A translucent scrim in the SAME colour as the
+// surface is mathematically identical to just raising the surface alpha (1-(1-a1)(1-a2)), so it buys
+// nothing. The real problem is that blur removes DETAIL but not BRIGHTNESS — a blurred white avatar
+// behind pale 14px text is still a smooth bright patch. brightness() is the scrim done properly: it
+// clamps the backdrop's luminance BEFORE compositing, killing bright outliers while leaving the
+// already-dark board essentially untouched. That is what buys the legibility headroom below.
+//
+// WHY THERE IS A saturate(), AND WHY THE FIRST CUT OF THIS LOOKED SOLID. The original dials
+// (blur 24 / brightness 0.45 / alpha 0.6) were verified live to APPLY correctly — the popup element
+// really did compute `background-color: rgba(43,44,47,0.6)` and `backdrop-filter: blur(24px)
+// brightness(0.45)`, with no opaque child painting over it — and the popup STILL read as a solid slab.
+// The reason is arithmetic, not plumbing. Backdrop detail reaches the eye multiplied by
+// (1 - alpha) x brightness = 0.4 x 0.45 = 0.18, and the board behind is already dark and low-contrast,
+// so an 18% share of it is nothing. Measured on the live rendered popup, the text-free gutters came out
+// at rgb(34,35,38) with a luminance SD of 0.0017 and a max-minus-min channel spread of 4 — i.e. a flat,
+// uniform, unmistakably OPAQUE-looking panel. The operator was right.
+//
+// Raising the transmission alone does not rescue it: sweeping alpha and brightness across the whole
+// AA-legal range only ever tripled the surface texture, because a 24px blur of a dark board averages
+// out to a near-constant no matter how much of it you let through. The lever that actually works is
+// saturate(). WCAG contrast is a function of relative LUMINANCE only, while saturate() moves colour
+// away from grey at essentially constant luminance — so it buys visible glassiness almost for free in
+// contrast terms. That is the whole trick, and it is why the recipe is blur + saturate + brightness.
+//
+// MEASURED, not estimated. The binding text is Jira's own --ds-text-subtlest #96999E at 14px/400
+// ("Last updated … ago"), so plain-text AA (>= 4.5:1) applies. Against the SOLID popup it scores only
+// 4.885:1 — Jira ships just 0.385 of headroom, which is why naive translucency fails immediately.
+//
+// The binding worst case is a SOLID CARD FILL, not a bright speck. A card fill is ~268x150 CSS px,
+// far larger than the blur kernel, so its interior survives the blur essentially unchanged and the
+// popup composites against a full field of it. Small bright features (24px avatars, glyphs) are the
+// opposite: the blur averages them away, so they never bind. Contrast was therefore evaluated against
+// UNIFORM FIELDS of every surface the popup can sit over, computed through Chromium's own filter
+// pipeline (canvas ctx.filter, same code path as backdrop-filter) rather than by hand:
+//
+//   uniform backdrop          -> composite        subtlest  verdict
+//   PR_SOLID_RED_DARK            rgb(78,18,19)     5.191:1  PASS   <- binds
+//   PR_SOLID_GREEN_DARK          rgb(17,44,25)     5.252:1  PASS
+//   QA/lighter card              rgb(32,34,38)     5.580:1  PASS
+//   board surface rgb(36,37,40)  rgb(27,28,31)     5.971:1  PASS
+//   body bg rgb(31,31,33)        rgb(26,26,29)     6.080:1  PASS
+//
+// The worst of those, 5.191:1, is BETTER than the 4.885:1 of the untouched solid ADS popup. That is the
+// invariant worth keeping: the frosted popup is never less legible than the stock one it replaces,
+// on any backdrop the board can put behind it — because brightness() removes more backdrop luminance
+// than the reduced surface alpha lets back in.
+//
+// Confirmed end-to-end on the rendered page (screenshot pixels sampled from the live popup's own
+// text-free gutters, frost on vs. the previous dials): surface luminance SD 0.0017 -> 0.0028 and
+// channel spread 4 -> 14, with the column gutter and the card edges behind now plainly visible
+// through the glass while the popup's own text stays pixel-sharp.
+//
+// TUNING. POPUP_BACKDROP_SATURATE is the cheap dial — push it for more glass, it costs almost no
+// contrast (2.5 -> 3.2 moved the binding case by under 0.02). The expensive dials are brightness and
+// alpha; every 0.02 of brightness costs roughly 0.07 of contrast on the binding red-card case, and
+// raising brightness past ~0.62 at this alpha is what breaks AA first. Lowering POPUP_BLUR_PX below
+// ~14 starts letting card TEXT read through as legible-but-smeared shapes behind our own text, which
+// is visually noisy long before it is a contrast problem.
+const POPUP_BLUR_PX = 16;               // backdrop blur radius (CSS blur() std deviation)
+const POPUP_SURFACE_ALPHA = 0.4;        // opacity of the popup surface; lower = glassier, less legible
+const POPUP_BACKDROP_SATURATE = 2.5;    // backdrop colour boost; buys visible glass at ~no contrast cost
+const POPUP_BACKDROP_BRIGHTNESS = 0.48; // backdrop luminance clamp; the "scrim", done as a filter
+
+// Jira's own overlay colour (--ds-surface-overlay, #2B2C2F). The HUE is deliberately unchanged — only
+// its alpha moves — so the frosted popup still reads as the same ADS surface, just translucent.
+const POPUP_SURFACE_RGB = '43, 44, 47';
+// The popup element, verified live. Scoped to dark mode with the SAME PR_DARK_PREFIX hook the card
+// fills use: light-mode tuning would need its own measured numbers, and this tenant does not even ship
+// the light token set (every --ds-* resolves empty under data-color-mode="light"), so light mode keeps
+// the untouched solid popup rather than an unmeasured translucent one.
+const POPUP_SELECTOR = '[data-testid="development-board-dev-info-icon.popup"]';
+// @supports gates BOTH declarations together — that pairing is the whole fallback. Where backdrop-filter
+// is unavailable or disabled the block is skipped entirely, so the popup keeps ADS's SOLID background
+// instead of becoming a transparent, unreadable panel. Verified live: the integrated browser
+// (Chromium 148 / Electron 42) honours the UNPREFIXED form and reports -webkit-backdrop-filter as
+// UNSUPPORTED, so gating on the -webkit- spelling would disable the effect outright — do not add it.
+const PR_POPUP_FROST_CSS =
+  `@supports (backdrop-filter: blur(1px)){` +
+  `${PR_DARK_PREFIX}${POPUP_SELECTOR}` +
+  `{background-color:rgba(${POPUP_SURFACE_RGB}, ${POPUP_SURFACE_ALPHA}) !important;` +
+  `backdrop-filter:blur(${POPUP_BLUR_PX}px) saturate(${POPUP_BACKDROP_SATURATE}) ` +
+  `brightness(${POPUP_BACKDROP_BRIGHTNESS}) !important;}}`;
+
+// ===================================================================================================
+// >>> THE FROSTED-MODAL DIAL <<<  Edit these values to change the Development-details modal's glass.
+// ===================================================================================================
+// Extends the frosted-glass treatment from the hover popup above to Jira's DEVELOPMENT DETAILS modal —
+// the full-size dialog our PR button opens (and the one the popup's "View all development information"
+// footer used to lead to). Same recipe (blur + saturate + brightness over a translucent surface, see
+// the popup dial for why each term exists), but DELIBERATELY DIFFERENT NUMBERS, for one reason:
+//
+// THE MODAL HAS A SCRIM AND THE POPUP DOES NOT. Measured live, the modal's ancestry is
+//     section [data-testid="development-details.main.modal-dialog"]      the surface we frost
+//       -> div  ...--positioner                                          z-index 510
+//       -> div  ...--blanket        background rgba(16,18,20,0.6)        z-index 500   <- the scrim
+//       -> div.atlaskit-portal -> div.atlaskit-portal-container -> body#jira
+// Every one of those ancestors was checked for the properties that establish a BACKDROP ROOT (filter,
+// opacity<1, mask, mix-blend-mode, will-change of those, contain:paint) and ALL are clean — so, exactly
+// as with the popup, backdrop-filter on the surface itself reaches the real board behind. The catch is
+// that the BLANKET IS AN ANCESTOR, so what the modal's backdrop-filter samples is the board ALREADY
+// composited under a 0.6 dark scrim. Board detail therefore arrives at only 40% strength before our
+// filter even runs, and stacking the popup's brightness(0.48) on top of Jira's scrim is a DOUBLE scrim.
+//
+// That is precisely the v1.2.23 failure mode — a rule that applies perfectly and yields a flat panel —
+// and it reproduced here. Measured on the rendered modal (screenshot pixels, text-free side/top gutters,
+// luminance SD and max-minus-min channel spread; the stock solid modal is the control):
+//     stock solid modal                       SD 0.00009  spread 4.3   <- a flat, opaque slab
+//     popup's dials verbatim (K 0.48, 0.6 scrim) SD 0.00051  spread 8.7   <- applied, still nearly flat
+//     these dials    (K 0.60, 0.25 scrim)     SD 0.00202  spread 19.0  <- 22x the control: real glass
+// So the fix is two-sided: RELIEVE Jira's scrim (MODAL_SCRIM_ALPHA, 0.6 -> 0.25) and RAISE brightness
+// (0.48 -> 0.60), because with a scrim already present our brightness() no longer has to be the scrim.
+// The scrim is relieved, NOT removed: at MODAL_SCRIM_ALPHA 0 the glass is brighter still (SD 0.00179 at
+// K 0.48) but the binding contrast falls to 4.683:1 — over AA, yet BELOW the 4.885:1 of the stock solid
+// modal, which breaks the invariant the popup established (never less legible than what we replace).
+//
+// MEASURED, not estimated. The binding text is the same --ds-text-subtlest #96999E that binds the popup
+// (14px/400 "#1522", and 12px/600 branch names — 12px semibold is still PLAIN text for WCAG, which
+// exempts only 18pt/14pt-bold, so AA >= 4.5:1 applies). Against the stock SOLID modal it scores 4.885:1.
+// Contrast was evaluated against UNIFORM FIELDS of every surface the modal can sit over, pushed through
+// the scrim and then through Chromium's own filter pipeline; the model was validated against canvas
+// ctx.filter (same Skia path as backdrop-filter) and reproduces it EXACTLY — e.g. a red card field
+// scrimmed to rgb(88,26,22) filters to rgb(97,4,0) in both the model and Chromium:
+//
+//   uniform backdrop          -> composite        subtlest  verdict
+//   PR_SOLID_RED_DARK            rgb(76,20,19)     5.207:1  PASS   <- binds
+//   PR_SOLID_GREEN_DARK          rgb(17,45,27)     5.213:1  PASS
+//   QA/lighter card              rgb(33,35,39)     5.529:1  PASS
+//   board surface rgb(36,37,40)  rgb(28,29,33)     5.891:1  PASS
+//   body bg rgb(31,31,33)        rgb(27,28,31)     5.983:1  PASS
+//
+// CONFIRMED END-TO-END, not just modelled: a uniform PR_SOLID_RED_DARK field was forced behind the live
+// modal and the rendered surface came out rgb(76,20,19) at 5.19:1 — the modelled binding row, to the
+// byte. And because a mean can hide a bad corner, local contrast was swept over a 12x12 tile grid of the
+// real modal (each tile's darkest-half mean, so the modal's OWN bright glyphs cannot masquerade as
+// backdrop): stock solid min 4.874:1 / median 4.877:1, frosted min 5.044:1 / median 5.817:1, with
+// 0 of 144 tiles under AA and 0 of 144 under the stock baseline. The frosted modal is more legible than
+// the solid one it replaces EVERYWHERE on the surface, not just on average.
+//
+// WHY THIS MODAL AND NOT THE OTHERS. The surrounding dialogs were surveyed live and deliberately left
+// alone; see PR_MODAL_FROST_CSS below for the two that were declined and why.
+//
+// TUNING. Same shape as the popup dial: MODAL_BACKDROP_SATURATE is the cheap dial (chroma at ~constant
+// luminance), brightness and alpha are the expensive ones. MODAL_SCRIM_ALPHA is the lever unique to
+// modals — lowering it buys glass fast but spends the legibility headroom that keeps this above the
+// stock-solid baseline, and it also weakens the dialog's focus affordance. Flip MODAL_FROST to false to
+// ship the modal exactly as Jira does, scrim included.
+const MODAL_FROST = true;                // master gate for the modal glass; false = untouched Jira modal
+const MODAL_BLUR_PX = 16;                // backdrop blur radius, matched to the popup for one visual family
+const MODAL_SURFACE_ALPHA = 0.4;         // opacity of the modal surface; lower = glassier, less legible
+const MODAL_BACKDROP_SATURATE = 2.5;     // backdrop colour boost; buys visible glass at ~no contrast cost
+const MODAL_BACKDROP_BRIGHTNESS = 0.6;   // higher than the popup's 0.48: Jira's own scrim already clamps
+const MODAL_SCRIM_ALPHA = 0.25;          // Jira ships 0.6; relieved so the blur has board detail to show
+// Jira's own blanket colour, hue untouched — only its alpha moves, so the scrim still reads as ADS's.
+const MODAL_SCRIM_RGB = '16, 18, 20';
+// Verified live: each of these matches EXACTLY ONE node. The sibling testids that share this prefix
+// (--positioner, --header, --scrollable, --body) are distinct VALUES, so the exact-match form cannot
+// collide with them. As everywhere else in this file, the Atlaskit compiled-class hashes on these nodes
+// (_16jlidpf, _1r04idpf ...) churn between ADS releases and are NOT targeted.
+const MODAL_SELECTOR = '[data-testid="development-details.main.modal-dialog"]';
+const MODAL_BLANKET_SELECTOR = '[data-testid="development-details.main.modal-dialog--blanket"]';
+// Threads PR_DARK_PREFIX onto EVERY selector rather than the joined string — the same leak that
+// prSurfaceTint documents. Today each rule below carries a single selector, so this is defensive; it
+// keeps a future comma-separated edit from silently scoping only its first selector.
+const prDarkRule = (selectors, decls) =>
+  selectors.map((selector) => `${PR_DARK_PREFIX}${selector}`).join(',') + `{${decls}}`;
+// A SEPARATE @supports block from the popup's, not a second rule inside it — the two surfaces are tuned
+// independently and keeping their blocks apart means neither can be edited into the other's fallback.
+// The scrim relief lives INSIDE the guard on purpose: where backdrop-filter is unavailable the modal
+// stays solid, and it must then keep Jira's full-strength 0.6 scrim rather than a thinned one that was
+// only ever justified by a blur that is not running. Unprefixed spelling only — this Chromium reports
+// -webkit-backdrop-filter as UNSUPPORTED, so gating on that form would disable the effect outright.
+//
+// SURVEYED AND DECLINED (both re-checked live, both would have passed AA — neither is a contrast fail):
+//   * The ISSUE DETAIL modal, [data-testid="issue.views.issue-details.issue-modal.modal-dialog"].
+//     Identical geometry (907x774), surface and 0.6 blanket, and it measures fine — 12x12 tiles gave
+//     min 5.030:1 with 0/144 below AA. It is declined on UNIFORMITY and DWELL, not legibility: it holds
+//     2099 characters of long-form copy across ~61% of its area (the dev-details modal holds 217 across
+//     ~10%, and the already-frosted popup 62), and it paints several large FULLY OPAQUE interior panels
+//     of its own (513x151 and 489x151 at rgb(43,44,47), a 445x90 comment box at rgb(31,31,33), a 285x98
+//     at rgb(43,44,47)). Frost cannot reach under those, so the result is glass in some regions and flat
+//     slab in others on one surface — and the saturated colour that survives the blur lands directly
+//     under paragraphs the operator actually reads, rather than under a five-row list.
+//   * MENU / DROPDOWN surfaces (profile, settings, filter and field menus). Structurally these are the
+//     EASY case — measured live they carry no scrim and no backdrop root, so the popup's proven dials
+//     would drop straight in. They are declined for want of a STABLE HOOK: the surface element carries
+//     no role (role=null) and no generic testid, only a per-menu one such as
+//     "atlassian-navigation--secondary-actions--profile", and its own classes are compiled hashes
+//     (_2rko1mok ...). The only generic alternative is a structural .atlaskit-portal descendant rule,
+//     which would also catch tooltips, flags, spotlights and the modals themselves. Not worth the leak.
+const PR_MODAL_FROST_CSS = !MODAL_FROST ? '' :
+  `@supports (backdrop-filter: blur(1px)){` +
+  prDarkRule([MODAL_BLANKET_SELECTOR],
+    `background-color:rgba(${MODAL_SCRIM_RGB}, ${MODAL_SCRIM_ALPHA}) !important;`) +
+  prDarkRule([MODAL_SELECTOR],
+    `background-color:rgba(${POPUP_SURFACE_RGB}, ${MODAL_SURFACE_ALPHA}) !important;` +
+    `backdrop-filter:blur(${MODAL_BLUR_PX}px) saturate(${MODAL_BACKDROP_SATURATE}) ` +
+    `brightness(${MODAL_BACKDROP_BRIGHTNESS}) !important;`) +
+  `}`;
+
+// ===================================================================================================
+// >>> THE FROSTED ISSUE-MODAL DIAL <<<  Edit these to change the ISSUE DETAIL modal's glass.
+// ===================================================================================================
+// Frosts Jira's ISSUE DETAIL modal — the big work-item dialog. The block above declined this surface,
+// and the decline was NOT about contrast (it measured 5.030:1 min, 0/144 tiles under AA). It was about
+// UNIFORMITY: the modal paints large FULLY OPAQUE interior panels that a parent backdrop-filter cannot
+// reach, so frosting the shell alone yields glass at the edges and flat slab in the middle. The
+// operator has since asked for this modal frosted, so the panels are the work; the shell is the easy
+// part. What follows is how the panels were dealt with WITHOUT flattening the modal's hierarchy.
+//
+// WHAT THE OPAQUE PANELS ACTUALLY ARE, MEASURED LIVE. A full walk of the open modal found 13 painted
+// surfaces over 4000px^2 at alpha > 0.85. The decisive discovery is that almost all of them paint
+// rgb(43,44,47) — which is EXACTLY the modal's own surface colour, ADS's --ds-surface-overlay
+// (#2B2C2F). They are same-colour repaints: in stock Jira they are INVISIBLE, because they are the
+// same colour as the sheet they sit on. They express no hierarchy by fill, and the two biggest (513x151
+// and 489x151, in the activity feed) are pure layout paint. Only three colours are actually distinct:
+//     --ds-surface-overlay  #2B2C2F  rgb(43,44,47)  the big slabs + the Details/context sections
+//     --ds-surface          #1F1F21  rgb(31,31,33)  the comment WELL (recessed, darker than the sheet)
+//     --ds-background-input #242528  rgb(36,37,40)  the "Add a comment…" field and friends (raised)
+//
+// THE HOOK IS A DESIGN TOKEN, NOT A CLASS. None of the big panels carries a data-testid; their only
+// classes are Atlaskit compiled hashes (_v5641pm3, _1e0c1txw ...) which churn between ADS releases and
+// which this file refuses to target everywhere else. So instead of selecting the panels, we REDEFINE
+// THE TOKENS THEY PAINT FROM, scoped to the modal element. Verified live by overriding each token and
+// re-reading every panel's computed background: the --ds-surface-overlay panels followed, while the
+// well and the input did NOT (they resolve different tokens) — so one declaration reaches exactly the
+// intended set and leaves the others their own identity. The tokens are set ON the modal, so they
+// inherit to its whole subtree and cannot leak to the page outside it. This is why there is no
+// compiled-hash selector anywhere below.
+//
+// AND CRITICALLY: NO SECOND backdrop-filter. The panels sit INSIDE an already-frosted parent. Giving
+// them their own backdrop-filter would blur the already-blurred parent — a double blur that reads as
+// muddy grey, not glass. They are made TRANSLUCENT ONLY; the single frost on the shell is what the eye
+// sees through them. That is the whole reason this reads as one sheet.
+//
+// HOW HIERARCHY SURVIVES. The Details card is the case worth naming. Its separation was measured and it
+// does NOT come from its fill (which is the sheet colour) — it comes from a 1.11px rgba(227,228,242,.12)
+// top border and an 8px corner radius, both of which are untouched here. So taking its fill to alpha 0
+// costs nothing visually and buys the frost underneath. The wells and inputs are the opposite case:
+// their fill IS their affordance (a comment box must read as a comment box), so they keep a real alpha,
+// stepped so the recessed well stays DARKER than the sheet and the raised input stays LIGHTER — the
+// same up/down relationship stock Jira uses, just rendered in glass. Hover and pressed keep their own
+// stepped alphas so focusing a field still changes it visibly instead of punching an opaque hole.
+//
+// PANEL_ALPHA IS 0 ON PURPOSE, and 0 is the FAITHFUL value, not the aggressive one: these panels are
+// already the sheet colour, so 0 reproduces stock Jira's relationship (panel indistinguishable from
+// sheet) exactly, while any positive alpha would make them DARKER than their surroundings and invent a
+// hierarchy Jira never had. Raise it only if you want the slabs deliberately picked out.
+//
+// MEASURED, not estimated — and measured on RENDERED PIXELS, which is the v1.2.23 lesson. The binding
+// text was re-derived rather than assumed: every text node in the modal was enumerated with its colour,
+// size and weight, and the dimmest real body text is --ds-text-subtlest #96999E (luminance 0.3174) —
+// the "Add text" / "Add subtask" / "Add options" placeholders, 15 nodes. Blue link text (#669DF1,
+// 0.3329) is BRIGHTER and does not bind. One darker string exists, a 12px rgb(41,42,46) story-point
+// count, but it sits on its own opaque rgb(221,222,225) badge that follows none of these tokens and is
+// therefore untouched. So #96999E binds, exactly as on the popup and the dev modal.
+//
+//   12x12 tile sweep (each tile's darkest-half mean, so the modal's own glyphs cannot pose as backdrop):
+//     stock solid  min 4.874:1  median 4.918   0/144 under AA
+//     frosted      min 5.014:1  median 5.790   0/144 under AA, 0/144 under the stock baseline
+//   per-placeholder, sampling the real pixels behind each #96999E node:
+//     stock solid  worst 4.982:1 ("None")      0/4 under AA
+//     frosted      worst 5.513:1 ("Add text")  0/4 under AA
+// The frosted modal is MORE legible than the solid one it replaces, everywhere on the surface — the
+// same no-regression invariant the popup and the dev modal hold.
+//
+// AND THE GLASS IS ACTUALLY VISIBLE (the v1.2.23 failure was a rule that applied but did nothing). On
+// the modal's clean text-free top gutter, luminance SD went 0.00005 -> 0.00126 and channel spread 2 ->
+// 15: a 25x rise in surface detail off a dead-flat control. That is real, visible glass on real pixels.
+//
+// TUNING. Same shape as the dials above: SATURATE is cheap (chroma at near-constant luminance),
+// BRIGHTNESS and the alphas are expensive. SCRIM_ALPHA is the modal-only lever — lowering it buys glass
+// fast but spends the headroom keeping this above the stock baseline. Flip ISSUE_MODAL_FROST to false
+// to ship Jira's untouched solid modal, scrim and opaque panels included.
+const ISSUE_MODAL_FROST = true;              // master gate; false = untouched Jira issue modal
+const ISSUE_MODAL_BLUR_PX = 16;              // backdrop blur radius, matched to the other two surfaces
+const ISSUE_MODAL_SURFACE_ALPHA = 0.4;       // opacity of the modal shell; lower = glassier, less legible
+const ISSUE_MODAL_BACKDROP_SATURATE = 2.5;   // backdrop colour boost; visible glass at ~no contrast cost
+const ISSUE_MODAL_BACKDROP_BRIGHTNESS = 0.6; // matches the dev modal: Jira's own scrim already clamps
+const ISSUE_MODAL_SCRIM_ALPHA = 0.25;        // Jira ships 0.6; relieved so the blur has detail to show
+// >>> the interior-panel dials <<< — alpha of each token'd surface INSIDE the modal. None of these gets
+// a backdrop-filter of its own (see above); they only let the shell's single frost through.
+const ISSUE_MODAL_PANEL_ALPHA = 0;           // --ds-surface-overlay slabs; 0 = vanish into the one sheet
+const ISSUE_MODAL_WELL_ALPHA = 0.35;         // --ds-surface wells; stays DARKER than the sheet (recessed)
+const ISSUE_MODAL_INPUT_ALPHA = 0.45;        // --ds-background-input fields; LIGHTER than the sheet
+const ISSUE_MODAL_HOVER_ALPHA = 0.55;        // hover step — a visible state change, not an opaque hole
+const ISSUE_MODAL_PRESSED_ALPHA = 0.6;       // pressed/focus step, one notch beyond hover
+// THE INTERACTIVE STATES ARE PART OF THE JOB, not an afterthought. Every --ds-* token defined on this
+// tenant was enumerated (564 of them) and filtered to the background/surface ones whose value is OPAQUE
+// and whose name is a hover/pressed/selected variant. Most of that list is ACCENT colour — the blue,
+// red, green, yellow lozenges and status chips — and those are deliberately left alone for the same
+// reason the epic-link lozenge is: their fill IS their meaning, they are small, and bleaching them to
+// glass would destroy information. What DOES get overridden is the NEUTRAL GREY LADDER, because those
+// are the tokens a plain row, field or menu item inside the modal paints when you hover it — and an
+// opaque grey appearing under the cursor is precisely the "hole punched in the glass" this feature has
+// to avoid. Each rung keeps its own hue and simply gains an alpha, so the up/down relationship between
+// rest, hover and pressed survives exactly as ADS ships it.
+const ISSUE_MODAL_WELL_RGB = '31, 31, 33';   // --ds-surface                  #1F1F21
+const ISSUE_MODAL_INPUT_RGB = '36, 37, 40';  // --ds-background-input, --ds-surface-hovered   #242528
+const ISSUE_MODAL_RAISED_RGB = '48, 49, 52'; // --ds-surface-overlay-hovered  #303134
+const ISSUE_MODAL_PRESSED_RGB = '61, 63, 67';// --ds-surface-overlay-pressed  #3D3F43
+// Verified live: each matches EXACTLY ONE node, and the sibling testids sharing this prefix
+// (--positioner, --header, --scrollable, --body) are distinct VALUES, so exact-match cannot collide.
+const ISSUE_MODAL_SELECTOR =
+  '[data-testid="issue.views.issue-details.issue-modal.modal-dialog"]';
+const ISSUE_MODAL_BLANKET_SELECTOR =
+  '[data-testid="issue.views.issue-details.issue-modal.modal-dialog--blanket"]';
+// Its OWN @supports block, separate from the popup's and the dev modal's, so the three surfaces stay
+// independently tunable and none can be edited into another's fallback. Unprefixed spelling only — this
+// Chromium reports -webkit-backdrop-filter as UNSUPPORTED, so gating on that form would disable the
+// effect outright. The scrim relief and the token overrides both live INSIDE the guard on purpose:
+// where backdrop-filter is unavailable the modal must fall back to stock Jira ENTIRELY — full-strength
+// scrim AND opaque panels — rather than a thinned scrim and transparent panels floating over nothing,
+// which is the one genuinely broken state this feature could ship.
+const PR_ISSUE_MODAL_FROST_CSS = !ISSUE_MODAL_FROST ? '' :
+  `@supports (backdrop-filter: blur(1px)){` +
+  prDarkRule([ISSUE_MODAL_BLANKET_SELECTOR],
+    `background-color:rgba(${MODAL_SCRIM_RGB}, ${ISSUE_MODAL_SCRIM_ALPHA}) !important;`) +
+  prDarkRule([ISSUE_MODAL_SELECTOR],
+    `background-color:rgba(${POPUP_SURFACE_RGB}, ${ISSUE_MODAL_SURFACE_ALPHA}) !important;` +
+    `backdrop-filter:blur(${ISSUE_MODAL_BLUR_PX}px) saturate(${ISSUE_MODAL_BACKDROP_SATURATE}) ` +
+    `brightness(${ISSUE_MODAL_BACKDROP_BRIGHTNESS}) !important;` +
+    // The token redefinitions. Scoped to this element, inherited by its subtree, invisible outside it.
+    // Rest states first, then the hover/pressed rungs of the same neutral ladder.
+    `--ds-surface-overlay:rgba(${POPUP_SURFACE_RGB}, ${ISSUE_MODAL_PANEL_ALPHA});` +
+    `--ds-surface-overlay-hovered:rgba(${ISSUE_MODAL_RAISED_RGB}, ${ISSUE_MODAL_HOVER_ALPHA});` +
+    `--ds-surface-overlay-pressed:rgba(${ISSUE_MODAL_PRESSED_RGB}, ${ISSUE_MODAL_PRESSED_ALPHA});` +
+    `--ds-surface:rgba(${ISSUE_MODAL_WELL_RGB}, ${ISSUE_MODAL_WELL_ALPHA});` +
+    `--ds-surface-hovered:rgba(${ISSUE_MODAL_INPUT_RGB}, ${ISSUE_MODAL_HOVER_ALPHA});` +
+    `--ds-surface-pressed:rgba(${POPUP_SURFACE_RGB}, ${ISSUE_MODAL_PRESSED_ALPHA});` +
+    `--ds-surface-raised:rgba(${ISSUE_MODAL_INPUT_RGB}, ${ISSUE_MODAL_INPUT_ALPHA});` +
+    `--ds-surface-raised-hovered:rgba(${POPUP_SURFACE_RGB}, ${ISSUE_MODAL_HOVER_ALPHA});` +
+    `--ds-surface-raised-pressed:rgba(${ISSUE_MODAL_RAISED_RGB}, ${ISSUE_MODAL_PRESSED_ALPHA});` +
+    `--ds-background-input:rgba(${ISSUE_MODAL_INPUT_RGB}, ${ISSUE_MODAL_INPUT_ALPHA});` +
+    `--ds-background-input-hovered:rgba(${POPUP_SURFACE_RGB}, ${ISSUE_MODAL_HOVER_ALPHA});` +
+    `--ds-background-input-pressed:rgba(${ISSUE_MODAL_INPUT_RGB}, ${ISSUE_MODAL_PRESSED_ALPHA});`) +
+  `}`;
+
+// Hide the hover popup's native footer — the "View all development information" button AND the 1px rule
+// above it — at the operator's request. Flip to false to get Jira's stock footer back.
+const POPUP_HIDE_DEV_INFO_FOOTER = true;
+// ONE rule does both hides because the divider is the footer's own first child: the footer is a plain
+// wrapper <div> holding [ 1px divider , button ], so hiding the wrapper takes the link and the hairline
+// together. That pairing is deliberate — killing the button but leaving a stray rule under the avatars
+// would read worse than the untouched footer. Measured live: the popup loses exactly 61px (44px footer +
+// its 16px margin-top + rounding) and the remaining gap under our avatar strip is 16px, which is the
+// content box's OWN symmetric padding — so the removal leaves no dangling hole and needs no spacing fix.
+//
+// NO TESTID EXISTS on either node (verified live: the footer div, its divider child and the button all
+// carry only Atlaskit compiled-CSS hashes like `_19pkpxbi`, which churn between ADS releases and are NOT
+// safe to target). So this is structural, and — per the house style for structural rules — it ships two
+// selectors, either of which alone does the job. Both are pinned to the popup's CONTENT BOX with the same
+// `> div > div > div` child chain (the footer's actual depth) and differ only in how they discriminate:
+//   1. the content-box child that DIRECTLY contains a button — the footer is the only such node;
+//   2. the LAST content-box child — where the footer sits today.
+// TWO INTERLOCKS keep these off our own reviewer strip, which is Jira's avatar-group <ul>:
+//   a. `:not(:has([data-testid]))` — the strip is saturated with data-testid attributes, so it can never
+//      satisfy either selector even if Jira reorders the popup's children or drops the footer entirely;
+//   b. the strict child chain — it confines matching to the content-box LEVEL, so nothing rendered INSIDE
+//      the strip (avatars, rings, initials-fallback nodes) is even reachable.
+// Both were adversarially verified live. Each selector matched exactly the footer (1 node document-wide);
+// the strip's <ul>.matches() was false for both; no node inside the strip matched. Two hostile cases were
+// then forced into the live DOM: a testid-less `div > button` injected INTO the strip (the one shape the
+// :has() discriminator would otherwise catch — interlock (b) blocks it) and the strip PROMOTED to last
+// child of the content box (which interlock (a) blocks). Both stayed unmatched. Note that the strict child
+// chain is load-bearing, not cosmetic: a loose descendant form (`popup div:has(> button)`) DID match the
+// injected hostile node. The overflow "+N" button is safe on its own — it is a `li > button`, and both
+// selectors require a DIV parent.
+const PR_POPUP_FOOTER_HIDE_CSS = !POPUP_HIDE_DEV_INFO_FOOTER ? '' :
+  `${POPUP_SELECTOR} > div > div > div:has(> button):not(:has([data-testid])),` +
+  `${POPUP_SELECTOR} > div > div > div:last-child:not(:has([data-testid]))` +
+  `{display:none !important;}`;
+
+// Inject an "open pull request" button into the issue DETAIL view's quick-add action row (the small round
+// +/apps buttons). Flip to false to stop injecting it entirely; the module then also removes any button a
+// previous apply() had already placed, so toggling off is clean rather than leaving an orphan behind.
+const PR_OPEN_BUTTON = true;
+// The row is anchored on the ONE stable testid in it — the compact quick-add "+" trigger. Everything else
+// in that subtree is Atlaskit compiled-CSS hashes (css-m1gh8r / _ymio1r31 ...) which churn between ADS
+// releases and are NOT safe to target, so the module climbs from this node to the flex row at runtime
+// rather than hardcoding a class chain. Verified live: exactly 1 match, inside `css-1pjflpu`, whose flex
+// row (display:flex, gap:8px) holds the "+" and the apps dropdown as two `div[role=presentation]` kids.
+const PR_OPEN_ADD_TRIGGER_SELECTOR =
+  '[data-testid="issue-view-foundation.quick-add.quick-add-items-compact.add-button-dropdown--trigger"]';
+// The PR/branch glyph LIFTED VERBATIM from Jira's own dev-panel chip — the `1 pull request OPEN` icon
+// under [data-testid="development-board-dev-info-icon.container"] (the same popup this file already
+// frosts). Captured live from that SVG's <path d>. Reusing Jira's own path is what makes the injected
+// button read as native: the neighbouring "+" icon is the SAME shape family — 16x16 viewBox, fill=none on
+// the <svg>, a single fill="currentcolor" path, evenodd winding — so the glyph inherits the row's
+// currentColor (rgb(169,171,175) in dark mode) and its hover/active shifts with zero extra styling.
+const PR_OPEN_ICON_PATH =
+  'M4.25 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5M2 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 2 3.25m6-.75h1.75a2.75 2.75 0 0 1 2.75 2.75v5.378a2.251 2.251 0 1 1-1.5 0V5.25C11 4.56 10.44 4 9.75 4H8zM4.25 12a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5m7.5 0a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5';
+// The ONLY host a PR link may point at. The URL is composed page-side from dev-status `repositoryName`,
+// which is untrusted third-party data, so the main-world module re-parses the composed string with
+// `new URL()` and requires BOTH https: and exactly this hostname before it ever reaches an href.
+const PR_OPEN_HOST = 'bitbucket.org';
+// What a plain left-click on the injected button DOES. 'dialog' (default, the operator's request) opens
+// Jira's OWN "Development details" modal in place, keeping the user on the issue; 'navigate' restores the
+// original behaviour of following the anchor to Bitbucket in the same tab. One flip switches them.
+//
+// 'dialog' does NOT reimplement anything: it drives Jira's own trigger — the "N pull requests" button in
+// the issue detail's Development panel — via .click(). MEASURED LIVE in the integrated browser: that click
+// mounts [data-testid="development-details.main.modal-dialog"] (role=dialog, aria-label "Development
+// details") with the "Pull requests" TAB PRE-SELECTED, listing every PR in a table with author, id,
+// summary, source/target branch, status, reviewer avatars and relative updated time. It is an in-DOM
+// modal, NOT a popup window, so the integrated browser's popup suppression does not touch it, and the URL
+// never changes. Escape and its "Close Modal" button both dismiss it, returning to the issue view intact.
+// Because the dialog lists ALL PRs, multi-PR issues are covered natively and better than the tooltip.
+//
+// The anchor keeps its validated href in BOTH modes, so 'dialog' degrades to plain navigation whenever the
+// native trigger is absent (Development panel not rendered yet, or collapsed), and modifier/middle clicks
+// are never intercepted.
+const PR_BUTTON_ACTION = 'dialog';
+// The native trigger, and the reason it is a TWO-PART selector. The button testid
+// `development-summary-common.ui.summary-item.link-formatted-button` is SHARED by every row of the
+// Development panel — branches, commits, pull requests, and the "connect dev tools" upsell all use it.
+// VERIFIED THE HARD WAY live: an unscoped document.querySelector for it matched the upsell row FIRST and
+// clicking it opened the "Connect development tools" popup, not the PR dialog. So the button must be
+// looked up INSIDE the pull-request summary item, never document-wide.
+const PR_DIALOG_ITEM_SELECTOR = '[data-testid="development-summary-pull-request.ui.summary-item"]';
+const PR_DIALOG_TRIGGER_SELECTOR = '[data-testid="development-summary-common.ui.summary-item.link-formatted-button"]';
+
 // The pre-wash 5px left-edge bar, RETAINED (no-deletions) but no longer appended by composeCss. Two ways
 // to bring a bar back: append PR_EDGE_BAR_CSS after PR_TINT_CSS in composeCss for bar + wash together (it
 // uses ::after, so it does not collide with the wash's ::before), or swap PR_TINT_CSS back to PR_BAR_CSS
@@ -392,6 +884,31 @@ class EnhanceJiraStore {
     // PR_SURFACE_TINT_CSS for PR_TINT_CSS to go back to the over-content overlay, or PR_BAR_CSS for the
     // original left-edge bar — both are retained above.
     if (components[PR_COLORING_KEY]) css += PR_SURFACE_TINT_CSS;
+    // Frost the PR hover card (see ">>> THE FROSTED-POPUP DIAL <<<"). Gated on the same flag as the card
+    // fills because it is the same feature: the popup only carries our reviewer strip when PR coloring
+    // is on, and this keeps the popup solid — Jira's untouched default — whenever the feature is off.
+    // Purely presentational; it adds no Jira/Bitbucket traffic. The popup is hover-transient, so the
+    // GPU-composited backdrop repaint never rides a scroll.
+    if (components[PR_COLORING_KEY]) css += PR_POPUP_FROST_CSS;
+    // Frost the Development-details modal our PR button opens (see ">>> THE FROSTED-MODAL DIAL <<<").
+    // Same gate as the popup frost and for the same reason — it is the same feature, and turning PR
+    // coloring off must hand back stock Jira chrome, scrim strength included. Contributes '' when
+    // MODAL_FROST is false. Purely presentational; adds no Jira/Bitbucket traffic. Unlike the popup this
+    // surface can stay open for a while, but the board behind a modal does not scroll, so the backdrop
+    // is static and the composited blur is painted once rather than re-rasterised per frame.
+    if (components[PR_COLORING_KEY]) css += PR_MODAL_FROST_CSS;
+    // Frost the ISSUE DETAIL modal (see ">>> THE FROSTED ISSUE-MODAL DIAL <<<"), including the token
+    // overrides that make its interior panels translucent so it reads as ONE frosted sheet. Same gate as
+    // the other two frosts and for the same reason. Contributes '' when ISSUE_MODAL_FROST is false.
+    // Purely presentational; adds no Jira/Bitbucket traffic. This surface DOES scroll its own content —
+    // measured live, the backdrop-filter samples what is behind the modal (the board, which does not
+    // move), so scrolling the modal body does not re-rasterise the blur; see the dial block.
+    if (components[PR_COLORING_KEY]) css += PR_ISSUE_MODAL_FROST_CSS;
+    // Hide that popup's native "View all development information" footer and the hairline above it (see
+    // POPUP_HIDE_DEV_INFO_FOOTER). Gated on PR coloring for the same reason the frost is: it restyles the
+    // surface our reviewer strip renders into, so turning the feature off must restore stock Jira chrome.
+    // Contributes '' when the dial is off, so composeCss is unchanged in that case.
+    if (components[PR_COLORING_KEY]) css += PR_POPUP_FOOTER_HIDE_CSS;
     return css;
   }
 
@@ -422,6 +939,42 @@ class EnhanceJiraStore {
     var AV_HEADER_SEL = ${JSON.stringify(AVATAR_HEADER_SELECTOR)};
     var AV_CARD_SEL = ${JSON.stringify(AVATAR_CARD_SELECTOR)};
     var AV_PERSON_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="#fff" aria-hidden="true"><path d="M12 12a5 5 0 1 0-5-5 5 5 0 0 0 5 5Zm0 2c-4 0-8 2-8 5v1h16v-1c0-3-4-5-8-5Z"/></svg>';
+    // Per-reviewer avatar shading (see ">>> THE AVATAR DIAL <<<"). Both the board strip and the PR
+    // hover popup draw 24px avatars, so ONE ring width (2px) and ONE tint alpha serve both surfaces —
+    // no per-surface scaling was needed. Shared by the two managers below — though the strip only
+    // actually shades when AV_SHADE_STRIP is on, so by default these serve the popup alone.
+    var AV_RING_GREEN = 'rgb(${AVATAR_RING_GREEN_RGB})';
+    var AV_RING_RED = 'rgb(${AVATAR_RING_RED_RGB})';
+    var AV_TINT_GREEN = 'rgba(${AVATAR_RING_GREEN_RGB}, ${AVATAR_TINT_ALPHA})';
+    var AV_TINT_RED = 'rgba(${AVATAR_RING_RED_RGB}, ${AVATAR_TINT_ALPHA})';
+    // The ring is an OUTER box-shadow rather than a border so it never changes the 24px layout box.
+    var AV_RING_W = '2px';
+    // Gate for the board-header strip only (see AVATAR_SHADE_HEADER_STRIP). The popup never consults it.
+    var AV_SHADE_STRIP = ${AVATAR_SHADE_HEADER_STRIP ? 'true' : 'false'};
+    function avRing(state) {
+      return state === 'red' ? ('0 0 0 ' + AV_RING_W + ' ' + AV_RING_RED)
+        : state === 'green' ? ('0 0 0 ' + AV_RING_W + ' ' + AV_RING_GREEN) : '';
+    }
+    // The wash: a circular, click-through overlay sized to the wrapper. Because it is a SIBLING of the
+    // avatar (not a background on it) it lands identically on a real <img> and on an initials/person
+    // fallback circle — the fallback needs no special case.
+    function avTint(state) {
+      var c = state === 'red' ? AV_TINT_RED : state === 'green' ? AV_TINT_GREEN : '';
+      if (!c) return null;
+      var t = document.createElement('span');
+      t.setAttribute('data-ej-tint', '1');
+      t.style.cssText = 'position:absolute;left:0;top:0;right:0;bottom:0;border-radius:50%;pointer-events:none;background:' + c + ';';
+      return t;
+    }
+    // One reviewer's OWN state from the relayed contract node, normalised to the same three-way
+    // vocabulary colorFor uses ('red' | 'green' | null) and with the same precedence: a requested
+    // change is a blocker and outranks an approval.
+    function avStateOfReviewer(rv) {
+      if (!rv) return null;
+      if (rv.state === 'changes_requested') return 'red';
+      if (rv.approved === true || rv.state === 'approved') return 'green';
+      return null;
+    }
     (function setupAvatars(){
       try {
         var exAv = window.__ejAvatars;
@@ -565,7 +1118,44 @@ class EnhanceJiraStore {
               }
             } catch (e) {}
           },
-          buildAvatar: function (name, avatar, accountId) {
+          // Per-PERSON review state for the whole strip, read fresh from the SAME relayed contract node
+          // the card colouring reads (#__ej_bb_states) — no extra request, no new data source, and no
+          // local state of its own. Returns a plain name -> 'red' | 'green' object.
+          //
+          // The strip lists board MEMBERS, so a person can appear as a reviewer on several issues at
+          // once. Aggregation follows colorFor's precedence exactly: one requested change anywhere
+          // outranks any number of approvals, because a blocker is the thing worth surfacing.
+          //
+          // MONOTONICITY comes from the data layer, not from here: the companion's publishes only ever
+          // ADD issues/facts within a cycle (see mergeBase and the seed overlay), so a person's
+          // aggregate can gain 'green' and can be promoted 'green' -> 'red', but a publish cannot take
+          // a state away mid-cycle. Deriving at paint time — exactly as colorCard does — therefore
+          // inherits that guarantee for free, and clears with no residue when a state genuinely goes
+          // away, because nothing is remembered between renders.
+          reviewStates: function () {
+            var out = {};
+            try {
+              var n = document.getElementById('__ej_bb_states');
+              if (!n) return out;
+              var txt = n.textContent || '';
+              if (!txt) return out;
+              var data = JSON.parse(txt);
+              var byIssue = (data && data.byIssue) || {};
+              for (var key in byIssue) {
+                if (!byIssue.hasOwnProperty(key)) continue;
+                var rs = (byIssue[key] && byIssue[key].reviewers) || [];
+                for (var i = 0; i < rs.length; i++) {
+                  var nm = rs[i] && rs[i].name;
+                  if (!nm) continue;
+                  var st = avStateOfReviewer(rs[i]);
+                  if (!st) continue;
+                  if (out[nm] !== 'red') out[nm] = st;   // red is sticky: a blocker outranks approvals
+                }
+              }
+            } catch (e) {}
+            return out;
+          },
+          buildAvatar: function (name, avatar, accountId, reviewState) {
             var el;
             if (avatar) {
               el = document.createElement('img');
@@ -587,6 +1177,12 @@ class EnhanceJiraStore {
             el.style.objectFit = 'cover';
             el.style.border = '1px solid rgba(255,255,255,.25)';
             el.style.flex = '0 0 auto';
+            // The review ring and the assignee-filter highlight both want a box-shadow, so they are
+            // STACKED rather than allowed to overwrite each other: review ring innermost (the thing
+            // this feature is about), blue selection ring pushed out to 4px around it. Either can be
+            // absent; the filled slots are joined in order.
+            var ring = avRing(reviewState);
+            if (ring) el.style.boxShadow = ring;
             if (accountId) {
               el.style.cursor = 'pointer';
               var active = [];
@@ -594,8 +1190,8 @@ class EnhanceJiraStore {
                 active = (new URL(location.href)).searchParams.getAll('assignee');
               } catch (e) {}
               if (active.indexOf(accountId) >= 0) {
-                el.style.boxShadow = '0 0 0 2px #4c9aff';
-                el.style.border = '1px solid #4c9aff';
+                el.style.boxShadow = (ring ? ring + ',0 0 0 4px #4c9aff' : '0 0 0 2px #4c9aff');
+                if (!ring) el.style.border = '1px solid #4c9aff';
               }
               el.addEventListener('click', function () {
                 try {
@@ -610,7 +1206,17 @@ class EnhanceJiraStore {
             } else {
               el.style.cursor = 'default';
             }
-            return el;
+            // UNSHADED reviewers (and non-reviewers) keep the pre-existing shape exactly: the bare
+            // avatar element, no wrapper. Only a shaded avatar gets wrapped, and only so the tint has
+            // a positioning context to sit in. The tint is pointer-events:none, so the assignee-filter
+            // click handler on the avatar itself is unaffected.
+            var tint = avTint(reviewState);
+            if (!tint) return el;
+            var wrap = document.createElement('span');
+            wrap.style.cssText = 'position:relative;display:inline-flex;width:24px;height:24px;flex:0 0 auto;';
+            wrap.appendChild(el);
+            wrap.appendChild(tint);
+            return wrap;
           },
           titleAnchor: function (row) {
             try {
@@ -668,9 +1274,16 @@ class EnhanceJiraStore {
               });
               var activeParam = '';
               try { activeParam = (new URL(location.href)).searchParams.getAll('assignee').slice().sort().join(','); } catch (e) {}
+              // Review state is part of the signature. Without this the strip would render once and
+              // then short-circuit forever on the unchanged sig, so a RED ring — which only ever
+              // arrives on a later Bitbucket enrichment publish, never on the same-origin base pass —
+              // could never appear. Read once per render, not once per avatar.
+              // null when the strip is unshaded: it skips the read entirely AND drops the extra
+              // signature field, so the sig is byte-identical to the pre-shading one.
+              var rstates = AV_SHADE_STRIP ? this.reviewStates() : null;
               var sig = activeParam + '||' + names.map(function (n) {
                 var r = roster.get(n) || {};
-                return n + '|' + (r.id || '') + '|' + (r.avatar || '');
+                return n + '|' + (r.id || '') + '|' + (r.avatar || '') + (rstates ? '|' + (rstates[n] || '') : '');
               }).join(',');
               var strip = document.getElementById('__ej_avatar_strip');
               var placed = !!(strip && strip.parentNode === row);
@@ -679,18 +1292,24 @@ class EnhanceJiraStore {
                 strip = document.createElement('div');
                 strip.id = '__ej_avatar_strip';
                 strip.style.display = 'inline-flex';
-                strip.style.gap = '4px';
                 strip.style.position = 'absolute';
                 strip.style.left = '50%';
                 strip.style.top = '50%';
                 strip.style.transform = 'translate(-50%,-50%)';
                 strip.style.margin = '0';
               }
+              // 6px only when shaded, so adjacent 2px rings do not touch; unshaded keeps the original
+              // 4px. Set on EVERY render rather than only at creation: the other style properties above
+              // are gate-independent constants, but this one is not, so a strip node that outlives a
+              // change of gate would otherwise keep the stale spacing forever (the node is reused
+              // whenever it is still in the DOM). Re-asserting it is free and makes the node
+              // self-healing; when the gate is off this writes the same '4px' the original code did.
+              strip.style.gap = AV_SHADE_STRIP ? '6px' : '4px';
               strip.setAttribute('data-sig', sig);
               strip.innerHTML = '';
               for (var i = 0; i < names.length; i++) {
                 var r = roster.get(names[i]) || {};
-                strip.appendChild(this.buildAvatar(names[i], r.avatar, r.id));
+                strip.appendChild(this.buildAvatar(names[i], r.avatar, r.id, rstates ? (rstates[names[i]] || null) : null));
               }
               if (!placed) row.appendChild(strip);
             } catch (e) {}
@@ -699,12 +1318,32 @@ class EnhanceJiraStore {
         function startAv() {
           if (window.__ejAvatars !== a || a.observer) return;
           var raf = window.requestAnimationFrame ? window.requestAnimationFrame.bind(window) : function (cb) { return setTimeout(cb, 16); };
+          // Same rAF-latch fix the card painter already carries: rAF does not fire while the tab is
+          // hidden (the VS Code integrated browser tab very often is), and clearing _scheduled only
+          // inside the rAF callback would latch it true forever, dropping every later publish. Race
+          // rAF against a short timer and run whichever wins, exactly once.
+          function scheduleAv(cb) {
+            var ran = false;
+            function run() { if (ran) return; ran = true; cb(); }
+            raf(run);
+            setTimeout(run, 250);
+          }
           a.observer = new MutationObserver(function () {
             if (a._scheduled) return;
             a._scheduled = true;
-            raf(function () { a._scheduled = false; a.mergeCards(); a.render(); });
+            scheduleAv(function () { a._scheduled = false; a.mergeCards(); a.render(); });
           });
-          a.observer.observe(document.body, { childList: true, subtree: true });
+          // Observation ROOT follows the dial, because it is the shading that decides what this manager
+          // needs to see. Unshaded, the strip's only inputs are the roster and the ?assignee param, both
+          // of which live under <body> — so body is the correct, narrower root and widening would only
+          // buy pointless wakeups on every companion publish. Shaded, the strip additionally consumes
+          // #__ej_bb_states, which is replaced at the <html> level on each publish and is the ONLY event
+          // that can turn a strip avatar red, so the root must widen to documentElement to see it (its
+          // subtree still contains <body>, so card re-renders and scroll virtualisation keep firing it
+          // exactly as before, and render() stays signature-guarded).
+          // The rAF-latch fix above is NOT part of this trade — it is a correctness fix for a hidden tab
+          // and applies to whichever root is in use.
+          a.observer.observe(AV_SHADE_STRIP ? document.documentElement : document.body, { childList: true, subtree: true });
           if (a.desired) a.fetchRoster().then(function (map) { a.roster = map; a.render(); });
           else a.render();
         }
@@ -1042,7 +1681,8 @@ class EnhanceJiraStore {
           // (unlike the throttled 8s timer) — but the DEBOUNCE used to reintroduce the very visibility
           // dependence that claim denied, because rAF is suspended while hidden; see schedule() above,
           // which is what actually makes this path visibility-independent now.
-          // (Only THIS manager widens to documentElement; avatars/insights/popup stay on body.)
+          // (Only THIS manager widens to documentElement unconditionally; the avatars strip widens only
+          // when AVATAR_SHADE_HEADER_STRIP is on — off by default — and insights/popup stay on body.)
           p.observer.observe(document.documentElement, { childList: true, subtree: true });
           if (p.desired) { p.refresh(); p.startRepaint(); }
         }
@@ -1118,11 +1758,17 @@ class EnhanceJiraStore {
             var wrap = document.createElement('div');
             wrap.style.cssText = 'position:relative;width:24px;height:24px;display:inline-block;flex:0 0 auto;';
             wrap.setAttribute('title', name + (isCr ? ' — requested changes' : (isApp ? ' — approved' : '')));
-            var ring = isCr ? 'box-shadow:0 0 0 2px #FF5630;' : (isApp ? 'box-shadow:0 0 0 2px #36B37E;' : '');
+            // THIS person's own state, shaded with the shared avatar dial rather than the old one-off
+            // ADS hues (#36B37E / #FF5630) — so the popup, the board strip and the card colours are one
+            // system in two hues instead of three unrelated greens.
+            var state = avStateOfReviewer(rv);
+            var rs = avRing(state);
+            var ring = rs ? ('box-shadow:' + rs + ';') : '';
             var self = this;
             function initialsEl() {
               var f = document.createElement('div');
               f.textContent = self.initials(name);
+              f.setAttribute('data-ej-av', '1');
               f.style.cssText = 'width:24px;height:24px;border-radius:50%;background:#5E6C84;color:#fff;font-size:10px;font-weight:600;display:flex;align-items:center;justify-content:center;' + ring;
               return f;
             }
@@ -1131,18 +1777,41 @@ class EnhanceJiraStore {
               img.src = rv.avatar;
               img.alt = name;
               img.referrerPolicy = 'no-referrer';
+              img.setAttribute('data-ej-av', '1');
               img.style.cssText = 'width:24px;height:24px;border-radius:50%;object-fit:cover;display:block;' + ring;
+              // The tint overlay is a wrap child too, so the old "wrap has no children left" test would
+              // wrongly conclude the initials circle was already there and skip it. Test for the AVATAR
+              // slot specifically, and insert it FIRST so the tint stays on top.
               img.onerror = function () {
-                try { if (img.parentNode === wrap) wrap.removeChild(img); if (!wrap.firstChild) wrap.appendChild(initialsEl()); } catch (e) {}
+                try {
+                  if (img.parentNode === wrap) wrap.removeChild(img);
+                  if (!wrap.querySelector('[data-ej-av]')) wrap.insertBefore(initialsEl(), wrap.firstChild);
+                } catch (e) {}
               };
               wrap.appendChild(img);
             } else {
               wrap.appendChild(initialsEl());
             }
+            // Appended last (and pointer-events:none) so it washes whichever avatar slot ends up under
+            // it — real photo or initials fallback — with no per-case handling.
+            var tint = avTint(state);
+            if (tint) wrap.appendChild(tint);
             return wrap;
           },
           // Hide Jira's original avatar-group children and append our full-reviewer strip in their place.
           // Idempotent: an existing strip is removed first so a re-render repaints cleanly.
+          // A stable fingerprint of the reviewer states this strip was drawn from. Stamped on the strip
+          // so apply() can tell "already drawn for this issue" from "already drawn, but a reviewer has
+          // since approved / requested changes". Names are read-only inputs here and never reach HTML.
+          stateSig: function (reviewers) {
+            try {
+              var parts = [];
+              for (var i = 0; i < reviewers.length; i++) {
+                parts.push(String(reviewers[i].name) + ':' + (avStateOfReviewer(reviewers[i]) || '-'));
+              }
+              return parts.join('|');
+            } catch (e) { return ''; }
+          },
           render: function (group, reviewers, key) {
             try {
               var kids = group.children;
@@ -1156,6 +1825,7 @@ class EnhanceJiraStore {
               var strip = document.createElement('div');
               strip.setAttribute('data-ej-pr-strip', '1');
               if (key) strip.setAttribute('data-ej-key', key);
+              strip.setAttribute('data-ej-state-sig', this.stateSig(reviewers));
               strip.style.cssText = 'display:flex;flex-wrap:wrap;gap:5px;align-items:center;';
               for (var j = 0; j < reviewers.length; j++) strip.appendChild(this.buildAvatar(reviewers[j]));
               group.appendChild(strip);
@@ -1187,9 +1857,13 @@ class EnhanceJiraStore {
                 var entry = byIssue[key];
                 var reviewers = entry && entry.reviewers;
                 if (!reviewers || !reviewers.length) continue;   // companion not ready for this issue -> leave Jira's popup as-is
-                // Skip only when already rendered for THIS key AND our strip survived Jira's re-renders.
+                // Skip only when already rendered for THIS key, our strip survived Jira's re-renders,
+                // AND the per-reviewer states are unchanged. The state check is what lets an OPEN popup
+                // pick up a RED that only lands on a later Bitbucket enrichment publish — without it
+                // the key match alone would freeze the popup on its first, approvals-only draw.
                 var existing = group.querySelector('[data-ej-pr-strip="1"]');
-                if (existing && existing.getAttribute('data-ej-key') === key) continue;
+                if (existing && existing.getAttribute('data-ej-key') === key &&
+                    existing.getAttribute('data-ej-state-sig') === this.stateSig(reviewers)) continue;
                 this.render(group, reviewers, key);
               }
             } catch (e) {}
@@ -1209,6 +1883,272 @@ class EnhanceJiraStore {
         window.__ejPrPopup = pop;
         if (document.body) startPop();
         else document.addEventListener('DOMContentLoaded', startPop, { once: true });
+      } catch (e) {}
+    })();
+    // Stage-3 "open pull request" button for the issue DETAIL view. Clones the quick-add row's own button
+    // markup, swaps in Jira's dev-panel PR glyph, and — per PR_BUTTON_ACTION — either opens Jira's own
+    // "Development details" dialog in place (default) or navigates to the selected issue's pull request.
+    //
+    // ZERO NEW REQUESTS: the PR list comes entirely from the existing #__ej_bb_states contract, whose
+    // per-issue entries now carry a \`prs\` array (url/status/title/updated) that the companion derives from
+    // the dev-status payload it ALREADY fetches for coloring — see prList()/stampPrs() in composeBridgeJs.
+    // This module never calls fetch/XHR and never mutates a PR or issue; a click is a navigation and
+    // nothing else.
+    (function () {
+      try {
+        var PR_BTN = ${PR_OPEN_BUTTON ? 'true' : 'false'} && ${desired ? 'true' : 'false'};
+        var ADD_SEL = ${JSON.stringify(PR_OPEN_ADD_TRIGGER_SELECTOR)};
+        var ICON_D = ${JSON.stringify(PR_OPEN_ICON_PATH)};
+        var HOST = ${JSON.stringify(PR_OPEN_HOST)};
+        var ACTION = ${JSON.stringify(PR_BUTTON_ACTION)};
+        var DLG_ITEM = ${JSON.stringify(PR_DIALOG_ITEM_SELECTOR)};
+        var DLG_TRIG = ${JSON.stringify(PR_DIALOG_TRIGGER_SELECTOR)};
+        var exBtn = window.__ejPrOpenBtn;
+        if (exBtn) { exBtn.desired = PR_BTN; exBtn.apply(); return; }
+        var b = {
+          desired: PR_BTN,
+          _scheduled: false,
+          observer: null,
+          _timer: null,
+          // SECURITY GATE. \`raw\` originates in dev-status \`repositoryName\`/PR id — untrusted third-party
+          // data that the companion string-concatenates into a URL. Re-parse it here and demand BOTH an
+          // https: scheme and exactly the Bitbucket host, so a repositoryName carrying a scheme, a
+          // userinfo \`@\`, or path traversal cannot retarget the link. Anything that fails to parse or
+          // fails either check returns null and the button simply does not render. Returning \`u.href\`
+          // (the PARSED, normalised form) rather than \`raw\` means the string that reaches href is the
+          // one the URL parser actually validated, never the attacker-shaped original.
+          safeUrl: function (raw) {
+            try {
+              if (typeof raw !== 'string' || !raw) return null;
+              var u = new URL(raw);
+              if (u.protocol !== 'https:') return null;
+              if (u.hostname !== HOST) return null;
+              return u.href;
+            } catch (e) { return null; }
+          },
+          // The issue currently open in the detail view, from the \`selectedIssue\` query param. Read FRESH
+          // on every apply() rather than cached, which is what makes retargeting work: this is an SPA, so
+          // clicking another card rewrites the param via pushState with no reload. Shape-validated so a
+          // hand-edited param can never become a selector or a lookup key for something unexpected.
+          currentKey: function () {
+            try {
+              var v = new URL(location.href).searchParams.get('selectedIssue');
+              if (!v || !/^[A-Z][A-Z0-9_]*-[0-9]+$/.test(v)) return null;
+              return v;
+            } catch (e) { return null; }
+          },
+          // Every PR for \`key\` that survives URL validation, newest-looking first is NOT assumed — order
+          // is whatever the companion published; pick() imposes the ordering.
+          prsFor: function (key) {
+            try {
+              if (!key) return [];
+              var n = document.getElementById('__ej_bb_states');
+              if (!n) return [];
+              var d = JSON.parse(n.textContent || '{}');
+              var e = d && d.byIssue && d.byIssue[key];
+              var list = (e && e.prs) || [];
+              var out = [];
+              for (var i = 0; i < list.length; i++) {
+                var p = list[i];
+                var url = this.safeUrl(p && p.url);
+                if (!url) continue;   // unvalidatable target: drop the PR entirely, never render it
+                out.push({ url: url, status: (p.status == null ? '' : String(p.status)), title: (p.title == null ? '' : String(p.title)), updated: (p.updated == null ? '' : String(p.updated)) });
+              }
+              return out;
+            } catch (e) { return []; }
+          },
+          // Default target: the OPEN pull request; when several are open, the most recently updated. Falls
+          // back to the most recently updated of ALL PRs when none are open (e.g. every PR merged), so the
+          // button still goes somewhere sensible instead of vanishing on a finished issue. \`updated\` is an
+          // ISO-8601 timestamp, so a plain string compare is a correct recency compare.
+          pick: function (prs) {
+            var best = null, bestOpen = null;
+            for (var i = 0; i < prs.length; i++) {
+              var p = prs[i];
+              if (!best || p.updated > best.updated) best = p;
+              if (/^open$/i.test(p.status) && (!bestOpen || p.updated > bestOpen.updated)) bestOpen = p;
+            }
+            return bestOpen || best;
+          },
+          // Full inventory in the native tooltip so a multi-PR issue hides nothing behind the single
+          // default target. Built as a plain string and assigned to .title as a PROPERTY, so the untrusted
+          // PR title is text to the DOM and can never be parsed as markup.
+          tooltip: function (prs, chosen) {
+            // First line states what the click actually DOES, so the tooltip stays truthful when
+            // PR_BUTTON_ACTION is flipped. The per-PR inventory below it is still useful in dialog mode as
+            // an at-a-glance preview of what the dialog will list.
+            var lines = [ACTION === 'dialog' ? 'Show pull requests' : 'Open pull request'];
+            for (var i = 0; i < prs.length; i++) {
+              var p = prs[i];
+              var id = p.url.split('/').pop();
+              lines.push((p === chosen ? '\\u2192 ' : '  ') + '#' + id + (p.status ? ' (' + p.status + ')' : '') + (p.title ? ' ' + p.title : ''));
+            }
+            return lines.join('\\n');
+          },
+          // Climb from the one stable testid to the flex row that actually holds the round buttons: the
+          // nearest ancestor with more than one ELEMENT child. Bounded climb so a Jira restructure degrades
+          // to "no button" rather than walking to <html> and injecting somewhere absurd.
+          row: function () {
+            try {
+              var t = document.querySelector(ADD_SEL);
+              if (!t) return null;
+              var n = t.parentElement;
+              for (var i = 0; i < 6 && n; i++) {
+                if (n.children.length > 1) return n;
+                n = n.parentElement;
+              }
+              return null;
+            } catch (e) { return null; }
+          },
+          // Jira's OWN "N pull requests" control in the issue detail's Development panel. Scoped lookup —
+          // see the PR_DIALOG_TRIGGER_SELECTOR note: the button testid is shared across the panel's rows,
+          // and an unscoped query lands on the "connect dev tools" upsell. Returns null when the panel is
+          // absent (not rendered yet, collapsed, or no dev data), which is what makes the click handler
+          // fall through to plain navigation instead of silently doing nothing.
+          dialogTrigger: function () {
+            try {
+              var item = document.querySelector(DLG_ITEM);
+              if (!item) return null;
+              var t = item.querySelector(DLG_TRIG);
+              return t || null;
+            } catch (e) { return null; }
+          },
+          remove: function (scope) {
+            try {
+              var root = scope || document;
+              var old = root.querySelectorAll('[data-ej-pr-open-wrap="1"]');
+              for (var i = 0; i < old.length; i++) { if (old[i].parentNode) old[i].parentNode.removeChild(old[i]); }
+            } catch (e) {}
+          },
+          // Build the link by CLONING the row's own button markup (tpl.innerHTML) instead of hand-rolling
+          // spans: size, radius, hover, active and focus-ring all come from Atlaskit's atomic classes read
+          // off the live node, so the button matches the row exactly and keeps matching when those hashes
+          // churn. Only two things are swapped — the <path d> (Jira's PR glyph) and the visually-hidden
+          // label — both via attribute/textContent writes, never innerHTML.
+          //
+          // It is an <a href> with NO target. MEASURED LIVE in the VS Code integrated browser: window.open
+          // returns null and a target="_blank" anchor click is a silent no-op (popups are suppressed
+          // outright), while a plain same-tab anchor click navigates correctly. So same-tab is not a
+          // preference here, it is the only thing that works — do not "improve" this to a new tab.
+          build: function (rowEl, key, url, title, sig) {
+            var tpl = rowEl.querySelector('button');
+            var wrap = document.createElement('div');
+            wrap.setAttribute('data-ej-pr-open-wrap', '1');
+            wrap.setAttribute('role', 'presentation');
+            var a = document.createElement('a');
+            a.setAttribute('data-ej-pr-open', '1');
+            a.setAttribute('data-ej-key', key);
+            a.setAttribute('data-ej-sig', sig);
+            a.className = tpl ? tpl.className : '';
+            a.href = url;                       // validated by safeUrl(); never raw contract data
+            a.title = title;                    // property write => text, not markup
+            a.setAttribute('aria-label', (ACTION === 'dialog' ? 'Show pull requests for ' : 'Open pull request for ') + key);
+            if (tpl) {
+              a.innerHTML = tpl.innerHTML;      // Jira's OWN markup only — no untrusted string reaches this
+              var path = a.querySelector('svg path');
+              if (path) {
+                path.setAttribute('d', ICON_D);
+                path.setAttribute('fill-rule', 'evenodd');
+                path.setAttribute('clip-rule', 'evenodd');
+              }
+              // The template's trailing span is the visually-hidden accessible label ("Add or create work
+              // related to this Story"); retarget it rather than leaving the wrong text on our button.
+              var spans = a.querySelectorAll('span > span');
+              var lbl = spans.length ? spans[spans.length - 1] : null;
+              if (lbl && !lbl.querySelector('svg')) lbl.textContent = (ACTION === 'dialog' ? 'Show pull requests for ' : 'Open pull request for ') + key;
+            }
+            // DIALOG MODE. Intercept the plain left-click and drive Jira's own Development-details trigger
+            // instead of following the href. Everything the dialog does — layout, the pre-selected Pull
+            // requests tab, focus trapping, Escape/Close-Modal dismissal, and the PR data itself — is
+            // Jira's, so this cannot drift from the real state and needs no markup of ours.
+            //
+            // Three deliberate escape hatches, each of which leaves the ORIGINAL navigation intact:
+            //   1. ACTION !== 'dialog'  -> no listener is attached at all, so the anchor behaves exactly as
+            //      it did before this change (flip PR_BUTTON_ACTION to 'navigate' to get that back);
+            //   2. modifier / non-primary clicks are ignored, so the browser's own open-in-new-tab and
+            //      copy-link affordances keep working on the href;
+            //   3. the native trigger being missing (Development panel not mounted or collapsed) returns
+            //      WITHOUT preventDefault, so the click falls through to navigating to Bitbucket rather
+            //      than becoming a dead control.
+            // Read-only: .click() on a disclosure button opens a panel and mutates no issue or PR.
+            if (ACTION === 'dialog') {
+              a.addEventListener('click', function (ev) {
+                try {
+                  if (ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+                  var t = b.dialogTrigger();
+                  if (!t) return;           // no native trigger -> let the href navigate (fallback)
+                  ev.preventDefault();
+                  t.click();
+                } catch (e) {}
+              });
+            }
+            wrap.appendChild(a);
+            return wrap;
+          },
+          apply: function () {
+            try {
+              if (!this.desired) { this.remove(); return; }
+              var rowEl = this.row();
+              // Detail view closed (or not this kind of view): drop any button we left behind. Scoped to
+              // the whole document because the row we injected into is gone by definition.
+              if (!rowEl) { this.remove(); return; }
+              var key = this.currentKey();
+              var prs = this.prsFor(key);
+              var chosen = this.pick(prs);
+              var existing = rowEl.querySelector('[data-ej-pr-open="1"]');
+              // No PR (or none with a valid URL): render NOTHING rather than a dead/disabled control, and
+              // clear a button left over from a previously selected issue that did have one.
+              if (!chosen) { this.remove(rowEl); return; }
+              // IDEMPOTENCY: identical issue AND identical rendered content already mounted -> leave it
+              // alone. This is the guard that stops the documentElement observer from stacking duplicates
+              // on every Jira re-render, and the data-ej-key half is what makes a SELECTED-ISSUE CHANGE
+              // retarget (different key -> rebuild) instead of silently pointing at the previous issue's PR.
+              //
+              // The signature covers the TOOLTIP, not just the href — same reason the hover-popup's
+              // stateSig does. Keying on (key, href) alone was measured to freeze the tooltip: when a PR's
+              // status flips OPEN -> MERGED, or a second PR appears on an issue whose chosen target is
+              // unchanged, the href is identical and the early-return kept the stale tooltip forever.
+              var tip = this.tooltip(prs, chosen);
+              var sig = key + '|' + chosen.url + '|' + tip;
+              if (existing && existing.getAttribute('data-ej-sig') === sig) return;
+              this.remove(rowEl);
+              rowEl.appendChild(this.build(rowEl, key, chosen.url, tip, sig));
+            } catch (e) {}
+          }
+        };
+        function startBtn() {
+          if (window.__ejPrOpenBtn !== b || b.observer) return;
+          var raf = window.requestAnimationFrame ? window.requestAnimationFrame.bind(window) : function (cb) { return setTimeout(cb, 16); };
+          // SAME rAF-latch FIX as the coloring manager's schedule() (see the long note there). A bare rAF
+          // debounce sets _scheduled true and only clears it inside the rAF callback, and rAF does not fire
+          // while the tab is hidden — which the integrated browser tab usually is — so one mutation while
+          // hidden LATCHES the flag and every later mutation is dropped forever. Racing rAF against a short
+          // timer clears the flag on whichever path fires first, so this can never latch.
+          function schedule(cb) {
+            var ran = false;
+            function run() { if (ran) return; ran = true; cb(); }
+            raf(run);
+            setTimeout(run, 250);
+          }
+          b.observer = new MutationObserver(function () {
+            if (b._scheduled) return;
+            b._scheduled = true;
+            schedule(function () { b._scheduled = false; b.apply(); });
+          });
+          // documentElement, not body — same reason as the coloring manager: the subtree still covers
+          // <body> (so detail-panel re-renders and card selection changes fire it) AND it catches
+          // #__ej_bb_states being REPLACED at the <html> level on every companion publish, which is what
+          // makes the button appear as soon as PR data lands rather than only on the next Jira re-render.
+          b.observer.observe(document.documentElement, { childList: true, subtree: true });
+          // Backstop, mirroring the coloring manager's startRepaint(): covers a pushState-only selection
+          // change that somehow produced no observed mutation, and a first paint that raced the contract
+          // node. Cheap — apply() early-returns on the idempotency check whenever nothing has changed.
+          if (!b._timer) { try { b._timer = setInterval(function () { try { b.apply(); } catch (e) {} }, 4000); } catch (e) { b._timer = null; } }
+          b.apply();
+        }
+        window.__ejPrOpenBtn = b;
+        if (document.body) startBtn();
+        else document.addEventListener('DOMContentLoaded', startBtn, { once: true });
       } catch (e) {}
     })();
     var DESIRED = ${desired ? 'true' : 'false'};
@@ -1510,7 +2450,17 @@ class EnhanceJiraStore {
               var rm = String(pr.repositoryUrl || '').match(/bitbucket\\.org\\/([^\\/]+\\/[^\\/?#]+)/);
               repo = rm && rm[1];
             }
-            if (repo && pr.id != null) out.push({ repo: repo, prId: pr.id, prKey: repo + '#' + pr.id });
+            // status/name/lastUpdate ride along from the SAME dev-status payload already in hand (no extra
+            // request): they are what the detail-view "open pull request" button needs to choose a default
+            // target (OPEN, then most recently updated) and to list every PR in its tooltip. Purely
+            // additive — repo/prId/prKey are unchanged, so cycle dedup and the Bitbucket enrichment that
+            // key off them behave exactly as before.
+            if (repo && pr.id != null) out.push({
+              repo: repo, prId: pr.id, prKey: repo + '#' + pr.id,
+              status: (typeof pr.status === 'string') ? pr.status : null,
+              title: (typeof pr.name === 'string') ? pr.name : null,
+              updated: (typeof pr.lastUpdate === 'string') ? pr.lastUpdate : null
+            });
           }
         }
         return out;
@@ -1662,6 +2612,50 @@ class EnhanceJiraStore {
         for (var n2 in apprBy) { if (apprBy.hasOwnProperty(n2)) apprCount++; }
         return { changesRequested: false, changesRequestedBy: [], approvedHumans: apprCount, reviewers: reviewers };
       },
+      // Per-issue PR descriptors for the detail-view "open pull request" button. Built ONLY from refs
+      // already collected by extractPrs — this adds no request of any kind.
+      //
+      // The URL is COMPOSED from repo + prId rather than passed through from dev-status's own \`url\`
+      // field: dev-status returns the UUID form
+      // (bitbucket.org/{c5627d4d-...}/{2e2a07c7-...}/pull-requests/1519), which works but is opaque, while
+      // repositoryName gives the readable slug the Referer in fetchParticipants already uses. Composing it
+      // also means exactly ONE shape can ever be emitted. repositoryName is still untrusted, so the
+      // main-world module re-parses and host-checks the result before it reaches an href — this is the
+      // convenience half, safeUrl() is the security half.
+      prList: function (refs) {
+        var out = [];
+        if (!refs) return out;
+        for (var i = 0; i < refs.length; i++) {
+          var r = refs[i];
+          if (!r || !r.repo || r.prId == null) continue;
+          out.push({
+            url: 'https://bitbucket.org/' + r.repo + '/pull-requests/' + r.prId,
+            status: r.status || null,
+            title: r.title || null,
+            updated: r.updated || null
+          });
+        }
+        return out;
+      },
+      // Attach prList() output to a map that is ABOUT TO BE PUBLISHED, returning a shallow COPY per
+      // touched entry. The copy is deliberate: the map handed in shares object identity with devBase, the
+      // enriched map and the cache seed, and mutating those in place would leak \`prs\` into writeCache()
+      // and into the monotonic-publish bookkeeping. Copying keeps every settled coloring/caching path
+      // byte-identical to before — this only ever ADDS a field to the published snapshot.
+      stampPrs: function (map, byIssuePrs) {
+        var out = {};
+        for (var k in map) {
+          if (!map.hasOwnProperty(k)) continue;
+          var e = map[k];
+          var list = (byIssuePrs && byIssuePrs[k]) ? this.prList(byIssuePrs[k]) : null;
+          if (!e || !list || !list.length) { out[k] = e; continue; }
+          var c = {};
+          for (var f in e) { if (e.hasOwnProperty(f)) c[f] = e[f]; }
+          c.prs = list;
+          out[k] = c;
+        }
+        return out;
+      },
       // Merge the dev-status BASE map with the Bitbucket ENRICHED map, keyed by issue key. Prefer the
       // enriched entry only when it actually produced reviewers (it adds the changes-requested/denier
       // signal + real avatars); otherwise keep the reliable base so coloring + the approver list still
@@ -1745,7 +2739,9 @@ class EnhanceJiraStore {
             for (var k in byIssuePrs) {
               if (byIssuePrs.hasOwnProperty(k)) enriched[k] = self.aggregateIssue(byIssuePrs[k]);
             }
-            safePublish(withSeed(self.mergeBase(devBase, enriched)), label);
+            // stampPrs is the LAST step and applies to the PUBLISHED SNAPSHOT ONLY (it returns copies), so
+            // withSeed/mergeBase/writeCache all still see exactly the maps they saw before this feature.
+            safePublish(self.stampPrs(withSeed(self.mergeBase(devBase, enriched)), byIssuePrs), label);
           } catch (e) {}
         }
         // Overlay the cached map UNDER this cycle's fresh map. This is what keeps publishes MONOTONIC
