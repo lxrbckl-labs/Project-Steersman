@@ -636,6 +636,79 @@ const ISSUE_MODAL_SELECTOR =
   '[data-testid="issue.views.issue-details.issue-modal.modal-dialog"]';
 const ISSUE_MODAL_BLANKET_SELECTOR =
   '[data-testid="issue.views.issue-details.issue-modal.modal-dialog--blanket"]';
+
+// Collapse the issue modal's right-hand Details sidebar (Story Points / Assignee / Development /
+// Sprint ...) once, automatically, each time the modal opens. Flip to false to leave Jira's default
+// expanded sidebar alone; nothing else in this file reads the flag, so off is a true no-op.
+//
+// JIRA DOES NOT PERSIST THIS — MEASURED, NOT ASSUMED. Two live experiments in the integrated browser:
+// (a) collapsed the sidebar, reloaded the board — it came back EXPANDED; (b) collapsed it on
+// CMMS-2850, closed the modal, opened CMMS-2831 in the SAME SPA session with no reload — also
+// EXPANDED. localStorage and sessionStorage are both entirely EMPTY on this tenant (0 keys; a
+// write/read/remove probe confirmed storage is available, so the emptiness is Jira's choice, not a
+// blocked API). So there is no stored preference for this module to fight, and no "just collapse it
+// once yourself" answer that would have made the feature unnecessary.
+//
+// IT DRIVES JIRA'S OWN CONTROL, and the trigger is NOT a click. The sidebar's left edge carries
+// Atlaskit's flex-resizer, whose chevron shows a "Collapse" tooltip on hover (this is the control in
+// the operator's screenshot). Reading the live React props settled how it actually works:
+//   - the chevron's enclosing div has an onClick, but it is only the Atlaskit TOOLTIP's dismiss
+//     handler — `()=>{y&&O.current&&O.current.requestHide({isImmediate:!0})}`. Clicking it does
+//     nothing to the layout. A plain .click() AND a trusted CDP click both left the sidebar at its
+//     full 329px, which is exactly why this looked inert at first.
+//   - the real logic hangs off the RESIZER's onPointerDown, which branches on the event target:
+//     `let t=(e.target.getAttribute("data-testid")||"").indexOf(l)>-1?"chevron":"resizer"`. A
+//     pointerdown whose target is the chevron takes the "chevron" path and collapses.
+// So the trigger is a bubbling PointerEvent('pointerdown') dispatched ON the chevron. Verified live:
+// container-right width 329 -> 0 and the handle's testid flips chevron-right -> chevron-left, with
+// defaultPrevented true (Jira's handler consumed it). Because this is Jira's own code path we
+// inherit its reflow, its animation and its re-expand affordance — the user gets the handle back in
+// the place they expect. A CSS display:none would strand them with no way to bring it back.
+//
+// The two testids below are the ONLY stable hooks here; everything else in that subtree is Atlaskit
+// compiled-class hash soup (_1wpz1fhb / _2rko1rr0 ...) which churns between ADS releases.
+// chevron-RIGHT means "expanded, click to collapse"; chevron-LEFT means "already collapsed" — so the
+// suffix doubles as the state read and no aria-expanded is involved (the chevron is aria-hidden).
+const ISSUE_MODAL_COLLAPSE_SIDEBAR = true;
+const ISSUE_SIDEBAR_CHEVRON_EXPANDED_SELECTOR =
+  '[data-testid="flex-resizer.ui.handle.chevron-right"]';
+const ISSUE_SIDEBAR_CONTAINER_SELECTOR =
+  '[data-testid="issue.views.issue-details.issue-layout.container-right"]';
+// THE SETTLE GATE, and it exists because the obvious implementation is racy — CAUGHT LIVE, not
+// theorised. When the user switches issues while the modal STAYS OPEN, the old issue's sidebar is
+// still mounted at the instant ?selectedIssue flips. A module that re-arms on the key change and
+// fires immediately collapses the OUTGOING issue's sidebar; Jira then renders the incoming issue's
+// layout fresh and EXPANDED, and because the module had already marked that open handled it never
+// corrected itself. Measured result: switching CMMS-2857 -> CMMS-2819 left the sidebar at 329px with
+// handled already true — the feature silently not working, which is worse than it visibly failing.
+//
+// Jira key-stamps the right column's own testid, so this is the precise fix: require a right-layout
+// node bearing the CURRENT key before touching anything. Until the incoming issue's column has
+// actually rendered there is simply nothing to act on, so the race cannot be entered at all. The key
+// is shape-validated (/^[A-Z][A-Z0-9_]*-[0-9]+$/) before it is ever concatenated in here, so it can
+// never smuggle anything into the selector.
+const ISSUE_SIDEBAR_RIGHT_LAYOUT_TESTID_PREFIX =
+  'highlight-actions.ui.target.container.issue-layout-right.';
+// THE STABILITY GATE — the second half of the same race, and the key gate alone does NOT close it.
+// MEASURED on the modal-open path: at 600ms the modal already carries a right column stamped with the
+// CURRENT key, but it is a STALE render left over from the previously viewed issue; at 1296ms Jira
+// swaps in the real layout. So a stamp match can be satisfied by DOM that is about to be thrown away,
+// and a collapse dispatched into it is simply discarded — the observed symptom being a modal that
+// intermittently opened with the sidebar still expanded and `handled` already true.
+//
+// What distinguishes the two renders is NODE IDENTITY: the chevron element is REPLACED across the
+// swap (tracked live: chevron node #1 -> #3) even though the container-right node is reused. So the
+// module refuses to act until it has seen the SAME chevron node persist for this long. Any re-render
+// underneath it restarts the clock, which means the dispatch always lands on the layout Jira actually
+// intends to keep. 400ms sits comfortably above the observed ~700ms swap gap's jitter while staying
+// far below the point a user would notice.
+const ISSUE_SIDEBAR_STABLE_MS = 400;
+// How long after a modal opens the module keeps waiting for the chevron to mount before giving up on
+// that open. The sidebar is not in the DOM at the instant the modal appears, so firing blindly would
+// miss; an unbounded wait would instead let a much later render get collapsed under the user's hands
+// long after they opened the issue. 6s comfortably covers observed mount time without that risk.
+const ISSUE_SIDEBAR_COLLAPSE_DEADLINE_MS = 6000;
+
 // Its OWN @supports block, separate from the popup's and the dev modal's, so the three surfaces stay
 // independently tunable and none can be edited into another's fallback. Unprefixed spelling only — this
 // Chromium reports -webkit-backdrop-filter as UNSUPPORTED, so gating on that form would disable the
@@ -2149,6 +2222,171 @@ class EnhanceJiraStore {
         window.__ejPrOpenBtn = b;
         if (document.body) startBtn();
         else document.addEventListener('DOMContentLoaded', startBtn, { once: true });
+      } catch (e) {}
+    })();
+    // Stage-4 auto-collapse of the issue modal's right-hand Details sidebar. The ISSUE_MODAL_COLLAPSE_
+    // SIDEBAR block upstream carries the evidence for the two non-obvious facts this rests on: Jira
+    // persists NO collapsed state of its own (so there is nothing here to fight), and the collapse is
+    // driven by a POINTERDOWN on the chevron, not a click (the chevron's onClick is only Atlaskit's
+    // tooltip-dismiss handler, which is why both a .click() and a trusted CDP click did nothing).
+    //
+    // THE DESIGN PROBLEM HERE IS NOT COLLAPSING — IT IS NOT FIGHTING THE USER. The naive version of
+    // this feature ("whenever the sidebar is expanded, collapse it") would slam the panel shut every
+    // time the user re-opened it, which is the one behaviour guaranteed to make the feature hated. So
+    // this module acts AT MOST ONCE PER MODAL OPEN and then stands down for that open completely: a
+    // manual re-expand is permanent for as long as that modal stays on that issue.
+    //
+    // "A MODAL OPEN" IN AN SPA = the (modal present, selectedIssue key) pair. Jira never reloads here;
+    // it mounts/unmounts the modal node and rewrites ?selectedIssue via pushState. Exactly two things
+    // re-arm the module: the modal going away, and the key changing (a different issue is a fresh
+    // open even when React reuses the modal node). Nothing else re-arms it — in particular the
+    // thousands of unrelated mutations fired inside an open modal all hit the \`handled\` short-circuit,
+    // and that is precisely what makes a manual re-expand stick.
+    (function () {
+      try {
+        var SIDE = ${ISSUE_MODAL_COLLAPSE_SIDEBAR ? 'true' : 'false'} && ${desired ? 'true' : 'false'};
+        var MODAL_SEL = ${JSON.stringify(ISSUE_MODAL_SELECTOR)};
+        var CHEV_SEL = ${JSON.stringify(ISSUE_SIDEBAR_CHEVRON_EXPANDED_SELECTOR)};
+        var SIDE_SEL = ${JSON.stringify(ISSUE_SIDEBAR_CONTAINER_SELECTOR)};
+        var RIGHT_PREFIX = ${JSON.stringify(ISSUE_SIDEBAR_RIGHT_LAYOUT_TESTID_PREFIX)};
+        var DEADLINE = ${ISSUE_SIDEBAR_COLLAPSE_DEADLINE_MS};
+        var STABLE_MS = ${ISSUE_SIDEBAR_STABLE_MS};
+        var exSide = window.__ejSideCollapse;
+        if (exSide) { exSide.desired = SIDE; exSide.apply(); return; }
+        var sc = {
+          desired: SIDE,
+          _scheduled: false,
+          observer: null,
+          _timer: null,
+          openKey: null,   // issue key of the modal open currently being tracked; null = no open modal
+          handled: false,  // set once this open has been collapsed / skipped / timed out — latches OFF
+          openedAt: 0,     // first sighting of this open, for the bounded wait below
+          chevNode: null,  // the chevron element currently being watched for stability
+          chevSince: 0,    // when that node was first seen; reset whenever Jira swaps the node
+          // One-shot re-check timed to land exactly when the stability gate expires. WITHOUT this the
+          // collapse waits for whatever wakes the module next — and once Jira has finished rendering,
+          // mutations go quiet, so that is usually the 1s backstop tick. MEASURED: the sidebar sat
+          // VISIBLY EXPANDED for ~700ms (26 frames) before collapsing, of which only 400ms was the gate
+          // itself and the rest was pure scheduling latency. Waking on purpose removes that tail without
+          // touching STABLE_MS, so the flash shrinks with no loss of the staleness protection the gate
+          // buys. Self-clearing and single-flight: a pending wake is never stacked.
+          _wake: null,
+          wake: function (ms) {
+            try {
+              if (this._wake) return;
+              var self = this;
+              this._wake = setTimeout(function () { self._wake = null; try { self.apply(); } catch (e) {} },
+                Math.max(0, ms) + 16);
+            } catch (e) { this._wake = null; }
+          },
+          // Same shape-validated read the PR button uses. Fresh on every apply(), never cached: the
+          // param is rewritten by pushState when another card is clicked, and noticing that rewrite is
+          // exactly how a new issue re-arms this module.
+          currentKey: function () {
+            try {
+              var v = new URL(location.href).searchParams.get('selectedIssue');
+              if (!v || !/^[A-Z][A-Z0-9_]*-[0-9]+$/.test(v)) return null;
+              return v;
+            } catch (e) { return null; }
+          },
+          // DON'T COLLAPSE A SIDEBAR THE USER IS WORKING IN. The Details panel is nothing but editable
+          // fields; collapsing one out from under an active edit would be worse than not collapsing at
+          // all. If focus sits anywhere inside the sidebar subtree, treat this open as handled and
+          // never come back to it.
+          busy: function (side) {
+            try {
+              var a = document.activeElement;
+              return !!(a && side && side !== a && side.contains(a));
+            } catch (e) { return true; }
+          },
+          apply: function () {
+            try {
+              var modal = document.querySelector(MODAL_SEL);
+              // Modal closed: drop the tracked open so the NEXT one re-arms from scratch.
+              if (!modal) { this.openKey = null; this.handled = false; this.openedAt = 0; this.chevNode = null; return; }
+              if (!this.desired) return;
+              var key = this.currentKey();
+              if (!key) return;
+              // A key we have not seen is a fresh open (first mount, or a switch to another issue
+              // while the modal stayed up). Re-arm and restart the bounded wait.
+              if (key !== this.openKey) { this.openKey = key; this.handled = false; this.openedAt = Date.now(); this.chevNode = null; }
+              if (this.handled) return;
+              // THE SETTLE GATE (see ISSUE_SIDEBAR_RIGHT_LAYOUT_TESTID_PREFIX). On an issue switch with
+              // the modal still open, the OUTGOING issue's sidebar is briefly still mounted; acting then
+              // collapses the wrong sidebar and Jira re-renders the incoming one expanded. Waiting for a
+              // right column stamped with the CURRENT key means there is nothing to act on until the
+              // incoming layout is really there. Key is shape-validated above, so this concatenation is safe.
+              if (!modal.querySelector('[data-testid="' + RIGHT_PREFIX + key + '"]')) {
+                if (Date.now() - this.openedAt > DEADLINE) this.handled = true;
+                return;
+              }
+              // Scoped INSIDE the modal on purpose: the same flex-resizer ships in the full-page issue
+              // view, which the operator did not ask for and which this must not silently touch.
+              var chev = modal.querySelector(CHEV_SEL);
+              if (!chev) {
+                // Either the sidebar has not mounted yet (wait) or it is already collapsed — the
+                // chevron-right selector only matches the EXPANDED state, so a collapsed sidebar looks
+                // identical to a missing one here. Both are resolved by the deadline: if nothing
+                // expanded shows up in time, this open is done and we never touch it.
+                this.chevNode = null;
+                if (Date.now() - this.openedAt > DEADLINE) this.handled = true;
+                return;
+              }
+              // THE STABILITY GATE (see ISSUE_SIDEBAR_STABLE_MS). A stamped-but-stale render can satisfy
+              // everything above and still be discarded milliseconds later, taking the collapse with it.
+              // Jira REPLACES the chevron node across that swap, so requiring one node to persist means
+              // the dispatch always lands on the layout that survives. Any re-render restarts the clock.
+              if (chev !== this.chevNode) { this.chevNode = chev; this.chevSince = Date.now(); this.wake(STABLE_MS); return; }
+              var waited = Date.now() - this.chevSince;
+              if (waited < STABLE_MS) { this.wake(STABLE_MS - waited); return; }
+              var side = modal.querySelector(SIDE_SEL);
+              if (this.busy(side)) { this.handled = true; return; }
+              // Jira's own control, via the one event its handler actually branches on. Marked handled
+              // BEFORE dispatching so that even if the handler throws or the collapse silently fails,
+              // this can never turn into a retry loop that fights the user.
+              this.handled = true;
+              var r = chev.getBoundingClientRect();
+              chev.dispatchEvent(new PointerEvent('pointerdown', {
+                bubbles: true, cancelable: true, composed: true, view: window,
+                clientX: r.left + r.width / 2, clientY: r.top + r.height / 2,
+                button: 0, buttons: 1, pointerId: 1, pointerType: 'mouse', isPrimary: true
+              }));
+            } catch (e) {}
+          }
+        };
+        function startSide() {
+          if (window.__ejSideCollapse !== sc || sc.observer) return;
+          var raf = window.requestAnimationFrame ? window.requestAnimationFrame.bind(window) : function (cb) { return setTimeout(cb, 16); };
+          // SAME rAF-latch FIX as the coloring and button managers (see the long note on the former). A
+          // bare rAF debounce sets _scheduled true and only clears it inside the rAF callback, and rAF
+          // does not fire while the tab is hidden — which the integrated browser tab usually is — so one
+          // mutation while hidden would LATCH the flag and drop every later one. That failure is
+          // especially bad here: the whole feature is a single act-once-per-open, so a latch does not
+          // degrade it, it silently disables it. Racing rAF against a short timer clears the flag on
+          // whichever path fires first, so this can never latch.
+          function schedule(cb) {
+            var ran = false;
+            function run() { if (ran) return; ran = true; cb(); }
+            raf(run);
+            setTimeout(run, 250);
+          }
+          sc.observer = new MutationObserver(function () {
+            if (sc._scheduled) return;
+            sc._scheduled = true;
+            schedule(function () { sc._scheduled = false; sc.apply(); });
+          });
+          // documentElement, not body — the modal mounts in a portal near the <html> level, and this
+          // also keeps the observer alive across the board's own re-renders.
+          sc.observer.observe(document.documentElement, { childList: true, subtree: true });
+          // Backstop for a pushState-only issue switch that produced no observed mutation, and for a
+          // sidebar that mounts in a quiet frame. Cheap: apply() early-returns on \`handled\` for every
+          // tick of an open it has already dealt with.
+          if (!sc._timer) { try { sc._timer = setInterval(function () { try { sc.apply(); } catch (e) {} }, 1000); } catch (e) { sc._timer = null; } }
+          sc.apply();
+        }
+        window.__ejSideCollapse = sc;
+        if (document.body) startSide();
+        else document.addEventListener('DOMContentLoaded', startSide, { once: true });
       } catch (e) {}
     })();
     var DESIRED = ${desired ? 'true' : 'false'};
