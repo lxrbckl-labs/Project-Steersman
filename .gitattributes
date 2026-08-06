@@ -1,0 +1,5 @@
+# Force LF line endings on checkout for shell scripts so bash can execute them
+# on native Windows (Git Bash / MINGW), where core.autocrlf would otherwise
+# convert to CRLF — breaking the shebang and every line with set -euo pipefail.
+*.sh        text eol=lf
+.githooks/* text eol=lf
